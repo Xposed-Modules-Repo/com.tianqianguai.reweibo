@@ -1,50 +1,69 @@
 package com.tianqianguai.reweibo;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.XposedInterface;
-import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class WeiboFeedHook {
-    private static final int LOG_LEVEL_INFO = 4;
-    private static XposedModule sModule;
 
-    public static void hook(XposedModule module, PackageLoadedParam param) {
+    private static final AtomicBoolean sReversed = new AtomicBoolean(false);
+
+    public static void hook(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
-            sModule = module;
-            Class<?> cardListAdapterClass = param.getDefaultClassLoader().loadClass(
-                "com.sina.weibo.page.CardListAdapter"
+            Class<?> adapterClass = XposedHelpers.findClass(
+                "com.sina.weibo.streamservice.adapter.RecyclerViewAdapter",
+                lpparam.classLoader
             );
 
-            module.hook(cardListAdapterClass.getMethod("a",
-                List.class, boolean.class, boolean.class))
-                .intercept(new CardListAdapterHooker());
+            for (Method m : adapterClass.getDeclaredMethods()) {
+                if (Modifier.isAbstract(m.getModifiers())) continue;
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            if (sReversed.get()) return;
+                            reverseAdapterList(param.thisObject);
+                        }
+                    });
+                } catch (Throwable ignored) {}
+            }
 
-            module.log(LOG_LEVEL_INFO, "ReWeibo", "Successfully hooked CardListAdapter");
+            XposedBridge.log("ReWeibo: Successfully hooked RecyclerViewAdapter");
         } catch (Throwable t) {
-            module.log(LOG_LEVEL_INFO, "ReWeibo", "Failed to hook: " + t.getMessage());
+            XposedBridge.log("ReWeibo: Failed to hook: " + t.getMessage());
         }
     }
 
-    private static class CardListAdapterHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            Object result = chain.proceed();
-            try {
-                Object adapter = chain.getThisObject();
-                java.lang.reflect.Field field = adapter.getClass().getDeclaredField("c");
-                field.setAccessible(true);
-                List<?> list = (List<?>) field.get(adapter);
-                if (list != null && !list.isEmpty()) {
-                    Collections.reverse(list);
-                    sModule.log(LOG_LEVEL_INFO, "ReWeibo", "Reversed feed with " + list.size() + " items");
+    private static void reverseAdapterList(Object adapter) {
+        try {
+            Class<?> clazz = adapter.getClass();
+            while (clazz != null && clazz != Object.class) {
+                for (Field f : clazz.getDeclaredFields()) {
+                    f.setAccessible(true);
+                    Object val = f.get(adapter);
+                    if (val instanceof List) {
+                        List<?> list = (List<?>) val;
+                        if (list.size() > 1) {
+                            if (sReversed.compareAndSet(false, true)) {
+                                Collections.reverse(list);
+                                XposedBridge.log("ReWeibo: Reversed feed with " + list.size() + " items");
+                            }
+                            return;
+                        }
+                    }
                 }
-            } catch (Throwable t) {
-                sModule.log(LOG_LEVEL_INFO, "ReWeibo", "Error reversing feed: " + t.getMessage());
+                clazz = clazz.getSuperclass();
             }
-            return result;
+        } catch (Throwable t) {
+            XposedBridge.log("ReWeibo: Error reversing feed: " + t.getMessage());
         }
     }
 }

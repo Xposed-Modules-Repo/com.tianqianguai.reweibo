@@ -42,7 +42,7 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.core.ktx)
     implementation(libs.material)
-    compileOnly(files("libs/api-82.jar"))
+    compileOnly(files("libs/xposed-bridge-api.jar"))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)

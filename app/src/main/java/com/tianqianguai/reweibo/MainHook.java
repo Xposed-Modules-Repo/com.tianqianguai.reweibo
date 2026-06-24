@@ -1,18 +1,17 @@
 package com.tianqianguai.reweibo;
 
-import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-public class MainHook extends XposedModule {
-
-    private static final int LOG_LEVEL_INFO = 4;
+public class MainHook implements IXposedHookLoadPackage {
 
     @Override
-    public void onPackageLoaded(PackageLoadedParam param) {
-        if (!param.getPackageName().equals("com.sina.weibo")) {
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+        if (!lpparam.packageName.equals("com.sina.weibo")) {
             return;
         }
-        log(LOG_LEVEL_INFO, "ReWeibo", "Weibo detected, hooking...");
-        WeiboFeedHook.hook(this, param);
+        XposedBridge.log("ReWeibo: Weibo detected, hooking...");
+        WeiboFeedHook.hook(lpparam);
     }
 }
