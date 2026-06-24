@@ -8,8 +8,12 @@ import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
 
 public class WeiboFeedHook {
+    private static final int LOG_LEVEL_INFO = 4;
+    private static XposedModule sModule;
+
     public static void hook(XposedModule module, PackageLoadedParam param) {
         try {
+            sModule = module;
             Class<?> cardListAdapterClass = param.getDefaultClassLoader().loadClass(
                 "com.sina.weibo.page.CardListAdapter"
             );
@@ -18,9 +22,9 @@ public class WeiboFeedHook {
                 List.class, boolean.class, boolean.class))
                 .intercept(new CardListAdapterHooker());
 
-            module.log(4, "ReWeibo", "Successfully hooked CardListAdapter");
+            module.log(LOG_LEVEL_INFO, "ReWeibo", "Successfully hooked CardListAdapter");
         } catch (Throwable t) {
-            module.log(4, "ReWeibo", "Failed to hook: " + t.getMessage());
+            module.log(LOG_LEVEL_INFO, "ReWeibo", "Failed to hook: " + t.getMessage());
         }
     }
 
@@ -35,9 +39,10 @@ public class WeiboFeedHook {
                 List<?> list = (List<?>) field.get(adapter);
                 if (list != null && !list.isEmpty()) {
                     Collections.reverse(list);
+                    sModule.log(LOG_LEVEL_INFO, "ReWeibo", "Reversed feed with " + list.size() + " items");
                 }
             } catch (Throwable t) {
-                // Silently ignore errors
+                sModule.log(LOG_LEVEL_INFO, "ReWeibo", "Error reversing feed: " + t.getMessage());
             }
             return result;
         }
