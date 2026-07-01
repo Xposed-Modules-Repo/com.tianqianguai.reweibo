@@ -5,8 +5,11 @@ import android.app.Application;
 import android.os.Handler;
 import android.os.Looper;
 
-import java.util.ArrayList;
-import java.util.HashMap;
+import java.io.File;
+import java.io.FileWriter;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -21,9 +24,27 @@ public class WeiboLiteHook {
     private static boolean sDone = false;
     private static Object sRecyclerView = null;
     private static Object sAdapter = null;
+    private static File sLogFile = null;
 
     private static void log(String msg) {
         XposedBridge.log("ReWeibo: " + msg);
+        if (sLogFile != null) {
+            try {
+                FileWriter fw = new FileWriter(sLogFile, true);
+                String ts = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+                fw.write(ts + " " + msg + "\n");
+                fw.close();
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void initLogFile() {
+        try {
+            File dir = new File("/data/data/com.weico.international/files");
+            if (!dir.exists()) dir.mkdirs();
+            sLogFile = new File(dir, "reweibo_weico.log");
+            log("=== Log started ===");
+        } catch (Throwable ignored) {}
     }
 
     private static void scheduleScroll() {
@@ -60,10 +81,10 @@ public class WeiboLiteHook {
     public static void hook(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             log("WeicoHook start");
+            initLogFile();
             removeSplashAd(lpparam.classLoader);
             removeTimelineAd(lpparam.classLoader);
 
-            // Feed reversal + floating button (same as WeiboFeedHook)
             Class<?> lmClass = XposedHelpers.findClass(
                 "androidx.recyclerview.widget.LinearLayoutManager",
                 lpparam.classLoader
@@ -81,6 +102,7 @@ public class WeiboLiteHook {
                 "androidx.recyclerview.widget.RecyclerView",
                 lpparam.classLoader
             );
+
             XposedHelpers.findAndHookMethod(rvClass, "setLayoutManager",
                 "androidx.recyclerview.widget.RecyclerView$LayoutManager",
                 new XC_MethodHook() {
@@ -102,26 +124,30 @@ public class WeiboLiteHook {
                                     if (adapter == null) return;
                                     int count = (int) XposedHelpers.callMethod(adapter, "getItemCount");
                                     if (count <= 1) return;
+                                    // Only capture TimelineAdapter (the actual feed adapter)
+                                    String adapterName = adapter.getClass().getName();
+                                    if (!adapterName.contains("TimelineAdapter")) return;
                                     sRecyclerView = rv;
                                     sAdapter = adapter;
                                     sLastCount = count;
-                                    log("RV captured, count=" + count);
+                                    log("Feed RV captured: " + adapterName + " count=" + count);
                                     Object ctx = XposedHelpers.callMethod(rv, "getContext");
                                     if (ctx instanceof Activity) {
                                         FloatingButton.attachToActivity((Activity) ctx, () -> {
-                                            log("Double-tap triggered");
-                                            if (!sDone) scheduleScroll();
+                                            log("Double-tap: start scroll");
+                                            try {
+                                                XposedHelpers.callMethod(sAdapter, "switch2LoadMore");
+                                            } catch (Throwable ignored) {}
+                                            sDone = false;
+                                            sIdleChecks = 0;
+                                            scheduleScroll();
+                                        }, () -> {
+                                            log("Single-tap: stop scroll");
+                                            sDone = true;
                                         });
                                     }
-                                    // Dump parent hierarchy to find pull-refresh component
-                                    Object parent = XposedHelpers.callMethod(rv, "getParent");
-                                    int depth = 0;
-                                    while (parent != null && depth < 8) {
-                                        log("Parent[" + depth + "]: " + parent.getClass().getName());
-                                        try { parent = XposedHelpers.callMethod(parent, "getParent"); } catch (Throwable e) { break; }
-                                        depth++;
-                                    }
                                     PullReverseUtil.findAndReverse(rv, lpparam.classLoader);
+                                    disablePullRefresh(rv, lpparam.classLoader);
                                 } catch (Throwable ignored) {}
                             }, 1000);
                         }
@@ -131,6 +157,38 @@ public class WeiboLiteHook {
             log("WeicoHook done");
         } catch (Throwable t) {
             log("WeicoHook failed: " + t.getMessage());
+        }
+    }
+
+    private static void disablePullRefresh(Object rv, ClassLoader cl) {
+        try {
+            Object parent = XposedHelpers.callMethod(rv, "getParent");
+            int depth = 0;
+            while (parent != null && depth < 8) {
+                String name = parent.getClass().getName();
+                if (name.contains("ESwpLayout") || name.contains("SwipeRefresh")) {
+                    log("Found pull-refresh: " + name);
+                    try {
+                        XposedHelpers.findAndHookMethod(
+                            "androidx.swiperefreshlayout.widget.SwipeRefreshLayout",
+                            cl, "canChildScrollUp",
+                            new XC_MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    param.setResult(true);
+                                }
+                            });
+                        log("  canChildScrollUp → always true");
+                    } catch (Throwable t) {
+                        log("  canChildScrollUp error: " + t.getMessage());
+                    }
+                    return;
+                }
+                try { parent = XposedHelpers.callMethod(parent, "getParent"); } catch (Throwable e) { break; }
+                depth++;
+            }
+        } catch (Throwable t) {
+            log("disablePullRefresh error: " + t.getMessage());
         }
     }
 

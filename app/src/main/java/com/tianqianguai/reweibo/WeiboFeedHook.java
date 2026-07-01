@@ -116,8 +116,11 @@ public class WeiboFeedHook {
                                 Object ctx = XposedHelpers.callMethod(rv, "getContext");
                                 if (ctx instanceof Activity) {
                                     FloatingButton.attachToActivity((Activity) ctx, () -> {
-                                        log("Double-tap triggered");
+                                        log("Double-tap: start scroll");
                                         if (!sDone) scheduleScroll();
+                                    }, () -> {
+                                        log("Single-tap: stop scroll");
+                                        sDone = true;
                                     });
                                 }
                                 PullReverseUtil.findAndReverse(rv, lpparam.classLoader);
