@@ -88,6 +88,7 @@ public class WeiboLiteHook {
     private static long sTopBarLastTapAtMs = 0L;
     private static float sTopBarLastTapX = 0f;
     private static float sTopBarLastTapY = 0f;
+    private static int sTopBarLastTapSide = -1;
     private static long sHomeTabLastTapAtMs = 0L;
     private static float sHomeTabLastTapX = 0f;
     private static float sHomeTabLastTapY = 0f;
@@ -231,23 +232,31 @@ public class WeiboLiteHook {
     private static void handleTopBarDoubleTap(MotionEvent event) {
         try {
             if (event.getActionMasked() != MotionEvent.ACTION_UP) return;
-            if (!isTimelineTopBarTap(event)) return;
+            int side = getTimelineTopBarTapSide(event);
+            if (side < 0) return;
 
             long now = SystemClock.elapsedRealtime();
             float x = event.getRawX();
             float y = event.getRawY();
             int slop = dpToPx(getAnyTimelineRecyclerView(), TOP_BAR_TAP_SLOP_DP);
             boolean isDoubleTap = now - sTopBarLastTapAtMs <= TOP_BAR_DOUBLE_TAP_MS
+                && side == sTopBarLastTapSide
                 && Math.abs(x - sTopBarLastTapX) <= slop
                 && Math.abs(y - sTopBarLastTapY) <= slop;
 
             sTopBarLastTapAtMs = now;
             sTopBarLastTapX = x;
             sTopBarLastTapY = y;
+            sTopBarLastTapSide = side;
 
             if (isDoubleTap) {
                 sTopBarLastTapAtMs = 0L;
-                jumpTimelineToAbsoluteTopForKnownRecyclerViews("top-bar-double-tap");
+                sTopBarLastTapSide = -1;
+                if (side == 0) {
+                    jumpTimelineToAbsoluteTopForKnownRecyclerViews("top-bar-left-double-tap");
+                } else {
+                    jumpTimelineToAbsoluteBottomForKnownRecyclerViews("top-bar-right-double-tap");
+                }
             }
         } catch (Throwable t) {
             log("Timeline top-bar double-tap error: " + t.getMessage());
@@ -305,16 +314,23 @@ public class WeiboLiteHook {
     }
 
     private static boolean isTimelineTopBarTap(MotionEvent event) {
+        return getTimelineTopBarTapSide(event) >= 0;
+    }
+
+    private static int getTimelineTopBarTapSide(MotionEvent event) {
         Object recyclerView = getAnyTimelineRecyclerView();
         int topLimit = dpToPx(recyclerView, TOP_BAR_TAP_MAX_DP);
-        if (event.getRawY() > topLimit) return false;
+        if (event.getRawY() > topLimit) return -1;
         try {
             int width = recyclerView == null ? 0 : callIntMethodSafe(recyclerView, "getWidth", 0);
             if (width > 0 && event.getRawX() >= width - dpToPx(recyclerView, TOP_BAR_RIGHT_EXCLUDE_DP)) {
-                return false;
+                return -1;
+            }
+            if (width > 0) {
+                return event.getRawX() < width / 2f ? 0 : 1;
             }
         } catch (Throwable ignored) {}
-        return true;
+        return 0;
     }
 
     private static void hookStaleVideoOpenRefresh(final ClassLoader cl) {
@@ -1023,22 +1039,36 @@ public class WeiboLiteHook {
             if (!(statusList instanceof List)) return;
 
             ArrayList statuses = mergeTimelineCumulativeStatuses((List) statusList, presenter, source);
+            persistTimelineNativeCacheList(presenter, statuses, source, false);
+        } catch (Throwable t) {
+            log("Timeline full cache persist error source=" + source + ": " + t.getMessage());
+        }
+    }
+
+    private static boolean persistTimelineNativeCacheList(Object presenter, List list, String source, boolean force) {
+        try {
+            if (presenter == null || list == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
+            rememberTimelinePresenter(presenter);
+
+            ArrayList statuses = collectTimelineStatuses(list);
             List filtered = filterTimelineContentless(statuses, presenter, source);
             if (filtered != statuses) {
                 statuses = new ArrayList(filtered);
             }
             int count = statuses.size();
-            if (count < TIMELINE_CACHE_MIN_ITEMS) return;
+            if (count < TIMELINE_CACHE_MIN_ITEMS) return false;
 
-            synchronized (sPersistedTimelineCacheCounts) {
-                Integer lastCount = sPersistedTimelineCacheCounts.get(presenter);
-                if (lastCount != null && lastCount.intValue() >= count) return;
+            if (!force) {
+                synchronized (sPersistedTimelineCacheCounts) {
+                    Integer lastCount = sPersistedTimelineCacheCounts.get(presenter);
+                    if (lastCount != null && lastCount.intValue() >= count) return false;
+                }
             }
 
             Object action = getTimelineAction(presenter);
             if (action == null) {
                 log("Timeline native cache persist skipped source=" + source + " count=" + count + " no action");
-                return;
+                return false;
             }
 
             String maxId = getTimelineCacheMaxId(action, statuses);
@@ -1048,14 +1078,17 @@ public class WeiboLiteHook {
             Class<?> diskCacheClass = Class.forName("com.weico.diskcache.DiskCache", false, action.getClass().getClassLoader());
             Object cache = callStaticNoArg(diskCacheClass, "getInstance");
             XposedHelpers.callMethod(cache, "cache", result, builder, true);
-            persistTimelineShadowCache(source, count, maxId, false);
+            persistTimelineShadowCache(source, count, maxId, force);
 
             synchronized (sPersistedTimelineCacheCounts) {
                 sPersistedTimelineCacheCounts.put(presenter, Integer.valueOf(count));
             }
-            log("Timeline full cache persisted source=" + source + " count=" + count + " maxId=" + maxId);
+            log("Timeline full cache persisted source=" + source + " count=" + count
+                + " maxId=" + maxId + " force=" + force);
+            return true;
         } catch (Throwable t) {
             log("Timeline full cache persist error source=" + source + ": " + t.getMessage());
+            return false;
         }
     }
 
@@ -1379,7 +1412,11 @@ public class WeiboLiteHook {
             }
             sTimelineOldestFirstMode = false;
             sTimelineRestoredCacheMode = true;
+            boolean persisted = persistTimelineNativeCacheList(presenter, sorted, source + "-merged", true);
             log("Timeline refresh merged cache restored source=" + source + " count=" + count);
+            if (!persisted) {
+                log("Timeline refresh merged cache persist skipped source=" + source + " count=" + count);
+            }
             return true;
         } catch (Throwable t) {
             log("Timeline refresh merged cache error source=" + source + ": " + t.getMessage());
@@ -2212,13 +2249,43 @@ public class WeiboLiteHook {
         }
     }
 
+    private static void jumpTimelineToAbsoluteBottomForKnownRecyclerViews(String source) {
+        ArrayList recyclerViews;
+        synchronized (sTopAnchorStates) {
+            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
+        }
+        boolean jumped = false;
+        for (int i = 0; i < recyclerViews.size(); i++) {
+            jumped |= jumpTimelineToAbsoluteBottom(recyclerViews.get(i), source, 0);
+        }
+        if (!jumped) {
+            log("Timeline absolute bottom jump skipped source=" + source + " no recycler");
+        }
+    }
+
     private static boolean jumpTimelineToAbsoluteTop(final Object recyclerView, final String source, final int attempt) {
+        return jumpTimelineToAbsoluteEdge(recyclerView, source, attempt, true);
+    }
+
+    private static boolean jumpTimelineToAbsoluteBottom(final Object recyclerView, final String source, final int attempt) {
+        return jumpTimelineToAbsoluteEdge(recyclerView, source, attempt, false);
+    }
+
+    private static boolean jumpTimelineToAbsoluteEdge(
+        final Object recyclerView,
+        final String source,
+        final int attempt,
+        final boolean top
+    ) {
         try {
             if (!isTimelineRecyclerView(recyclerView)) return false;
 
-            int target = getTimelineAbsoluteTopAdapterPosition(recyclerView);
+            int target = top
+                ? getTimelineAbsoluteTopAdapterPosition(recyclerView)
+                : getTimelineAbsoluteBottomAdapterPosition(recyclerView);
+            String edge = top ? "top" : "bottom";
             if (target < 0) {
-                log("Timeline absolute top jump skipped source=" + source + " no target");
+                log("Timeline absolute " + edge + " jump skipped source=" + source + " no target");
                 return false;
             }
 
@@ -2244,20 +2311,21 @@ public class WeiboLiteHook {
                 state.untilElapsedMs = 0L;
                 state.attempts = TOP_ANCHOR_MAX_ATTEMPTS;
             }
-            log("Timeline absolute top jumped source=" + source + " target=" + target
+            log("Timeline absolute " + edge + " jumped source=" + source + " target=" + target
                 + " attempt=" + attempt + " offset=" + offset + " usedOffset=" + usedOffset + " "
                 + describeTimelineViewport(recyclerView, layoutManager));
             if (!isTimelineTargetVisible(layoutManager, target) && attempt < TOP_BAR_JUMP_MAX_ATTEMPTS) {
                 new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        jumpTimelineToAbsoluteTop(recyclerView, source, attempt + 1);
+                        jumpTimelineToAbsoluteEdge(recyclerView, source, attempt + 1, top);
                     }
                 }, TOP_BAR_JUMP_RETRY_MS);
             }
             return true;
         } catch (Throwable t) {
-            log("Timeline absolute top jump error source=" + source + ": " + t.getMessage());
+            log("Timeline absolute " + (top ? "top" : "bottom")
+                + " jump error source=" + source + ": " + t.getMessage());
             return false;
         }
     }
@@ -2272,6 +2340,21 @@ public class WeiboLiteHook {
             if (dataCount >= TIMELINE_CACHE_MIN_ITEMS) {
                 if (sTimelineOldestFirstMode) return Math.max(0, headerCount);
                 return Math.max(0, headerCount) + dataCount - 1;
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static int getTimelineAbsoluteBottomAdapterPosition(Object recyclerView) {
+        try {
+            Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
+            if (adapter == null) return -1;
+
+            int dataCount = callIntMethodSafe(adapter, "getCount", -1);
+            int headerCount = callIntMethodSafe(adapter, "getHeaderCount", 0);
+            if (dataCount >= TIMELINE_CACHE_MIN_ITEMS) {
+                if (sTimelineOldestFirstMode) return Math.max(0, headerCount) + dataCount - 1;
+                return Math.max(0, headerCount);
             }
         } catch (Throwable ignored) {}
         return -1;

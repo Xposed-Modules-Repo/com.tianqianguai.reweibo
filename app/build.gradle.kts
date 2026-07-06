@@ -2,6 +2,20 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
+fun releaseProperty(name: String): String? =
+    providers.gradleProperty(name).orNull ?: providers.environmentVariable(name).orNull
+
+val releaseStoreFilePath = releaseProperty("REWEIBO_RELEASE_STORE_FILE")
+val releaseStorePassword = releaseProperty("REWEIBO_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = releaseProperty("REWEIBO_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = releaseProperty("REWEIBO_RELEASE_KEY_PASSWORD")
+val hasReleaseSigning = listOf(
+    releaseStoreFilePath,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.tianqianguai.reweibo"
     compileSdk = 37
@@ -15,17 +29,21 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFilePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -39,9 +57,6 @@ android {
 }
 
 dependencies {
-    implementation(libs.androidx.appcompat)
-    implementation(libs.androidx.core.ktx)
-    implementation(libs.material)
     compileOnly(files("libs/xposed-bridge-api.jar"))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
