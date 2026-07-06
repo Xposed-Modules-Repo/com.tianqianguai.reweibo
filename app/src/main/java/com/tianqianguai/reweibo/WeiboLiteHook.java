@@ -50,8 +50,11 @@ public class WeiboLiteHook {
     private static final long TOP_BAR_JUMP_RETRY_MS = 120L;
     private static final long VIDEO_URL_EXPIRY_MARGIN_SEC = 300L;
     private static final long VIDEO_OPEN_REFRESH_BYPASS_MS = 30000L;
+    private static final long REFRESH_ANCHOR_WINDOW_MS = 30000L;
+    private static final long HOME_TAB_DOUBLE_TAP_MS = 500L;
     private static final int TOP_ANCHOR_MAX_ATTEMPTS = 80;
     private static final int TOP_BAR_JUMP_MAX_ATTEMPTS = 8;
+    private static final int REFRESH_ANCHOR_MAX_ATTEMPTS = 12;
     private static final int PRELOAD_DONE_MIN_ITEMS = 1300;
     private static final int PRELOAD_RESTORED_TRUST_MIN_ITEMS = 1800;
     private static final int PRELOAD_STABLE_DONE_ROUNDS = 8;
@@ -59,6 +62,8 @@ public class WeiboLiteHook {
     private static final int TOP_BAR_TAP_MAX_DP = 100;
     private static final int TOP_BAR_TAP_SLOP_DP = 64;
     private static final int TOP_BAR_RIGHT_EXCLUDE_DP = 72;
+    private static final int HOME_TAB_TAP_BOTTOM_DP = 128;
+    private static final float HOME_TAB_MAX_X_RATIO = 0.30f;
     private static final String PRELOAD_DONE_FILE = "reweibo_weico_preload_done";
     private static final String LAST_READ_FILE = "reweibo_weico_last_read";
     private static final String TIMELINE_FULL_CACHE_PREFIX = "reweibo_fullTimeline_";
@@ -83,8 +88,19 @@ public class WeiboLiteHook {
     private static long sTopBarLastTapAtMs = 0L;
     private static float sTopBarLastTapX = 0f;
     private static float sTopBarLastTapY = 0f;
+    private static long sHomeTabLastTapAtMs = 0L;
+    private static float sHomeTabLastTapX = 0f;
+    private static float sHomeTabLastTapY = 0f;
+    private static long sHomeTabPendingAnchorStatusId = 0L;
+    private static long sHomeTabPendingAnchorUntilMs = 0L;
+    private static int sHomeTabPendingAnchorPosition = -1;
+    private static int sHomeTabPendingAnchorFirst = -1;
+    private static int sHomeTabPendingAnchorLast = -1;
     private static long sVideoOpenRefreshBypassStatusId = 0L;
     private static long sVideoOpenRefreshBypassUntilMs = 0L;
+    private static long sTimelineRefreshAnchorStatusId = 0L;
+    private static long sTimelineRefreshAnchorUntilMs = 0L;
+    private static int sTimelineRefreshAnchorGeneration = 0;
     private static int sTimelineShadowCacheCount = 0;
     private static boolean sTimelineCursorActionDumped = false;
 
@@ -200,6 +216,7 @@ public class WeiboLiteHook {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         Object event = param.args[0];
                         if (event instanceof MotionEvent) {
+                            handleHomeTabDoubleTap((MotionEvent) event);
                             handleTopBarDoubleTap((MotionEvent) event);
                         }
                     }
@@ -234,6 +251,56 @@ public class WeiboLiteHook {
             }
         } catch (Throwable t) {
             log("Timeline top-bar double-tap error: " + t.getMessage());
+        }
+    }
+
+    private static void handleHomeTabDoubleTap(MotionEvent event) {
+        try {
+            int action = event.getActionMasked();
+            if (action != MotionEvent.ACTION_DOWN && action != MotionEvent.ACTION_UP) return;
+            if (!isTimelineHomeTabTap(event)) return;
+
+            long now = SystemClock.elapsedRealtime();
+            if (action == MotionEvent.ACTION_DOWN) {
+                captureHomeTabPendingRefreshAnchor(now);
+                return;
+            }
+
+            float x = event.getRawX();
+            float y = event.getRawY();
+            captureHomeTabPendingRefreshAnchor(now);
+            int slop = dpToPx(getAnyTimelineRecyclerView(), TOP_BAR_TAP_SLOP_DP);
+            boolean isDoubleTap = now - sHomeTabLastTapAtMs <= HOME_TAB_DOUBLE_TAP_MS
+                && Math.abs(x - sHomeTabLastTapX) <= slop
+                && Math.abs(y - sHomeTabLastTapY) <= slop;
+
+            sHomeTabLastTapAtMs = now;
+            sHomeTabLastTapX = x;
+            sHomeTabLastTapY = y;
+
+            if (isDoubleTap) {
+                sHomeTabLastTapAtMs = 0L;
+                if (!captureTimelineRefreshAnchorFromPendingHomeTab("home-tab-double-tap")
+                    && !captureTimelineRefreshAnchorForKnownRecyclerViews(sLastTimelinePresenter, "home-tab-double-tap")) {
+                    log("Timeline refresh anchor capture skipped source=home-tab-double-tap");
+                }
+            }
+        } catch (Throwable t) {
+            log("Timeline home-tab double-tap error: " + t.getMessage());
+        }
+    }
+
+    private static boolean isTimelineHomeTabTap(MotionEvent event) {
+        Object recyclerView = getAnyTimelineRecyclerView();
+        if (recyclerView == null) return false;
+        try {
+            int height = callIntMethodSafe(recyclerView, "getHeight", 0);
+            int width = callIntMethodSafe(recyclerView, "getWidth", 0);
+            if (height <= 0 || width <= 0) return false;
+            if (event.getRawY() < height - dpToPx(recyclerView, HOME_TAB_TAP_BOTTOM_DP)) return false;
+            return event.getRawX() >= 0f && event.getRawX() <= width * HOME_TAB_MAX_X_RATIO;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -642,7 +709,9 @@ public class WeiboLiteHook {
                 protected void afterHookedMethod(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
-                        finishTimelineTopAnchorForKnownRecyclerViews("presenter-addData-suppressed");
+                        if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-addData-suppressed")) {
+                            finishTimelineTopAnchorForKnownRecyclerViews("presenter-addData-suppressed");
+                        }
                         return;
                     }
                     List incomingData = null;
@@ -654,14 +723,23 @@ public class WeiboLiteHook {
                     persistTimelineNativeCache(param.thisObject, "presenter-addData");
                     markTimelineNoMoreIfEmptyPage(param.thisObject, incomingData, "presenter-addData");
                     scheduleTimelinePreload(param.thisObject, "presenter-addData");
+                    boolean anchoredRefresh = scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-addData");
                     if (isTimelinePreloadStopped(param.thisObject)) {
-                        finishTimelineTopAnchorForKnownRecyclerViews("presenter-addData-stop");
-                    } else {
+                        if (!anchoredRefresh) {
+                            finishTimelineTopAnchorForKnownRecyclerViews("presenter-addData-stop");
+                        }
+                    } else if (!anchoredRefresh) {
                         beginTimelineTopAnchorForKnownRecyclerViews("presenter-addData", false);
                     }
                 }
             });
             XposedHelpers.findAndHookMethod(presenterClass, "setData", List.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    rememberTimelinePresenter(param.thisObject);
+                    captureTimelineRefreshAnchorIfNeeded(param.thisObject, "presenter-setData-before");
+                }
+
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
@@ -671,9 +749,22 @@ public class WeiboLiteHook {
                         return;
                     }
                     resetPreloadState(param.thisObject, "presenter-setData");
+                    List incomingData = param.args != null && param.args.length > 0 && param.args[0] instanceof List
+                        ? (List) param.args[0]
+                        : null;
+                    if (getActiveTimelineRefreshAnchorStatusId() > 0L
+                        && restoreTimelineCumulativeCache(param.thisObject, incomingData, "presenter-setData-refresh")) {
+                        if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-setData-refresh")) {
+                            beginTimelineTopAnchorForKnownRecyclerViews("presenter-setData-refresh", true);
+                        }
+                        scheduleTimelinePreload(param.thisObject, "presenter-setData-refresh");
+                        return;
+                    }
                     if (isTimelinePreloadDone()
                         && restoreTimelineNativeCache(param.thisObject, "presenter-setData-warmed")) {
-                        beginTimelineTopAnchorForKnownRecyclerViews("presenter-cache-restore", true);
+                        if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-cache-restore")) {
+                            beginTimelineTopAnchorForKnownRecyclerViews("presenter-cache-restore", true);
+                        }
                         scheduleTimelinePreload(param.thisObject, "presenter-cache-restore");
                         return;
                     }
@@ -682,11 +773,15 @@ public class WeiboLiteHook {
                         persistTimelineNativeCache(param.thisObject, "presenter-setData");
                     }
                     if (restoreTimelineNativeCache(param.thisObject, "presenter-setData")) {
-                        beginTimelineTopAnchorForKnownRecyclerViews("presenter-cache-restore", true);
+                        if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-cache-restore")) {
+                            beginTimelineTopAnchorForKnownRecyclerViews("presenter-cache-restore", true);
+                        }
                         scheduleTimelinePreload(param.thisObject, "presenter-cache-restore");
                         return;
                     }
-                    beginTimelineTopAnchorForKnownRecyclerViews("presenter-setData", true);
+                    if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-setData")) {
+                        beginTimelineTopAnchorForKnownRecyclerViews("presenter-setData", true);
+                    }
                     scheduleTimelinePreload(param.thisObject, "presenter-setData");
                 }
             });
@@ -695,12 +790,15 @@ public class WeiboLiteHook {
                 protected void afterHookedMethod(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
-                        finishTimelineTopAnchorForKnownRecyclerViews("presenter-distinct-suppressed");
+                        if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-distinct-suppressed")) {
+                            finishTimelineTopAnchorForKnownRecyclerViews("presenter-distinct-suppressed");
+                        }
                         return;
                     }
                     normalizePresenterTimeline(param.thisObject, "presenter-distinct");
                     persistTimelineNativeCache(param.thisObject, "presenter-distinct");
-                    if (!isTimelinePreloadStopped(param.thisObject)) {
+                    if (!isTimelinePreloadStopped(param.thisObject)
+                        && !scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-distinct")) {
                         beginTimelineTopAnchorForKnownRecyclerViews("presenter-distinct", false);
                     }
                 }
@@ -744,6 +842,9 @@ public class WeiboLiteHook {
                     protected void afterHookedMethod(MethodHookParam param) {
                         Object action = getOuterAction(param.thisObject);
                         boolean loadNew = getBooleanFieldSafe(param.thisObject, "$isLoadNew", false);
+                        if (loadNew) {
+                            captureTimelineRefreshAnchorForKnownRecyclerViews(action, "v2-network-loadNew");
+                        }
                         if (param.args[0] instanceof List) {
                             List list = (List) param.args[0];
                             hydrateTimelineStatusText(list, "v2-network");
@@ -796,6 +897,9 @@ public class WeiboLiteHook {
                         Object result = param.getResult();
                         Object action = getOuterAction(param.thisObject);
                         boolean loadNew = getBooleanFieldSafe(param.thisObject, "$isLoadNew", false);
+                        if (loadNew) {
+                            captureTimelineRefreshAnchorForKnownRecyclerViews(action, "v3-network-loadNew");
+                        }
                         if (result instanceof List) {
                             hydrateTimelineStatusText((List) result, "v3-network");
                             List filtered = filterTimelineAds((List) result, action, "v3-network");
@@ -1151,7 +1255,7 @@ public class WeiboLiteHook {
     private static boolean restoreTimelineNativeCache(Object presenter, String source) {
         try {
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
-            if (getTimelineStatusCount(presenter) >= PRELOAD_DONE_MIN_ITEMS) return false;
+            if (getTimelinePresenterStatusCount(presenter) >= PRELOAD_DONE_MIN_ITEMS) return false;
 
             Object action = getTimelineAction(presenter);
             if (action == null) {
@@ -1228,7 +1332,7 @@ public class WeiboLiteHook {
         }
 
         int expected = countTimelineStatuses(data);
-        if (getTimelineStatusCount(presenter) < Math.min(PRELOAD_DONE_MIN_ITEMS, expected)) {
+        if (getTimelinePresenterStatusCount(presenter) < Math.min(PRELOAD_DONE_MIN_ITEMS, expected)) {
             try {
                 XposedHelpers.callMethod(presenter, "setData", data);
             } catch (Throwable t) {
@@ -1237,6 +1341,50 @@ public class WeiboLiteHook {
             }
         }
         log("Presenter timeline restored from cache source=" + source + " size=" + data.size());
+    }
+
+    private static boolean restoreTimelineCumulativeCache(Object presenter, List incomingData, String source) {
+        try {
+            if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
+            ArrayList statuses;
+            if (incomingData != null) {
+                statuses = mergeTimelineCumulativeStatuses(incomingData, presenter, source + "-incoming");
+            } else {
+                synchronized (sTimelineCumulativeStatusesById) {
+                    statuses = new ArrayList(sTimelineCumulativeStatusesById.values());
+                }
+            }
+            hydrateTimelineStatusText(statuses, source);
+            List filtered = filterTimelineAds(statuses, presenter, source);
+            filtered = filterTimelineContentless(filtered, presenter, source);
+            List sorted = sortTimelineNewestFirst(filtered, presenter, source, false);
+            int count = countTimelineStatuses(sorted);
+            if (count < PRELOAD_DONE_MIN_ITEMS) {
+                log("Timeline refresh merged cache skipped source=" + source + " count=" + count);
+                return false;
+            }
+
+            Object action = getTimelineAction(presenter);
+            if (action != null) {
+                syncTimelineActionMaxId(action, sorted, source);
+            }
+            setTimelineCacheRestoring(presenter, true);
+            try {
+                setPresenterTimelineData(presenter, sorted, source);
+            } finally {
+                setTimelineCacheRestoring(presenter, false);
+            }
+            synchronized (sPersistedTimelineCacheCounts) {
+                sPersistedTimelineCacheCounts.put(presenter, Integer.valueOf(count));
+            }
+            sTimelineOldestFirstMode = false;
+            sTimelineRestoredCacheMode = true;
+            log("Timeline refresh merged cache restored source=" + source + " count=" + count);
+            return true;
+        } catch (Throwable t) {
+            log("Timeline refresh merged cache error source=" + source + ": " + t.getMessage());
+            return false;
+        }
     }
 
     private static boolean isTimelineCacheRestoring(Object presenter) {
@@ -1738,6 +1886,289 @@ public class WeiboLiteHook {
         return null;
     }
 
+    private static void captureTimelineRefreshAnchorIfNeeded(Object owner, String source) {
+        if (getActiveTimelineRefreshAnchorStatusId() > 0L) return;
+        if (owner == null || !"-1".equals(getTimelineGroupId(owner))) return;
+        if (!sTimelineRestoredCacheMode && !isTimelinePreloadDone()) return;
+        if (!captureTimelineRefreshAnchorFromPendingHomeTab(source)) {
+            captureTimelineRefreshAnchorForKnownRecyclerViews(owner, source);
+        }
+    }
+
+    private static boolean captureTimelineRefreshAnchorForKnownRecyclerViews(Object owner, String source) {
+        if (getActiveTimelineRefreshAnchorStatusId() > 0L) return true;
+        if (owner == null || !"-1".equals(getTimelineGroupId(owner))) return false;
+        if (captureTimelineRefreshAnchorFromPendingHomeTab(source)) return true;
+
+        ArrayList recyclerViews;
+        synchronized (sTopAnchorStates) {
+            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
+        }
+        for (int i = 0; i < recyclerViews.size(); i++) {
+            Object recyclerView = recyclerViews.get(i);
+            int[] viewport = new int[3];
+            long statusId = getVisibleTimelineStatusId(recyclerView, viewport);
+            if (statusId <= 0L) continue;
+            long lastReadId = getLastReadStatusId();
+            if (lastReadId > 0L && lastReadId != statusId && isTimelinePreloadDone()
+                && viewport[0] >= 0 && viewport[0] < 20
+                && (hasTimelineStatusInCumulativeCache(lastReadId)
+                    || getTimelineStatusAdapterPosition(recyclerView, lastReadId) >= 0)) {
+                return setTimelineRefreshAnchor(lastReadId, source + "-last-read", -1, viewport[1], viewport[2]);
+            }
+            return setTimelineRefreshAnchor(statusId, source, viewport[0], viewport[1], viewport[2]);
+        }
+        return getActiveTimelineRefreshAnchorStatusId() > 0L;
+    }
+
+    private static void captureHomeTabPendingRefreshAnchor(long now) {
+        try {
+            if (sHomeTabPendingAnchorStatusId > 0L
+                && now <= sHomeTabPendingAnchorUntilMs
+                && sHomeTabLastTapAtMs > 0L
+                && now - sHomeTabLastTapAtMs <= HOME_TAB_DOUBLE_TAP_MS) {
+                return;
+            }
+            Object recyclerView = getAnyTimelineRecyclerView();
+            int[] viewport = new int[3];
+            long statusId = getVisibleTimelineStatusId(recyclerView, viewport);
+            if (statusId <= 0L) return;
+            sHomeTabPendingAnchorStatusId = statusId;
+            sHomeTabPendingAnchorUntilMs = now + REFRESH_ANCHOR_WINDOW_MS;
+            sHomeTabPendingAnchorPosition = viewport[0];
+            sHomeTabPendingAnchorFirst = viewport[1];
+            sHomeTabPendingAnchorLast = viewport[2];
+            log("Timeline refresh pending anchor captured source=home-tab-tap"
+                + " id=" + statusId
+                + " position=" + viewport[0]
+                + " visible=" + viewport[1] + ".." + viewport[2]);
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean captureTimelineRefreshAnchorFromPendingHomeTab(String source) {
+        long now = SystemClock.elapsedRealtime();
+        long statusId = sHomeTabPendingAnchorStatusId;
+        if (statusId <= 0L || now > sHomeTabPendingAnchorUntilMs) return false;
+        boolean captured = setTimelineRefreshAnchor(
+            statusId,
+            source + "-home-pending",
+            sHomeTabPendingAnchorPosition,
+            sHomeTabPendingAnchorFirst,
+            sHomeTabPendingAnchorLast
+        );
+        if (captured) {
+            sHomeTabPendingAnchorStatusId = 0L;
+            sHomeTabPendingAnchorUntilMs = 0L;
+            sHomeTabPendingAnchorPosition = -1;
+            sHomeTabPendingAnchorFirst = -1;
+            sHomeTabPendingAnchorLast = -1;
+        }
+        return captured;
+    }
+
+    private static boolean setTimelineRefreshAnchor(long statusId, String source, int position, int first, int last) {
+        if (statusId <= 0L) return false;
+        if (getActiveTimelineRefreshAnchorStatusId() > 0L) return true;
+        sTimelineRefreshAnchorStatusId = statusId;
+        sTimelineRefreshAnchorUntilMs = SystemClock.elapsedRealtime() + REFRESH_ANCHOR_WINDOW_MS;
+        sTimelineRefreshAnchorGeneration++;
+        cancelTimelineTopAnchorsForRefresh(source);
+        log("Timeline refresh anchor captured source=" + source
+            + " id=" + statusId
+            + " position=" + position
+            + " visible=" + first + ".." + last);
+        return true;
+    }
+
+    private static long getVisibleTimelineStatusId(Object recyclerView, int[] viewport) {
+        try {
+            if (!isTimelineRecyclerView(recyclerView)) return 0L;
+            Object layoutManager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
+            Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
+            int headerCount = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
+            int first = callIntMethodSafe(layoutManager, "findFirstVisibleItemPosition", -1);
+            int last = callIntMethodSafe(layoutManager, "findLastVisibleItemPosition", -1);
+            int position = findVisibleTimelineStatusPosition(adapter, headerCount, first, last);
+            if (viewport != null && viewport.length >= 3) {
+                viewport[0] = position;
+                viewport[1] = first;
+                viewport[2] = last;
+            }
+            if (position < 0) return 0L;
+            return getTimelineAdapterDataStatusId(adapter, position - Math.max(0, headerCount));
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private static boolean scheduleTimelineRefreshAnchorForKnownRecyclerViews(String source) {
+        long statusId = getActiveTimelineRefreshAnchorStatusId();
+        if (statusId <= 0L) return false;
+
+        cancelTimelineTopAnchorsForRefresh(source);
+        ArrayList recyclerViews;
+        synchronized (sTopAnchorStates) {
+            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
+        }
+        boolean scheduled = false;
+        int generation = sTimelineRefreshAnchorGeneration;
+        for (int i = 0; i < recyclerViews.size(); i++) {
+            Object recyclerView = recyclerViews.get(i);
+            if (!isTimelineRecyclerView(recyclerView)) continue;
+            scheduled = true;
+            scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, 0, 50L);
+            scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, 1, 250L);
+            scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, 2, 900L);
+        }
+        if (!scheduled) {
+            log("Timeline refresh anchor pending source=" + source + " id=" + statusId + " no recycler");
+        }
+        return scheduled;
+    }
+
+    private static void scheduleTimelineRefreshAnchor(
+        final Object recyclerView,
+        final long statusId,
+        final int generation,
+        final String source,
+        final int attempt,
+        long delayMs
+    ) {
+        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                anchorTimelineRefreshPosition(recyclerView, statusId, generation, source, attempt);
+            }
+        }, delayMs);
+    }
+
+    private static void anchorTimelineRefreshPosition(
+        final Object recyclerView,
+        final long statusId,
+        final int generation,
+        final String source,
+        final int attempt
+    ) {
+        try {
+            if (statusId <= 0L || statusId != getActiveTimelineRefreshAnchorStatusId()) return;
+            if (generation != sTimelineRefreshAnchorGeneration) return;
+            if (!isTimelineRecyclerView(recyclerView)) return;
+
+            int target = getTimelineStatusAdapterPosition(recyclerView, statusId);
+            if (target < 0) {
+                if (attempt < REFRESH_ANCHOR_MAX_ATTEMPTS) {
+                    scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, attempt + 1, 180L);
+                } else {
+                    log("Timeline refresh anchor target missing source=" + source + " id=" + statusId);
+                }
+                return;
+            }
+
+            Object layoutManager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
+            int offset = getTimelineTopOffset(recyclerView);
+            boolean usedOffset = false;
+            try {
+                int layoutOffset = sTimelineRestoredCacheMode
+                    ? getTimelineLayoutManagerOffset(recyclerView, layoutManager, offset)
+                    : offset;
+                XposedHelpers.callMethod(layoutManager, "scrollToPositionWithOffset", target, layoutOffset);
+                usedOffset = true;
+            } catch (Throwable ignored) {
+                XposedHelpers.callMethod(recyclerView, "scrollToPosition", target);
+            }
+
+            if (!isTimelineTargetVisible(layoutManager, target)) {
+                scrollTimelineTowardTarget(recyclerView, layoutManager, target);
+            }
+
+            if (isTimelineTargetVisible(layoutManager, target)) {
+                consumeTimelineRefreshAnchor(statusId);
+                cancelTimelineTopAnchorsForRefresh(source + "-done");
+                log("Timeline refresh anchor restored source=" + source
+                    + " id=" + statusId
+                    + " target=" + target
+                    + " attempt=" + attempt
+                    + " offset=" + offset
+                    + " usedOffset=" + usedOffset
+                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+                return;
+            }
+
+            if (attempt < REFRESH_ANCHOR_MAX_ATTEMPTS) {
+                scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, attempt + 1, 180L);
+            } else {
+                log("Timeline refresh anchor not visible source=" + source
+                    + " id=" + statusId
+                    + " target=" + target
+                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+            }
+        } catch (Throwable t) {
+            log("Timeline refresh anchor error source=" + source + ": " + t.getMessage());
+        }
+    }
+
+    private static int getTimelineStatusAdapterPosition(Object recyclerView, long statusId) {
+        try {
+            Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
+            int headerCount = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
+            return getTimelineStatusAdapterPosition(adapter, headerCount, statusId);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    private static int getTimelineStatusAdapterPosition(Object adapter, int headerCount, long statusId) {
+        if (adapter == null || statusId <= 0L) return -1;
+        int dataCount = callIntMethodSafe(adapter, "getCount", -1);
+        if (dataCount < 1) return -1;
+        for (int i = 0; i < dataCount; i++) {
+            if (getTimelineAdapterDataStatusId(adapter, i) == statusId) {
+                return Math.max(0, headerCount) + i;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean hasTimelineStatusInCumulativeCache(long statusId) {
+        if (statusId <= 0L) return false;
+        synchronized (sTimelineCumulativeStatusesById) {
+            return sTimelineCumulativeStatusesById.containsKey(Long.valueOf(statusId));
+        }
+    }
+
+    private static long getActiveTimelineRefreshAnchorStatusId() {
+        if (sTimelineRefreshAnchorStatusId <= 0L) return 0L;
+        if (SystemClock.elapsedRealtime() <= sTimelineRefreshAnchorUntilMs) {
+            return sTimelineRefreshAnchorStatusId;
+        }
+        sTimelineRefreshAnchorStatusId = 0L;
+        sTimelineRefreshAnchorUntilMs = 0L;
+        return 0L;
+    }
+
+    private static void consumeTimelineRefreshAnchor(long statusId) {
+        if (statusId == sTimelineRefreshAnchorStatusId) {
+            sTimelineRefreshAnchorStatusId = 0L;
+            sTimelineRefreshAnchorUntilMs = 0L;
+        }
+    }
+
+    private static void cancelTimelineTopAnchorsForRefresh(String source) {
+        synchronized (sTopAnchorStates) {
+            ArrayList recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
+            for (int i = 0; i < recyclerViews.size(); i++) {
+                Object recyclerView = recyclerViews.get(i);
+                TopAnchorState state = getTopAnchorStateLocked(recyclerView);
+                state.generation++;
+                state.userTouched = true;
+                state.untilElapsedMs = 0L;
+                state.attempts = TOP_ANCHOR_MAX_ATTEMPTS;
+                state.finishing = false;
+            }
+        }
+        sSuppressTimelineLoadMoreUntilMs = 0L;
+    }
+
     private static TopAnchorState getTopAnchorStateLocked(Object recyclerView) {
         TopAnchorState state = sTopAnchorStates.get(recyclerView);
         if (state == null) {
@@ -2129,6 +2560,10 @@ public class WeiboLiteHook {
         try {
             if (!isTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
             if (!sTimelineRestoredCacheMode || !isTimelinePreloadDone()) return;
+            if (getActiveTimelineRefreshAnchorStatusId() > 0L) {
+                log("Timeline last-read save skipped source=" + source + " reason=refresh-anchor");
+                return;
+            }
             long now = SystemClock.elapsedRealtime();
             if (now - sLastReadPersistAtMs < 1000L) return;
 
@@ -2692,6 +3127,18 @@ public class WeiboLiteHook {
 
     private static int getTimelineStatusCount(Object presenter) {
         try {
+            int count = getTimelinePresenterStatusCount(presenter);
+            if ("-1".equals(getTimelineGroupId(presenter))) {
+                count = Math.max(count, getTimelineCumulativeStatusCount());
+            }
+            return count;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private static int getTimelinePresenterStatusCount(Object presenter) {
+        try {
             Object statusList = XposedHelpers.callMethod(presenter, "getStatusList");
             if (!(statusList instanceof List)) return 0;
             List list = (List) statusList;
@@ -2702,9 +3149,6 @@ public class WeiboLiteHook {
                     && !isTimelineAdStatus(status) && !isTimelineContentlessStatus(status)) {
                     count++;
                 }
-            }
-            if ("-1".equals(getTimelineGroupId(presenter))) {
-                count = Math.max(count, getTimelineCumulativeStatusCount());
             }
             return count;
         } catch (Throwable ignored) {
