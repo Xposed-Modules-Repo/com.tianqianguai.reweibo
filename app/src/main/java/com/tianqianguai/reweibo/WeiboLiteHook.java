@@ -1336,8 +1336,10 @@ public class WeiboLiteHook {
         for (int i = 0; i < list.size(); i++) {
             Object status = unwrapStatus(list.get(i));
             long id = getStatusId(status);
-            if (status == null || id <= 0 || isLoadMoreStatus(status) || isTimelineAdStatus(status)
-                || isTimelineContentlessStatus(status)) {
+            if (status == null || id <= 0 || isLoadMoreStatus(status)) {
+                continue;
+            }
+            if (isTimelineAdStatus(status) || isTimelineContentlessStatus(status)) {
                 continue;
             }
             Long key = Long.valueOf(id);
@@ -1421,7 +1423,7 @@ public class WeiboLiteHook {
         if (changed > 0) {
             log("Timeline text hydrated source=" + source + " count=" + changed);
         }
-        return changed;
+        return changed + hydrateTimelineStatusMedia(list, source);
     }
 
     private static int hydrateStatusText(Object status, int depth) {
@@ -1447,6 +1449,82 @@ public class WeiboLiteHook {
         changed += hydrateStatusText(getObjectMethodOrField(status, "getRetweeted_status", "retweeted_status"), depth + 1);
         changed += hydrateStatusText(getObjectMethodOrField(status, null, "reprinted_status"), depth + 1);
         return changed;
+    }
+
+    private static int hydrateTimelineStatusMedia(List list, String source) {
+        if (list == null || list.isEmpty()) return 0;
+        int changed = 0;
+        for (int i = 0; i < list.size(); i++) {
+            changed += hydrateStatusMedia(unwrapStatus(list.get(i)), 0);
+        }
+        if (changed > 0) {
+            log("Timeline media hydrated source=" + source + " count=" + changed);
+        }
+        return changed;
+    }
+
+    private static int hydrateStatusMedia(Object status, int depth) {
+        if (status == null || depth > 2) return 0;
+        if (!hasTimelinePicSource(status, depth)) return 0;
+
+        int before = countTimelineDisplayImages(status, depth);
+        try {
+            Class<?> statusClass = Class.forName(
+                "com.weico.international.model.sina.Status",
+                false,
+                status.getClass().getClassLoader()
+            );
+            java.lang.reflect.Method method = statusClass.getDeclaredMethod("transformPicUrls", statusClass);
+            method.setAccessible(true);
+            method.invoke(null, status);
+            resetTimelineStatusViewType(status, depth);
+            int after = countTimelineDisplayImages(status, depth);
+            return after > before ? 1 : 0;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private static boolean hasTimelinePicSource(Object status, int depth) {
+        if (status == null || depth > 2) return false;
+        if (hasNonEmptyObject(getObjectMethodOrField(status, null, "pic_ids"))) return true;
+        if (hasNonEmptyObject(getObjectMethodOrField(status, "getPic_detail_infos", "pic_detail_infos"))) return true;
+        if (hasMeaningfulString(getStringMethodOrField(status, "getThumbnail_pic", "thumbnail_pic"))) return true;
+        if (hasMeaningfulString(getStringMethodOrField(status, "getBmiddle_pic", "bmiddle_pic"))) return true;
+        if (hasMeaningfulString(getStringMethodOrField(status, "getOriginal_pic", "original_pic"))) return true;
+        if (hasTimelinePicSource(getObjectMethodOrField(status, "getRetweeted_status", "retweeted_status"), depth + 1)) {
+            return true;
+        }
+        return hasTimelinePicSource(getObjectMethodOrField(status, null, "reprinted_status"), depth + 1);
+    }
+
+    private static int countTimelineDisplayImages(Object status, int depth) {
+        if (status == null || depth > 2) return 0;
+        int count = objectItemCount(getObjectMethodOrField(status, null, "picPathUrls"));
+        count += objectItemCount(getObjectMethodOrField(status, null, "thumbPicPathUrls"));
+        count += objectItemCount(getObjectMethodOrField(status, null, "largePicPathUrls"));
+        if (hasMeaningfulString(getStringMethodOrField(status, "getThumbnail_pic", "thumbnail_pic"))) count++;
+        count += countTimelineDisplayImages(getObjectMethodOrField(status, "getRetweeted_status", "retweeted_status"), depth + 1);
+        count += countTimelineDisplayImages(getObjectMethodOrField(status, null, "reprinted_status"), depth + 1);
+        return count;
+    }
+
+    private static int objectItemCount(Object value) {
+        if (value == null) return 0;
+        if (value instanceof java.util.Collection) return ((java.util.Collection) value).size();
+        if (value instanceof Map) return ((Map) value).size();
+        Class<?> clazz = value.getClass();
+        if (clazz.isArray()) return java.lang.reflect.Array.getLength(value);
+        return hasNonEmptyObject(value) ? 1 : 0;
+    }
+
+    private static void resetTimelineStatusViewType(Object status, int depth) {
+        if (status == null || depth > 2) return;
+        try {
+            setFieldValue(status, "viewType", Integer.valueOf(0));
+        } catch (Throwable ignored) {}
+        resetTimelineStatusViewType(getObjectMethodOrField(status, "getRetweeted_status", "retweeted_status"), depth + 1);
+        resetTimelineStatusViewType(getObjectMethodOrField(status, null, "reprinted_status"), depth + 1);
     }
 
     private static boolean replaceListContents(List target, List replacement, String source) {
