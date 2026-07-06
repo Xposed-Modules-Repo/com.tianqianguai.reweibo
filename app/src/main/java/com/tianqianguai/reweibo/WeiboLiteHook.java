@@ -48,6 +48,8 @@ public class WeiboLiteHook {
     private static final long TOP_ANCHOR_WINDOW_MS = 16000L;
     private static final long TOP_BAR_DOUBLE_TAP_MS = 500L;
     private static final long TOP_BAR_JUMP_RETRY_MS = 120L;
+    private static final long VIDEO_URL_EXPIRY_MARGIN_SEC = 300L;
+    private static final long VIDEO_OPEN_REFRESH_BYPASS_MS = 30000L;
     private static final int TOP_ANCHOR_MAX_ATTEMPTS = 80;
     private static final int TOP_BAR_JUMP_MAX_ATTEMPTS = 8;
     private static final int PRELOAD_DONE_MIN_ITEMS = 1300;
@@ -81,6 +83,8 @@ public class WeiboLiteHook {
     private static long sTopBarLastTapAtMs = 0L;
     private static float sTopBarLastTapX = 0f;
     private static float sTopBarLastTapY = 0f;
+    private static long sVideoOpenRefreshBypassStatusId = 0L;
+    private static long sVideoOpenRefreshBypassUntilMs = 0L;
     private static int sTimelineShadowCacheCount = 0;
     private static boolean sTimelineCursorActionDumped = false;
 
@@ -133,6 +137,7 @@ public class WeiboLiteHook {
             forceTimelineDataOrder(lpparam.classLoader);
             hookTimelineNoMoreContentMarker(lpparam.classLoader);
             hookTopBarDoubleTap(lpparam.classLoader);
+            hookStaleVideoOpenRefresh(lpparam.classLoader);
             disableWeicoPullRefresh(lpparam.classLoader);
             removeSplashAd(lpparam.classLoader);
             removeTimelineAd(lpparam.classLoader);
@@ -243,6 +248,184 @@ public class WeiboLiteHook {
             }
         } catch (Throwable ignored) {}
         return true;
+    }
+
+    private static void hookStaleVideoOpenRefresh(final ClassLoader cl) {
+        try {
+            final Class<?> activityClass = Class.forName(
+                "com.weico.international.ui.smallvideo.SmallVideoActivity",
+                false,
+                cl
+            );
+            final Class<?> companionClass = Class.forName(
+                "com.weico.international.ui.smallvideo.SmallVideoActivity$Companion",
+                false,
+                cl
+            );
+            final Class<?> videoInfoClass = Class.forName("com.weico.international.data.VideoInfo", false, cl);
+            final Class<?> statusClass = Class.forName("com.weico.international.model.sina.Status", false, cl);
+
+            XposedHelpers.findAndHookMethod(
+                activityClass,
+                "openVideo",
+                Context.class,
+                videoInfoClass,
+                statusClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Object companion = getStaticFieldSafe(activityClass, "INSTANCE");
+                        if (redirectStaleVideoOpen(companion, param.args, "SmallVideoActivity.openVideo")) {
+                            param.setResult(null);
+                        }
+                    }
+                }
+            );
+
+            XposedHelpers.findAndHookMethod(
+                companionClass,
+                "openVideo",
+                Context.class,
+                videoInfoClass,
+                statusClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (redirectStaleVideoOpen(param.thisObject, param.args, "SmallVideoActivity.Companion.openVideo")) {
+                            param.setResult(null);
+                        }
+                    }
+                }
+            );
+
+            log("Timeline stale video-open hook installed");
+        } catch (Throwable t) {
+            log("Timeline stale video-open hook error: " + t.getMessage());
+        }
+    }
+
+    private static boolean redirectStaleVideoOpen(Object opener, Object[] args, String source) {
+        try {
+            if (opener == null || args == null || args.length < 3) return false;
+            if (!(args[0] instanceof Context)) return false;
+
+            Context context = (Context) args[0];
+            Object videoInfo = args[1];
+            Object status = args[2];
+            long statusId = getStatusId(status);
+            if (videoInfo == null || statusId <= 0) return false;
+            if (isVideoOpenRefreshBypassed(statusId)) return false;
+
+            String url = getStringMethodOrField(videoInfo, "getUrl", "url");
+            if (isUsableVideoUrl(url)) return false;
+
+            String playUrl = getStringMethodOrField(videoInfo, "getPlayUrl", null);
+            if (isUsableVideoUrl(playUrl)) {
+                if (replaceVideoInfoUrl(videoInfo, playUrl, source, statusId)) {
+                    return false;
+                }
+            }
+
+            if (!shouldRefreshVideoUrl(url)) return false;
+
+            markVideoOpenRefreshBypass(statusId);
+            XposedHelpers.callMethod(opener, "openWeiboVideo", context, Long.valueOf(statusId));
+            log("Timeline stale video url refreshed source=" + source
+                + " id=" + statusId
+                + " url=" + describeVideoUrlState(url)
+                + " playUrl=" + describeVideoUrlState(playUrl));
+            return true;
+        } catch (Throwable t) {
+            log("Timeline stale video url refresh error source=" + source + ": " + t.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean replaceVideoInfoUrl(Object videoInfo, String playUrl, String source, long statusId) {
+        try {
+            XposedHelpers.callMethod(videoInfo, "setUrl", playUrl);
+            log("Timeline video url replaced source=" + source + " id=" + statusId
+                + " playUrl=" + describeVideoUrlState(playUrl));
+            return true;
+        } catch (Throwable ignored) {}
+        try {
+            setFieldValue(videoInfo, "url", playUrl);
+            log("Timeline video url field replaced source=" + source + " id=" + statusId
+                + " playUrl=" + describeVideoUrlState(playUrl));
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isUsableVideoUrl(String url) {
+        return hasMeaningfulString(url) && !isVideoUrlExpiredOrNear(url);
+    }
+
+    private static boolean shouldRefreshVideoUrl(String url) {
+        return !hasMeaningfulString(url) || isVideoUrlExpiredOrNear(url);
+    }
+
+    private static boolean isVideoUrlExpiredOrNear(String url) {
+        long expiresAt = extractVideoUrlExpiresAtSec(url);
+        if (expiresAt <= 0L) return false;
+        long now = System.currentTimeMillis() / 1000L;
+        return expiresAt <= now + VIDEO_URL_EXPIRY_MARGIN_SEC;
+    }
+
+    private static long extractVideoUrlExpiresAtSec(String url) {
+        if (!hasMeaningfulString(url)) return 0L;
+        String[] keys = {"Expires=", "expires=", "Expires%3D", "expires%3D"};
+        for (int i = 0; i < keys.length; i++) {
+            int start = url.indexOf(keys[i]);
+            if (start < 0) continue;
+            long value = parseLeadingLong(url, start + keys[i].length());
+            if (value > 0L) return value;
+        }
+        return 0L;
+    }
+
+    private static long parseLeadingLong(String value, int start) {
+        if (value == null || start < 0 || start >= value.length()) return 0L;
+        long result = 0L;
+        boolean hasDigit = false;
+        for (int i = start; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') break;
+            hasDigit = true;
+            long next = result * 10L + (c - '0');
+            if (next < result) return 0L;
+            result = next;
+        }
+        return hasDigit ? result : 0L;
+    }
+
+    private static String describeVideoUrlState(String url) {
+        if (!hasMeaningfulString(url)) return "empty";
+        long expiresAt = extractVideoUrlExpiresAtSec(url);
+        if (expiresAt <= 0L) return "no-expiry";
+        return "expires=" + expiresAt + " now=" + (System.currentTimeMillis() / 1000L);
+    }
+
+    private static boolean isVideoOpenRefreshBypassed(long statusId) {
+        return statusId > 0L
+            && statusId == sVideoOpenRefreshBypassStatusId
+            && SystemClock.elapsedRealtime() < sVideoOpenRefreshBypassUntilMs;
+    }
+
+    private static void markVideoOpenRefreshBypass(long statusId) {
+        sVideoOpenRefreshBypassStatusId = statusId;
+        sVideoOpenRefreshBypassUntilMs = SystemClock.elapsedRealtime() + VIDEO_OPEN_REFRESH_BYPASS_MS;
+    }
+
+    private static Object getStaticFieldSafe(Class<?> clazz, String fieldName) {
+        try {
+            java.lang.reflect.Field field = clazz.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            return field.get(null);
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static void disableWeicoPullRefresh(ClassLoader cl) {
