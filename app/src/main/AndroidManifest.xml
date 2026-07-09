@@ -14,7 +14,9 @@
 
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposedminversion" android:value="82" />
-        <meta-data android:name="xposeddescription" android:value="ReWeibo Xposed Module" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="微博轻享版 LSPosed/Xposed 模块：去广告、反向时间线、阅读位置恢复&#10;Weibo Lite LSPosed/Xposed module for ad removal, reversed timeline, and reading-position recovery" />
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
