@@ -12,7 +12,9 @@
 - 移除微博轻享版启动页广告和时间线广告路径。
 - 强制微博轻享版主页时间线使用反向/新微博在前排序。
 - 过滤已加载数据中的广告样式条目和无实际内容条目。
-- 持久化并恢复扩展后的时间线缓存，降低刷新或缓存丢失后的阅读位置丢失概率。
+- 按设置的时间跨度补齐、裁剪并恢复首页时间线缓存，检测缓存断层后分段回补、显示进度并保存检查点。
+- 在微博轻享版“我的”页增加 ReWeibo 设置入口，用于控制入口显示和首页缓存时间跨度。
+- 在头像下方增加“跳转”按钮；深色时间弹窗展示实际缓存条数与 `MM-dd HH:mm` 可跳转范围，并拦截越界输入。
 - 在可信缓存恢复后保存并恢复上次阅读位置。
 - 增加时间线顶部栏双击快捷操作，用于快速跳转到时间线边缘。
 - 在可行时刷新或替换打开时间线视频时遇到的过期缓存视频地址。
@@ -27,7 +29,9 @@
 - Removes Weibo Lite splash-ad and timeline-ad paths.
 - Forces Weibo Lite home timeline reverse/newest-first ordering.
 - Filters ad-like and contentless entries from loaded timeline data.
-- Persists and restores an expanded timeline cache to reduce reading-position loss after refreshes or cache eviction.
+- Fills, trims, and restores the home timeline cache to a configured time span, backfilling detected gaps in stages with progress and checkpoints.
+- Adds a ReWeibo entry to Weibo Lite's profile drawer for controlling entry visibility and the home timeline cache window.
+- Adds a "跳转" button below the avatar; its dark time dialog shows the actual cached item count and `MM-dd HH:mm` jump range, and rejects out-of-range input.
 - Saves and restores the last-read timeline position when the restored cache is trusted.
 - Adds timeline top-bar double-tap shortcuts for jumping to timeline edges.
 - Refreshes or replaces expired cached video URLs when opening timeline videos where possible.
