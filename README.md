@@ -60,30 +60,4 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 3. Apply the recommended scope for Weibo Lite.
 4. Force stop and reopen Weibo Lite.
 
-## 构建
 
-面向公开分发的 release 构建必须使用私有 release keystore 签名：
-
-```powershell
-$env:REWEIBO_RELEASE_STORE_FILE="C:\path\to\reweibo-release.jks"
-$env:REWEIBO_RELEASE_STORE_PASSWORD="..."
-$env:REWEIBO_RELEASE_KEY_ALIAS="..."
-$env:REWEIBO_RELEASE_KEY_PASSWORD="..."
-.\gradlew.bat clean assembleRelease
-```
-
-如果没有配置这些签名值，Gradle 只会生成用于本地校验的 unsigned release APK。
-
-## Build
-
-Release builds intended for public distribution must be signed with a private release keystore:
-
-```powershell
-$env:REWEIBO_RELEASE_STORE_FILE="C:\path\to\reweibo-release.jks"
-$env:REWEIBO_RELEASE_STORE_PASSWORD="..."
-$env:REWEIBO_RELEASE_KEY_ALIAS="..."
-$env:REWEIBO_RELEASE_KEY_PASSWORD="..."
-.\gradlew.bat clean assembleRelease
-```
-
-Without these signing values, Gradle produces an unsigned release APK for local verification only.
