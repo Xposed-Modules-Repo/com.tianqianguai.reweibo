@@ -42,6 +42,20 @@ Official repository: https://modules.lsposed.org
 - APK asset: signed `ReWeibo-v1.0.apk`
 - Release content: use `docs/release/1.0.md` and include the APK SHA-256.
 
+## Release 1.0.1
+
+- Release 标题：`ReWeibo 1.0.1`
+- Release tag：`2-1.0.1`
+- APK 资产：已签名 `ReWeibo-v1.0.1.apk`
+- Release 内容：使用 `docs/release/1.0.1.md`，并附 APK SHA-256。
+
+## Release 1.0.1
+
+- Release title: `ReWeibo 1.0.1`
+- Release tag: `2-1.0.1`
+- APK asset: signed `ReWeibo-v1.0.1.apk`
+- Release content: use `docs/release/1.0.1.md` and include the APK SHA-256.
+
 ## 构建已签名 APK
 
 在仓库外配置签名值，然后构建：

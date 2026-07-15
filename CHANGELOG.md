@@ -2,6 +2,26 @@
 
 # Changelog
 
+## 1.0.1
+
+### 中文
+
+- 修复缓存天数在微博轻享版冷启动时回退为默认 3 天的问题，支持在应用内明确保存并读取 1-30 天。
+- 将 ReWeibo 设置入口改为稳定的应用内深色弹窗，并移除会写入另一份无效配置的旧数字编辑入口。
+- 按 status id 合并实时、原生与 shadow cache，避免刷新、空响应或设置尚未确认时丢失较旧历史。
+- 使用微博轻享版自身的 Gson 流式写入缓存，经 `fsync` 后原子替换，降低大缓存序列化时的内存峰值和损坏风险。
+- 保留有限的上次阅读历史与回退锚点，在缓存恢复和断层回补期间继续显示“上次读到这里”。
+- 扩展缓存窗口和补齐安全上限以支持最多 30 天，并补充相关回归测试。
+
+### English
+
+- Fixes the cache window falling back to the three-day default during a Weibo Lite cold start, with explicit in-app persistence for 1-30 days.
+- Replaces the profile entry with a stable dark in-app settings dialog and removes the legacy numeric editor that wrote a conflicting value.
+- Merges live, native, and shadow caches by status id so refreshes, empty responses, or unconfirmed settings do not discard older history.
+- Streams cache JSON through Weibo Lite's own Gson, calls `fsync`, and atomically replaces the native file to reduce memory spikes and partial-cache risk.
+- Keeps bounded last-read history and fallback anchors so the “上次读到这里” marker survives restoration and gap repair.
+- Expands cache-window and preload safety limits for up to 30 days and adds regression coverage.
+
 ## 1.0
 
 ### 中文
