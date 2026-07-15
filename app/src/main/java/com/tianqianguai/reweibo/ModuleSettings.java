@@ -10,7 +10,7 @@ public final class ModuleSettings {
     public static final String KEY_WEICO_TIMELINE_CACHE_DAYS = "weico_timeline_cache_days";
     public static final int DEFAULT_WEICO_TIMELINE_CACHE_DAYS = 3;
     public static final int MIN_WEICO_TIMELINE_CACHE_DAYS = 1;
-    public static final int MAX_WEICO_TIMELINE_CACHE_DAYS = 3;
+    public static final int MAX_WEICO_TIMELINE_CACHE_DAYS = 30;
 
     private ModuleSettings() {}
 

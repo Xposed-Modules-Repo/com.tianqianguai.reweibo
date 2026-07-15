@@ -58,6 +58,7 @@ android {
 
 dependencies {
     compileOnly(files("libs/xposed-bridge-api.jar"))
+    testImplementation(files("libs/xposed-bridge-api.jar"))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)

@@ -6,14 +6,9 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.text.Editable;
-import android.text.InputFilter;
-import android.text.InputType;
-import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.CompoundButton;
-import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
@@ -77,14 +72,10 @@ public class SettingsActivity extends Activity {
                 prefs,
                 ModuleSettings.KEY_WEICO_PROFILE_ENTRY
         );
-        addNumberRow(
+        addInfoRow(
                 panel,
                 "首页缓存天数",
-                "按微博时间跨度缓存首页时间线，补齐完成也按这个天数判断",
-                prefs,
-                ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS,
-                ModuleSettings.MIN_WEICO_TIMELINE_CACHE_DAYS,
-                ModuleSettings.MAX_WEICO_TIMELINE_CACHE_DAYS
+                "请在微博轻享版的“我的”页点击 ReWeibo，在深色弹窗中保存 1-30 天；旧值会在首次打开时迁移"
         );
 
         setContentView(scrollView);
@@ -150,113 +141,28 @@ public class SettingsActivity extends Activity {
         });
     }
 
-    private void addNumberRow(
+    private void addInfoRow(
             LinearLayout parent,
             String title,
-            String subtitle,
-            SharedPreferences prefs,
-            String key,
-            int min,
-            int max
+            String subtitle
     ) {
         LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setOrientation(LinearLayout.VERTICAL);
         row.setPadding(0, dp(12), 0, dp(12));
-
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        texts.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView titleView = new TextView(this);
         titleView.setText(title);
         titleView.setTextColor(COLOR_TEXT);
         titleView.setTextSize(16);
         titleView.setTypeface(Typeface.DEFAULT_BOLD);
-        texts.addView(titleView);
+        row.addView(titleView);
 
         TextView subtitleView = new TextView(this);
-        subtitleView.setText(subtitle + "（" + min + "-" + max + " 天）");
+        subtitleView.setText(subtitle);
         subtitleView.setTextColor(COLOR_SUBTEXT);
         subtitleView.setTextSize(13);
         subtitleView.setPadding(0, dp(4), dp(12), 0);
-        texts.addView(subtitleView);
-
-        row.addView(texts, new LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f
-        ));
-
-        LinearLayout inputBox = new LinearLayout(this);
-        inputBox.setOrientation(LinearLayout.HORIZONTAL);
-        inputBox.setGravity(Gravity.CENTER_VERTICAL);
-
-        EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setSelectAllOnFocus(true);
-        input.setGravity(Gravity.CENTER);
-        input.setTextColor(COLOR_TEXT);
-        input.setTextSize(16);
-        input.setInputType(InputType.TYPE_CLASS_NUMBER);
-        input.setFilters(new InputFilter[] { new InputFilter.LengthFilter(2) });
-        input.setBackground(makeRoundRect(Color.rgb(28, 36, 47), COLOR_LINE, dp(6)));
-        int current = prefs.getInt(key, ModuleSettings.defaultIntFor(key));
-        current = ModuleSettings.clampTimelineCacheDays(current);
-        input.setText(String.valueOf(current));
-        inputBox.addView(input, new LinearLayout.LayoutParams(dp(58), dp(42)));
-
-        TextView unit = new TextView(this);
-        unit.setText("天");
-        unit.setTextColor(COLOR_SUBTEXT);
-        unit.setTextSize(14);
-        unit.setPadding(dp(8), 0, 0, 0);
-        inputBox.addView(unit);
-
-        input.addTextChangedListener(new TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-
-            @Override
-            public void onTextChanged(CharSequence s, int start, int before, int count) {}
-
-            @Override
-            public void afterTextChanged(Editable s) {
-                String text = s == null ? "" : s.toString().trim();
-                if (text.length() == 0) return;
-                try {
-                    int days = ModuleSettings.clampTimelineCacheDays(Integer.parseInt(text));
-                    prefs.edit().putInt(key, days).apply();
-                } catch (Throwable ignored) {
-                }
-            }
-        });
-        input.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            @Override
-            public void onFocusChange(View v, boolean hasFocus) {
-                if (hasFocus) return;
-                String text = input.getText() == null ? "" : input.getText().toString().trim();
-                int days = ModuleSettings.defaultIntFor(key);
-                try {
-                    if (text.length() > 0) {
-                        days = Integer.parseInt(text);
-                    }
-                } catch (Throwable ignored) {
-                }
-                days = ModuleSettings.clampTimelineCacheDays(days);
-                prefs.edit().putInt(key, days).apply();
-                input.setText(String.valueOf(days));
-            }
-        });
-
-        row.addView(inputBox);
-        row.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                input.requestFocus();
-                input.selectAll();
-            }
-        });
+        row.addView(subtitleView);
 
         parent.addView(row, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
