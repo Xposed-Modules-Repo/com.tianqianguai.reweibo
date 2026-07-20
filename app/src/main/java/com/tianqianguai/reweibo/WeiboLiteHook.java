@@ -299,6 +299,22 @@ public class WeiboLiteHook {
         Object recyclerView = null;
     }
 
+    private static final class TimelineJumpInput {
+        final long targetMs;
+        final long dayStartMs;
+        final long dayEndMs;
+
+        TimelineJumpInput(long targetMs, long dayStartMs, long dayEndMs) {
+            this.targetMs = targetMs;
+            this.dayStartMs = dayStartMs;
+            this.dayEndMs = dayEndMs;
+        }
+
+        boolean isDateOnly() {
+            return dayStartMs > 0L && dayEndMs >= dayStartMs;
+        }
+    }
+
     private static final class TimelineRestoreState {
         boolean inFlight = false;
         boolean diskRestoreResolved = false;
@@ -6316,7 +6332,10 @@ public class WeiboLiteHook {
                     }
                     if (action == MotionEvent.ACTION_UP) {
                         v.setAlpha(0.96f);
-                        Object currentRecyclerView = isTimelineRecyclerView(sTimelineTimeJumpRecyclerView)
+                        Object bestRecyclerView = getAnyTimelineRecyclerView();
+                        Object currentRecyclerView = isTimelineRecyclerView(bestRecyclerView)
+                            ? bestRecyclerView
+                            : isTimelineRecyclerView(sTimelineTimeJumpRecyclerView)
                             ? sTimelineTimeJumpRecyclerView
                             : recyclerView;
                         log("Timeline time-jump button tapped");
@@ -6421,7 +6440,10 @@ public class WeiboLiteHook {
             container.setPadding(padding, dpToPx(anchor, 6), padding, 0);
 
             TextView hint = new TextView(activity);
-            hint.setText("输入目标微博时间，支持 07-09 18:30、18:30");
+            hint.setText(
+                "只填日期（如 7号、7-11）会跳到当天最早的缓存微博；"
+                    + "填写具体时间（如 7-11 18:30、18:30）会跳到该时间附近。"
+            );
             hint.setTextSize(13f);
             hint.setTextColor(0xFFB8BCC6);
             container.addView(hint, new LinearLayout.LayoutParams(
@@ -6467,7 +6489,7 @@ public class WeiboLiteHook {
                 activity,
                 android.R.style.Theme_Material_Dialog_Alert
             )
-                .setTitle("按时间跳转")
+                .setTitle("按日期或时间跳转")
                 .setView(container)
                 .setPositiveButton("跳转", null)
                 .setNegativeButton("取消", null)
@@ -6480,26 +6502,28 @@ public class WeiboLiteHook {
                             @Override
                             public void onClick(View v) {
                                 String text = input.getText() == null ? "" : input.getText().toString();
-                                long targetMs = parseTimelineJumpInputMillis(text);
-                                if (targetMs <= 0L) {
-                                    input.setError("时间格式不对");
+                                TimelineJumpInput jumpInput = parseTimelineJumpInput(text);
+                                if (jumpInput == null || jumpInput.targetMs <= 0L) {
+                                    input.setError("日期或时间格式不对，如 7号、7-11、18:30");
                                     return;
                                 }
                                 if (hasCacheRange
-                                    && !isTimelineJumpInputWithinCacheRange(text, targetMs, cacheStats)) {
+                                    && !isTimelineJumpInputWithinCacheRange(jumpInput, cacheStats)) {
                                     input.setError("超出缓存范围：" + cacheRangeText);
                                     return;
                                 }
                                 boolean accepted = jumpTimelineToTime(
                                     recyclerView,
-                                    targetMs,
+                                    jumpInput.targetMs,
+                                    jumpInput.dayStartMs,
+                                    jumpInput.dayEndMs,
                                     "time-dialog",
                                     0
                                 );
                                 if (accepted) {
                                     dialog.dismiss();
                                 } else {
-                                    input.setError("当前缓存里没有这个时间附近的微博");
+                                    input.setError("当前缓存里没有匹配的日期或时间");
                                 }
                             }
                         });
@@ -6541,51 +6565,78 @@ public class WeiboLiteHook {
         return null;
     }
 
-    private static long parseTimelineJumpInputMillis(String value) {
-        if (!hasMeaningfulString(value)) return 0L;
+    private static TimelineJumpInput parseTimelineJumpInput(String value) {
+        if (!hasMeaningfulString(value)) return null;
         String text = normalizeTimelineJumpInput(value);
         long parsed = parseTimelineJumpWithPatterns(text, new String[] {
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-dd HH:mm",
-            "yyyy-MM-dd"
+            "yyyy-M-d H:m:s",
+            "yyyy-M-d H:m"
         });
-        if (parsed > 0L) return parsed;
+        if (parsed > 0L) return new TimelineJumpInput(parsed, 0L, 0L);
 
         Calendar now = Calendar.getInstance();
         if (text.startsWith("今天") || text.startsWith("今日")) {
             String time = text.substring(2).trim();
-            return parseTimelineJumpWithToday(now, time, false);
+            parsed = parseTimelineJumpWithToday(now, time, false);
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
         if (text.startsWith("昨天")) {
             String time = text.substring(2).trim();
-            return parseTimelineJumpWithToday(now, time, true);
+            parsed = parseTimelineJumpWithToday(now, time, true);
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
-        if (text.matches("\\d{1,2}:\\d{2}(:\\d{2})?")) {
-            return parseTimelineJumpWithToday(now, text, false);
+        if (text.matches("\\d{1,2}:\\d{1,2}(:\\d{1,2})?")) {
+            parsed = parseTimelineJumpWithToday(now, text, false);
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
-        if (text.matches("\\d{1,2}-\\d{1,2}\\s+\\d{1,2}:\\d{2}(:\\d{2})?")) {
+        if (text.matches("\\d{1,2}-\\d{1,2}\\s+\\d{1,2}:\\d{1,2}(:\\d{1,2})?")) {
             int year = now.get(Calendar.YEAR);
             parsed = parseTimelineJumpWithPatterns(year + "-" + text, new String[] {
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-dd HH:mm"
+                "yyyy-M-d H:m:s",
+                "yyyy-M-d H:m"
             });
             if (parsed > now.getTimeInMillis() + TIMELINE_CACHE_DAY_MS) {
                 parsed = parseTimelineJumpWithPatterns((year - 1) + "-" + text, new String[] {
-                    "yyyy-MM-dd HH:mm:ss",
-                    "yyyy-MM-dd HH:mm"
+                    "yyyy-M-d H:m:s",
+                    "yyyy-M-d H:m"
                 });
             }
-            return parsed;
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
-        if (text.matches("\\d{1,2}-\\d{1,2}")) {
-            int year = now.get(Calendar.YEAR);
-            parsed = parseTimelineJumpWithPatterns(year + "-" + text, new String[] {"yyyy-MM-dd"});
-            if (parsed > now.getTimeInMillis() + TIMELINE_CACHE_DAY_MS) {
-                parsed = parseTimelineJumpWithPatterns((year - 1) + "-" + text, new String[] {"yyyy-MM-dd"});
+
+        long dayStartMs = parseTimelineClearDateOnlyInput(value, false);
+        if (dayStartMs > 0L) {
+            String looseDate = normalizeTimelineClearInput(value);
+            if (looseDate.matches("\\d{1,2}[-/.]\\d{1,2}")
+                && dayStartMs > now.getTimeInMillis() + TIMELINE_CACHE_DAY_MS) {
+                String[] parts = looseDate.split("[-/.]");
+                dayStartMs = parseTimelineClearDateOnlyInput(
+                    (now.get(Calendar.YEAR) - 1) + "-" + parts[0] + "-" + parts[1],
+                    false
+                );
             }
-            return parsed;
+            if (dayStartMs > 0L) {
+                long dayEndMs = getTimelineJumpDayEndMs(dayStartMs);
+                if (dayEndMs >= dayStartMs) {
+                    return new TimelineJumpInput(dayStartMs, dayStartMs, dayEndMs);
+                }
+            }
         }
-        return 0L;
+        return null;
+    }
+
+    static long[] parseTimelineJumpInputRange(String value) {
+        TimelineJumpInput input = parseTimelineJumpInput(value);
+        if (input == null) return new long[0];
+        return new long[] {input.targetMs, input.dayStartMs, input.dayEndMs};
+    }
+
+    private static long getTimelineJumpDayEndMs(long dayStartMs) {
+        if (dayStartMs <= 0L) return 0L;
+        Calendar dayEnd = Calendar.getInstance();
+        dayEnd.setTimeInMillis(dayStartMs);
+        dayEnd.add(Calendar.DAY_OF_MONTH, 1);
+        return dayEnd.getTimeInMillis() - 1L;
     }
 
     private static String normalizeTimelineJumpInput(String value) {
@@ -6595,7 +6646,8 @@ public class WeiboLiteHook {
             .replace('.', '-')
             .replace("年", "-")
             .replace("月", "-")
-            .replace("日", " ");
+            .replace("日", " ")
+            .replace("号", " ");
         while (text.contains("  ")) {
             text = text.replace("  ", " ");
         }
@@ -6610,14 +6662,14 @@ public class WeiboLiteHook {
         }
         String date = formatTimelineJumpDate(day);
         long parsed = parseTimelineJumpWithPatterns(date + " " + time, new String[] {
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-dd HH:mm"
+            "yyyy-M-d H:m:s",
+            "yyyy-M-d H:m"
         });
         if (!yesterday && parsed > now.getTimeInMillis() + TIME_JUMP_FUTURE_GRACE_MS) {
             day.add(Calendar.DAY_OF_MONTH, -1);
             parsed = parseTimelineJumpWithPatterns(formatTimelineJumpDate(day) + " " + time, new String[] {
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-dd HH:mm"
+                "yyyy-M-d H:m:s",
+                "yyyy-M-d H:m"
             });
         }
         return parsed;
@@ -6653,15 +6705,26 @@ public class WeiboLiteHook {
     private static boolean jumpTimelineToTime(
         final Object recyclerView,
         final long targetMs,
+        final long dayStartMs,
+        final long dayEndMs,
         final String source,
         final int attempt
     ) {
         try {
             if (!isTimelineRecyclerView(recyclerView)) return false;
-            final TimelineTimeJumpTarget target = findTimelineTimeJumpTarget(recyclerView, targetMs);
+            final TimelineTimeJumpTarget target = findTimelineTimeJumpTarget(
+                recyclerView,
+                targetMs,
+                dayStartMs,
+                dayEndMs
+            );
             if (target == null || target.statusId <= 0L) {
-                showTimelineToast(recyclerView, "当前已加载/缓存中没有可跳转的微博");
+                showTimelineToast(
+                    recyclerView,
+                    dayStartMs > 0L ? "当前缓存中没有这一天的微博" : "当前已加载/缓存中没有可跳转的微博"
+                );
                 log("Timeline time-jump missed source=" + source + " target=" + targetMs
+                    + " dayRange=" + dayStartMs + ".." + dayEndMs
                     + " " + describeTimelineTimeJumpSearch(recyclerView));
                 return false;
             }
@@ -6687,7 +6750,14 @@ public class WeiboLiteHook {
                     new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                         @Override
                         public void run() {
-                            jumpTimelineToTime(targetRecyclerView, targetMs, source + "-retry", attempt + 1);
+                            jumpTimelineToTime(
+                                targetRecyclerView,
+                                targetMs,
+                                dayStartMs,
+                                dayEndMs,
+                                source + "-retry",
+                                attempt + 1
+                            );
                         }
                     }, TIME_JUMP_RETRY_MS * 3);
                     return true;
@@ -6741,7 +6811,14 @@ public class WeiboLiteHook {
                 new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        jumpTimelineToTime(targetRecyclerView, targetMs, source, attempt + 1);
+                        jumpTimelineToTime(
+                            targetRecyclerView,
+                            targetMs,
+                            dayStartMs,
+                            dayEndMs,
+                            source,
+                            attempt + 1
+                        );
                     }
                 }, TIME_JUMP_RETRY_MS);
             }
@@ -6804,7 +6881,12 @@ public class WeiboLiteHook {
             + " cumulativeSample=" + cumulativeSample;
     }
 
-    private static TimelineTimeJumpTarget findTimelineTimeJumpTarget(Object recyclerView, long targetMs) {
+    private static TimelineTimeJumpTarget findTimelineTimeJumpTarget(
+        Object recyclerView,
+        long targetMs,
+        long dayStartMs,
+        long dayEndMs
+    ) {
         TimelineTimeJumpTarget adapterBest = null;
         TimelineTimeJumpTarget cumulativeBest = null;
         ArrayList recyclerViews = getTimelineTimeJumpRecyclerViews(recyclerView);
@@ -6820,6 +6902,8 @@ public class WeiboLiteHook {
                         adapterBest,
                         unwrapStatus(item),
                         targetMs,
+                        dayStartMs,
+                        dayEndMs,
                         Math.max(0, headerCount) + i,
                         i,
                         candidateRecyclerView
@@ -6838,6 +6922,8 @@ public class WeiboLiteHook {
                 cumulativeBest,
                 unwrapStatus(snapshot.get(i)),
                 targetMs,
+                dayStartMs,
+                dayEndMs,
                 -1,
                 -1,
                 null
@@ -6845,6 +6931,9 @@ public class WeiboLiteHook {
         }
 
         if (cumulativeBest != null && cumulativeBest.adapterPosition < 0) {
+            Object bestRecyclerView = null;
+            int bestPosition = -1;
+            int bestScore = Integer.MIN_VALUE;
             for (int r = 0; r < recyclerViews.size(); r++) {
                 Object candidateRecyclerView = recyclerViews.get(r);
                 try {
@@ -6852,13 +6941,23 @@ public class WeiboLiteHook {
                     int headerCount = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
                     int position = getTimelineStatusAdapterPosition(adapter, headerCount, cumulativeBest.statusId);
                     if (position >= 0) {
-                        cumulativeBest.adapterPosition = position;
-                        cumulativeBest.dataPosition = position - Math.max(0, headerCount);
-                        cumulativeBest.recyclerView = candidateRecyclerView;
-                        break;
+                        int score = getTimelineRecyclerViewDataScore(candidateRecyclerView);
+                        if (candidateRecyclerView == recyclerView) score += 1000000;
+                        if (bestRecyclerView == null || score > bestScore) {
+                            bestRecyclerView = candidateRecyclerView;
+                            bestPosition = position;
+                            bestScore = score;
+                        }
                     }
                 } catch (Throwable ignored) {
                 }
+            }
+            if (bestRecyclerView != null) {
+                Object adapter = XposedHelpers.callMethod(bestRecyclerView, "getAdapter");
+                int headerCount = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
+                cumulativeBest.adapterPosition = bestPosition;
+                cumulativeBest.dataPosition = bestPosition - Math.max(0, headerCount);
+                cumulativeBest.recyclerView = bestRecyclerView;
             }
         }
         if (cumulativeBest != null && cumulativeBest.adapterPosition >= 0) {
@@ -6898,6 +6997,8 @@ public class WeiboLiteHook {
         TimelineTimeJumpTarget best,
         Object status,
         long targetMs,
+        long dayStartMs,
+        long dayEndMs,
         int adapterPosition,
         int dataPosition,
         Object recyclerView
@@ -6908,6 +7009,10 @@ public class WeiboLiteHook {
         long statusId = getStatusId(status);
         long createdMs = getStatusCreatedAtMillis(status);
         if (statusId <= 0L || createdMs <= 0L) return best;
+        if (dayStartMs > 0L && dayEndMs >= dayStartMs
+            && (createdMs < dayStartMs || createdMs > dayEndMs)) {
+            return best;
+        }
         long diff = createdMs >= targetMs ? createdMs - targetMs : targetMs - createdMs;
         if (best != null) best.searchedCount++;
         if (best != null && diff >= best.diffMs) return best;
@@ -6946,26 +7051,18 @@ public class WeiboLiteHook {
     }
 
     private static boolean isTimelineJumpInputWithinCacheRange(
-        String value,
-        long targetMs,
+        TimelineJumpInput input,
         TimelineCacheStats stats
     ) {
-        if (targetMs <= 0L || !hasTimelineTimeJumpCacheRange(stats)) return true;
-        String normalized = normalizeTimelineJumpInput(value);
-        boolean dateOnly = normalized.matches("\\d{4}-\\d{1,2}-\\d{1,2}")
-            || normalized.matches("\\d{1,2}-\\d{1,2}");
-        if (dateOnly) {
-            Calendar endOfDay = Calendar.getInstance();
-            endOfDay.setTimeInMillis(targetMs);
-            endOfDay.add(Calendar.DAY_OF_MONTH, 1);
-            long dayEndMs = endOfDay.getTimeInMillis() - 1L;
-            return targetMs <= stats.newestMs && dayEndMs >= stats.oldestMs;
+        if (input == null || input.targetMs <= 0L || !hasTimelineTimeJumpCacheRange(stats)) return true;
+        if (input.isDateOnly()) {
+            return input.dayStartMs <= stats.newestMs && input.dayEndMs >= stats.oldestMs;
         }
 
         long minuteMs = 60000L;
         long rangeStartMs = stats.oldestMs - (stats.oldestMs % minuteMs);
         long rangeEndMs = stats.newestMs - (stats.newestMs % minuteMs) + minuteMs - 1L;
-        return targetMs >= rangeStartMs && targetMs <= rangeEndMs;
+        return input.targetMs >= rangeStartMs && input.targetMs <= rangeEndMs;
     }
 
     private static String formatTimelineJumpRangeTime(long millis) {

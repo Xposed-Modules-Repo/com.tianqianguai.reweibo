@@ -7,10 +7,12 @@
 ### 中文
 
 - 在微博轻享版内的 ReWeibo 设置中新增按发布时间范围清除缓存微博；既支持日历选择，也支持 `7号`、`7-7`、完整日期时间等松散输入，单独日期按整天处理。清理会同步更新原生缓存、shadow cache 与当前内存时间线，并阻止旧的异步任务回写已删除内容。
+- 时间线“跳转”同步支持 `7号`、`7-11`、中文完整日期等松散日期；仅输入日期时只在当天微博中定位，并优先滚动当前主时间线。
 
 ### English
 
 - Adds inclusive publication-time range clearing to the in-app ReWeibo settings, with both calendar selection and loose typed dates (date-only input covers the whole day), while updating native, shadow, and in-memory caches and blocking stale asynchronous writes.
+- Extends timeline jump input to loose dates such as `7号`, `7-11`, and full Chinese dates; date-only input searches only that day and targets the primary timeline.
 
 ## 1.0.1
 

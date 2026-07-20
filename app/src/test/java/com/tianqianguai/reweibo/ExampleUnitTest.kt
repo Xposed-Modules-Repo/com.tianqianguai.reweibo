@@ -211,6 +211,43 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun timelineJumpTreatsLooseDateAsAWholeDay() {
+        val range = WeiboLiteHook.parseTimelineJumpInputRange("7-11")
+        val start = Calendar.getInstance().apply { timeInMillis = range[1] }
+        val end = Calendar.getInstance().apply { timeInMillis = range[2] }
+
+        assertEquals(3, range.size)
+        assertEquals(range[0], range[1])
+        assertEquals(Calendar.JULY, start.get(Calendar.MONTH))
+        assertEquals(11, start.get(Calendar.DAY_OF_MONTH))
+        assertEquals(0, start.get(Calendar.HOUR_OF_DAY))
+        assertEquals(0, start.get(Calendar.MINUTE))
+        assertEquals(11, end.get(Calendar.DAY_OF_MONTH))
+        assertEquals(23, end.get(Calendar.HOUR_OF_DAY))
+        assertEquals(59, end.get(Calendar.MINUTE))
+        assertEquals(59, end.get(Calendar.SECOND))
+        assertEquals(999, end.get(Calendar.MILLISECOND))
+    }
+
+    @Test
+    fun timelineJumpAcceptsTheSameLooseSingleDayFormsAsCacheClear() {
+        val reference = Calendar.getInstance()
+        val dayOnly = WeiboLiteHook.parseTimelineJumpInputRange("7号")
+        val chineseDate = WeiboLiteHook.parseTimelineJumpInputRange("2026年7月11日")
+        val dayValue = Calendar.getInstance().apply { timeInMillis = dayOnly[0] }
+        val chineseValue = Calendar.getInstance().apply { timeInMillis = chineseDate[0] }
+
+        assertEquals(3, dayOnly.size)
+        assertEquals(reference.get(Calendar.YEAR), dayValue.get(Calendar.YEAR))
+        assertEquals(reference.get(Calendar.MONTH), dayValue.get(Calendar.MONTH))
+        assertEquals(7, dayValue.get(Calendar.DAY_OF_MONTH))
+        assertEquals(2026, chineseValue.get(Calendar.YEAR))
+        assertEquals(Calendar.JULY, chineseValue.get(Calendar.MONTH))
+        assertEquals(11, chineseValue.get(Calendar.DAY_OF_MONTH))
+        assertTrue(WeiboLiteHook.parseTimelineJumpInputRange("2月30日").isEmpty())
+    }
+
+    @Test
     fun staleTerminalMarkerCannotCompletePreloadByCountAlone() {
         val now = 1_800_000_000_000L
 
