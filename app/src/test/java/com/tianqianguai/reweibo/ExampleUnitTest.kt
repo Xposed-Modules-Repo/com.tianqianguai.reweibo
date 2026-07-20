@@ -229,6 +229,42 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun missingReflectionLookupsStayOnTheNullFastPath() {
+        val status = ChildStatus()
+
+        repeat(10_000) {
+            assertNull(WeiboLiteHook.getFieldValueOrNull(status, "missingField"))
+            assertNull(WeiboLiteHook.callNoArgMethodCached(status, "missingMethod"))
+        }
+    }
+
+    @Test
+    fun fullNativeCacheWinsWithoutReadingAnEquivalentShadowCopy() {
+        assertFalse(
+            WeiboLiteHook.shouldReadTimelineShadowFirst(
+                47_717_754L, 47_717_754L, 5_480
+            )
+        )
+        assertTrue(
+            WeiboLiteHook.shouldReadTimelineShadowFirst(
+                200_000L, 47_717_754L, 5_480
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldReadTimelineShadowFirst(
+                47_717_754L, 0L, 0
+            )
+        )
+    }
+
+    @Test
+    fun partialCacheWritesWaitForAnInFlightRestore() {
+        assertTrue(WeiboLiteHook.shouldDeferTimelinePersist(false, true))
+        assertFalse(WeiboLiteHook.shouldDeferTimelinePersist(true, true))
+        assertFalse(WeiboLiteHook.shouldDeferTimelinePersist(false, false))
+    }
+
+    @Test
     fun completeRestoreCanUseLastReadWithoutStrictPreloadMarker() {
         assertTrue(WeiboLiteHook.shouldUseTimelineLastRead(true, false))
         assertTrue(WeiboLiteHook.shouldUseTimelineLastRead(false, false))
