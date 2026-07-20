@@ -3,6 +3,8 @@ package com.tianqianguai.reweibo;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Application;
+import android.app.DatePickerDialog;
+import android.app.TimePickerDialog;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
@@ -18,6 +20,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.system.Os;
 import android.text.InputType;
+import android.text.method.DigitsKeyListener;
 import android.util.AtomicFile;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
@@ -132,6 +135,7 @@ public class WeiboLiteHook {
     private static final String TIMELINE_SHADOW_CACHE_FILE = "reweibo_weico_full_cache_shadow.txt";
     private static final String TIMELINE_SHADOW_CACHE_META_FILE = "reweibo_weico_full_cache_shadow.meta";
     private static final String TIMELINE_NATIVE_CACHE_BACKUP_SUFFIX = ".reweibo-native-backup";
+    private static final String TIMELINE_CLEAR_TIME_PATTERN = "yyyy-MM-dd HH:mm";
     private static final Map<Object, PreloadState> sPreloadStates = new WeakHashMap<>();
     private static final Map<Object, TopAnchorState> sTopAnchorStates = new WeakHashMap<>();
     private static final Map<Object, Boolean> sTimelineRecyclerViews = new WeakHashMap<>();
@@ -172,6 +176,7 @@ public class WeiboLiteHook {
     private static File sLogFile = null;
     private static Context sWeicoContext = null;
     private static volatile boolean sTimelineCacheDaysSettingConfirmed = false;
+    private static volatile boolean sTimelineCacheClearInFlight = false;
     private static TimelineNativePersistRequest sPendingTimelineNativePersist = null;
     private static TimelineShadowPersistRequest sPendingTimelineShadowPersist = null;
     private static boolean sTimelinePersistWorkerScheduled = false;
@@ -451,6 +456,51 @@ public class WeiboLiteHook {
             this.force = force;
             this.stats = stats;
         }
+    }
+
+    private static final class TimelineCacheRangeFilterResult {
+        final ArrayList retainedStatuses;
+        final int sourceCount;
+        final int removedCount;
+        final boolean removedLastRead;
+
+        TimelineCacheRangeFilterResult(
+            ArrayList retainedStatuses,
+            int sourceCount,
+            int removedCount,
+            boolean removedLastRead
+        ) {
+            this.retainedStatuses = retainedStatuses;
+            this.sourceCount = sourceCount;
+            this.removedCount = removedCount;
+            this.removedLastRead = removedLastRead;
+        }
+    }
+
+    private static final class TimelineCacheRangeClearResult {
+        final ArrayList retainedStatuses;
+        final int sourceCount;
+        final int removedCount;
+        final boolean removedLastRead;
+        final String maxId;
+
+        TimelineCacheRangeClearResult(
+            ArrayList retainedStatuses,
+            int sourceCount,
+            int removedCount,
+            boolean removedLastRead,
+            String maxId
+        ) {
+            this.retainedStatuses = retainedStatuses;
+            this.sourceCount = sourceCount;
+            this.removedCount = removedCount;
+            this.removedLastRead = removedLastRead;
+            this.maxId = maxId;
+        }
+    }
+
+    private interface TimelineDateTimeCallback {
+        void onSelected(long timeMs);
     }
 
     private static void log(String msg) {
@@ -828,6 +878,48 @@ public class WeiboLiteHook {
                 dpToPx(activity.getWindow().getDecorView(), 48)
             ));
 
+            View divider = new View(activity);
+            divider.setBackgroundColor(0xFF343946);
+            LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                Math.max(1, dpToPx(activity.getWindow().getDecorView(), 1))
+            );
+            dividerParams.setMargins(0, padding, 0, padding / 2);
+            panel.addView(divider, dividerParams);
+
+            TextView clearLabel = new TextView(activity);
+            clearLabel.setText("缓存微博清理");
+            clearLabel.setTextColor(Color.WHITE);
+            clearLabel.setTextSize(15f);
+            panel.addView(clearLabel);
+
+            TimelineCacheStats cacheStats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+            TextView clearDescription = new TextView(activity);
+            clearDescription.setText(
+                formatTimelineCacheRangeSummary(cacheStats)
+                    + "\n可按微博发布时间选择起止范围；清理后再次浏览仍可能重新缓存。"
+            );
+            clearDescription.setTextColor(Color.rgb(160, 169, 184));
+            clearDescription.setTextSize(12f);
+            clearDescription.setPadding(0, dpToPx(activity.getWindow().getDecorView(), 6), 0, 0);
+            panel.addView(clearDescription);
+
+            TextView clearButton = new TextView(activity);
+            clearButton.setText("选择时间范围并清除");
+            clearButton.setTextColor(0xFFFF6B73);
+            clearButton.setTextSize(14f);
+            clearButton.setGravity(Gravity.CENTER);
+            clearButton.setClickable(true);
+            clearButton.setFocusable(true);
+            clearButton.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+            LinearLayout.LayoutParams clearButtonParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 44)
+            );
+            clearButtonParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 12), 0, 0);
+            panel.addView(clearButton, clearButtonParams);
+            clearButton.setOnClickListener(v -> showTimelineCacheClearRangeDialog(activity));
+
             final AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle("ReWeibo 设置")
                 .setView(panel)
@@ -871,6 +963,764 @@ public class WeiboLiteHook {
         } catch (Throwable t) {
             log("show ReWeibo settings dialog error: " + t.getMessage());
         }
+    }
+
+    private static String formatTimelineCacheRangeSummary(TimelineCacheStats stats) {
+        if (stats == null || stats.count <= 0) return "当前未检测到缓存微博";
+        if (stats.oldestMs <= 0L || stats.newestMs <= 0L) {
+            return "当前检测到 " + stats.count + " 条缓存微博，部分发布时间未知";
+        }
+        return "当前约 " + stats.count + " 条："
+            + formatTimelineClearTime(stats.oldestMs)
+            + " 至 "
+            + formatTimelineClearTime(stats.newestMs);
+    }
+
+    private static String formatTimelineClearTime(long timeMs) {
+        if (timeMs <= 0L) return "未知";
+        return new SimpleDateFormat(TIMELINE_CLEAR_TIME_PATTERN, Locale.getDefault())
+            .format(new Date(timeMs));
+    }
+
+    private static EditText newTimelineClearTimeInput(Activity activity, long timeMs) {
+        EditText input = new EditText(activity);
+        input.setSingleLine(true);
+        input.setSelectAllOnFocus(true);
+        input.setText(formatTimelineClearTime(timeMs));
+        input.setHint("yyyy-MM-dd HH:mm");
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.rgb(145, 155, 170));
+        input.setTextSize(14f);
+        input.setGravity(Gravity.CENTER_VERTICAL);
+        input.setPadding(dpToPx(activity.getWindow().getDecorView(), 12), 0, 0, 0);
+        input.setInputType(InputType.TYPE_CLASS_DATETIME | InputType.TYPE_DATETIME_VARIATION_NORMAL);
+        input.setKeyListener(DigitsKeyListener.getInstance("0123456789-/: .年月日号"));
+        input.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+        return input;
+    }
+
+    private static EditText newTimelineClearSingleDayInput(Activity activity) {
+        EditText input = newTimelineClearTimeInput(activity, 0L);
+        input.setText("");
+        input.setHint("如 7号、7-7、2026-07-07");
+        input.setContentDescription("缓存清理单日快捷输入");
+        return input;
+    }
+
+    private static TextView newTimelineClearCalendarButton(Activity activity, String contentDescription) {
+        TextView button = new TextView(activity);
+        button.setText("日历");
+        button.setContentDescription(contentDescription);
+        button.setTextColor(0xFFFF6B73);
+        button.setTextSize(14f);
+        button.setGravity(Gravity.CENTER);
+        button.setClickable(true);
+        button.setFocusable(true);
+        button.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+        return button;
+    }
+
+    private static void showTimelineCacheClearRangeDialog(final Activity activity) {
+        try {
+            TimelineCacheStats stats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+            long nowMs = System.currentTimeMillis();
+            long initialStart = stats != null && stats.oldestMs > 0L
+                ? stats.oldestMs
+                : nowMs - TIMELINE_CACHE_DAY_MS;
+            long initialEnd = stats != null && stats.newestMs > 0L
+                ? stats.newestMs
+                : nowMs;
+            final long[] selectedRange = new long[] {
+                normalizeTimelineClearMinute(initialStart, false),
+                normalizeTimelineClearMinute(initialEnd, true)
+            };
+
+            LinearLayout panel = new LinearLayout(activity);
+            panel.setOrientation(LinearLayout.VERTICAL);
+            int padding = dpToPx(activity.getWindow().getDecorView(), 20);
+            panel.setPadding(padding, padding / 2, padding, padding / 2);
+
+            TextView hint = new TextView(activity);
+            hint.setText(
+                "可直接输入日期或时间，也可使用右侧日历。日期支持 7号、7-7、"
+                    + "2026-07-07 等写法；清理范围包含起止边界。"
+            );
+            hint.setTextColor(Color.rgb(160, 169, 184));
+            hint.setTextSize(13f);
+            hint.setPadding(0, 0, 0, dpToPx(activity.getWindow().getDecorView(), 12));
+            panel.addView(hint);
+
+            TextView singleDayLabel = new TextView(activity);
+            singleDayLabel.setText("只清除某一天（可选，填写后优先）");
+            singleDayLabel.setTextColor(Color.WHITE);
+            singleDayLabel.setTextSize(14f);
+            panel.addView(singleDayLabel);
+
+            final EditText singleDayInput = newTimelineClearSingleDayInput(activity);
+            LinearLayout.LayoutParams singleDayParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            singleDayParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 6), 0,
+                dpToPx(activity.getWindow().getDecorView(), 14));
+            panel.addView(singleDayInput, singleDayParams);
+
+            TextView startLabel = new TextView(activity);
+            startLabel.setText("开始时间");
+            startLabel.setTextColor(Color.WHITE);
+            startLabel.setTextSize(14f);
+            panel.addView(startLabel);
+
+            final EditText startInput = newTimelineClearTimeInput(activity, selectedRange[0]);
+            startInput.setContentDescription("缓存清理开始时间");
+            final TextView startCalendar = newTimelineClearCalendarButton(
+                activity,
+                "为开始时间打开日历"
+            );
+            LinearLayout startRow = new LinearLayout(activity);
+            startRow.setOrientation(LinearLayout.HORIZONTAL);
+            startRow.setGravity(Gravity.CENTER_VERTICAL);
+            startRow.addView(startInput, new LinearLayout.LayoutParams(
+                0,
+                dpToPx(activity.getWindow().getDecorView(), 46),
+                1f
+            ));
+            LinearLayout.LayoutParams startCalendarParams = new LinearLayout.LayoutParams(
+                dpToPx(activity.getWindow().getDecorView(), 68),
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            startCalendarParams.setMargins(dpToPx(activity.getWindow().getDecorView(), 8), 0, 0, 0);
+            startRow.addView(startCalendar, startCalendarParams);
+            LinearLayout.LayoutParams timeParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            timeParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 6), 0,
+                dpToPx(activity.getWindow().getDecorView(), 14));
+            panel.addView(startRow, timeParams);
+
+            TextView endLabel = new TextView(activity);
+            endLabel.setText("结束时间");
+            endLabel.setTextColor(Color.WHITE);
+            endLabel.setTextSize(14f);
+            panel.addView(endLabel);
+
+            final EditText endInput = newTimelineClearTimeInput(activity, selectedRange[1]);
+            endInput.setContentDescription("缓存清理结束时间");
+            final TextView endCalendar = newTimelineClearCalendarButton(
+                activity,
+                "为结束时间打开日历"
+            );
+            LinearLayout endRow = new LinearLayout(activity);
+            endRow.setOrientation(LinearLayout.HORIZONTAL);
+            endRow.setGravity(Gravity.CENTER_VERTICAL);
+            endRow.addView(endInput, new LinearLayout.LayoutParams(
+                0,
+                dpToPx(activity.getWindow().getDecorView(), 46),
+                1f
+            ));
+            LinearLayout.LayoutParams endCalendarParams = new LinearLayout.LayoutParams(
+                dpToPx(activity.getWindow().getDecorView(), 68),
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            endCalendarParams.setMargins(dpToPx(activity.getWindow().getDecorView(), 8), 0, 0, 0);
+            endRow.addView(endCalendar, endCalendarParams);
+            LinearLayout.LayoutParams endParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            endParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 6), 0, 0);
+            panel.addView(endRow, endParams);
+
+            startInput.setOnFocusChangeListener((view, hasFocus) -> {
+                if (hasFocus) singleDayInput.setText("");
+            });
+            endInput.setOnFocusChangeListener((view, hasFocus) -> {
+                if (hasFocus) singleDayInput.setText("");
+            });
+
+            startCalendar.setOnClickListener(v -> {
+                singleDayInput.setText("");
+                long typed = parseTimelineClearTimeInput(
+                    startInput.getText() == null ? null : startInput.getText().toString(),
+                    false
+                );
+                showTimelineClearDateTimePicker(
+                    activity,
+                    typed > 0L ? typed : selectedRange[0],
+                    false,
+                    timeMs -> {
+                        selectedRange[0] = timeMs;
+                        startInput.setError(null);
+                        startInput.setText(formatTimelineClearTime(timeMs));
+                    }
+                );
+            });
+            endCalendar.setOnClickListener(v -> {
+                singleDayInput.setText("");
+                long typed = parseTimelineClearTimeInput(
+                    endInput.getText() == null ? null : endInput.getText().toString(),
+                    true
+                );
+                showTimelineClearDateTimePicker(
+                    activity,
+                    typed > 0L ? typed : selectedRange[1],
+                    true,
+                    timeMs -> {
+                        selectedRange[1] = timeMs;
+                        endInput.setError(null);
+                        endInput.setText(formatTimelineClearTime(timeMs));
+                    }
+                );
+            });
+
+            final AlertDialog dialog = new AlertDialog.Builder(activity)
+                .setTitle("清除缓存微博")
+                .setView(panel)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("下一步", null)
+                .create();
+            dialog.setOnShowListener(ignored -> {
+                styleDarkDialog(dialog, activity.getWindow().getDecorView());
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                    String singleDayRaw = singleDayInput.getText() == null
+                        ? ""
+                        : singleDayInput.getText().toString().trim();
+                    if (!singleDayRaw.isEmpty()) {
+                        long dayStart = parseTimelineClearDateOnlyInput(singleDayRaw, false);
+                        long dayEnd = parseTimelineClearDateOnlyInput(singleDayRaw, true);
+                        if (dayStart <= 0L || dayEnd <= 0L) {
+                            singleDayInput.setError("请输入有效日期，如 7号、7-7 或 2026-07-07");
+                            singleDayInput.requestFocus();
+                            return;
+                        }
+                        selectedRange[0] = dayStart;
+                        selectedRange[1] = dayEnd;
+                        startInput.setText(formatTimelineClearTime(dayStart));
+                        endInput.setText(formatTimelineClearTime(dayEnd));
+                        singleDayInput.clearFocus();
+                        startInput.clearFocus();
+                        endInput.clearFocus();
+                        showTimelineCacheClearConfirmation(
+                            activity,
+                            dialog,
+                            dayStart,
+                            dayEnd
+                        );
+                        return;
+                    }
+                    long parsedStart = parseTimelineClearTimeInput(
+                        startInput.getText() == null ? null : startInput.getText().toString(),
+                        false
+                    );
+                    if (parsedStart <= 0L) {
+                        startInput.setError("请输入有效日期或时间，如 7号、7-7、2026-07-07 00:00");
+                        startInput.requestFocus();
+                        return;
+                    }
+                    long parsedEnd = parseTimelineClearTimeInput(
+                        endInput.getText() == null ? null : endInput.getText().toString(),
+                        true
+                    );
+                    if (parsedEnd <= 0L) {
+                        endInput.setError("请输入有效日期或时间，如 7号、7-7、2026-07-07 23:59");
+                        endInput.requestFocus();
+                        return;
+                    }
+                    if (parsedStart > parsedEnd) {
+                        startInput.setError("开始时间不能晚于结束时间");
+                        startInput.requestFocus();
+                        return;
+                    }
+                    selectedRange[0] = parsedStart;
+                    selectedRange[1] = parsedEnd;
+                    startInput.setText(formatTimelineClearTime(parsedStart));
+                    endInput.setText(formatTimelineClearTime(parsedEnd));
+                    startInput.clearFocus();
+                    endInput.clearFocus();
+                    showTimelineCacheClearConfirmation(
+                        activity,
+                        dialog,
+                        selectedRange[0],
+                        selectedRange[1]
+                    );
+                });
+            });
+            dialog.show();
+        } catch (Throwable t) {
+            log("show timeline cache clear range error: " + t.getMessage());
+            Toast.makeText(activity, "无法打开缓存清理，请重试", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private static void showTimelineClearDateTimePicker(
+        final Activity activity,
+        long initialTimeMs,
+        final boolean endOfMinute,
+        final TimelineDateTimeCallback callback
+    ) {
+        final Calendar selected = Calendar.getInstance();
+        selected.setTimeInMillis(initialTimeMs > 0L ? initialTimeMs : System.currentTimeMillis());
+        DatePickerDialog dateDialog = new DatePickerDialog(
+            activity,
+            (datePicker, year, month, dayOfMonth) -> {
+                selected.set(Calendar.YEAR, year);
+                selected.set(Calendar.MONTH, month);
+                selected.set(Calendar.DAY_OF_MONTH, dayOfMonth);
+                TimePickerDialog timeDialog = new TimePickerDialog(
+                    activity,
+                    (timePicker, hourOfDay, minute) -> {
+                        selected.set(Calendar.HOUR_OF_DAY, hourOfDay);
+                        selected.set(Calendar.MINUTE, minute);
+                        selected.set(Calendar.SECOND, endOfMinute ? 59 : 0);
+                        selected.set(Calendar.MILLISECOND, endOfMinute ? 999 : 0);
+                        callback.onSelected(selected.getTimeInMillis());
+                    },
+                    selected.get(Calendar.HOUR_OF_DAY),
+                    selected.get(Calendar.MINUTE),
+                    true
+                );
+                timeDialog.show();
+            },
+            selected.get(Calendar.YEAR),
+            selected.get(Calendar.MONTH),
+            selected.get(Calendar.DAY_OF_MONTH)
+        );
+        dateDialog.show();
+    }
+
+    private static long normalizeTimelineClearMinute(long timeMs, boolean endOfMinute) {
+        Calendar value = Calendar.getInstance();
+        value.setTimeInMillis(timeMs > 0L ? timeMs : System.currentTimeMillis());
+        value.set(Calendar.SECOND, endOfMinute ? 59 : 0);
+        value.set(Calendar.MILLISECOND, endOfMinute ? 999 : 0);
+        return value.getTimeInMillis();
+    }
+
+    static long parseTimelineClearTimeInput(String raw, boolean endOfMinute) {
+        if (raw == null) return -1L;
+        String text = raw.trim();
+        if (text.isEmpty()) return -1L;
+        String normalized = normalizeTimelineClearInput(text);
+        String[] patterns = new String[] {
+            "yyyy-M-d H:m",
+            "yyyy/M/d H:m",
+            "yyyy.M.d H:m",
+            "yyyyMMddHHmm"
+        };
+        for (int i = 0; i < patterns.length; i++) {
+            SimpleDateFormat parser = new SimpleDateFormat(patterns[i], Locale.getDefault());
+            parser.setLenient(false);
+            ParsePosition position = new ParsePosition(0);
+            Date parsed = parser.parse(normalized, position);
+            if (parsed == null || position.getIndex() != normalized.length()) continue;
+            return normalizeTimelineClearMinute(parsed.getTime(), endOfMinute);
+        }
+        return parseTimelineClearDateOnlyInput(text, endOfMinute);
+    }
+
+    static long parseTimelineClearDateOnlyInput(String raw, boolean endOfDay) {
+        if (raw == null) return -1L;
+        String text = normalizeTimelineClearInput(raw.trim());
+        if (text.isEmpty() || text.indexOf(':') >= 0) return -1L;
+
+        int year;
+        int month;
+        int day;
+        Calendar reference = Calendar.getInstance();
+        String[] parts;
+        if (text.matches("\\d{8}")) {
+            year = parsePositiveInt(text.substring(0, 4));
+            month = parsePositiveInt(text.substring(4, 6));
+            day = parsePositiveInt(text.substring(6, 8));
+        } else if (text.matches("\\d{4}[-/.]\\d{1,2}[-/.]\\d{1,2}")) {
+            parts = text.split("[-/.]");
+            year = parsePositiveInt(parts[0]);
+            month = parsePositiveInt(parts[1]);
+            day = parsePositiveInt(parts[2]);
+        } else if (text.matches("\\d{1,2}[-/.]\\d{1,2}")) {
+            parts = text.split("[-/.]");
+            year = reference.get(Calendar.YEAR);
+            month = parsePositiveInt(parts[0]);
+            day = parsePositiveInt(parts[1]);
+        } else if (text.matches("\\d{1,2}")) {
+            year = reference.get(Calendar.YEAR);
+            month = reference.get(Calendar.MONTH) + 1;
+            day = parsePositiveInt(text);
+        } else {
+            return -1L;
+        }
+
+        if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31) return -1L;
+        Calendar value = Calendar.getInstance();
+        value.clear();
+        value.setLenient(false);
+        value.set(
+            year,
+            month - 1,
+            day,
+            endOfDay ? 23 : 0,
+            endOfDay ? 59 : 0,
+            endOfDay ? 59 : 0
+        );
+        value.set(Calendar.MILLISECOND, endOfDay ? 999 : 0);
+        try {
+            return value.getTimeInMillis();
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    private static String normalizeTimelineClearInput(String raw) {
+        if (raw == null) return "";
+        return raw.trim()
+            .replace('年', '-')
+            .replace('月', '-')
+            .replace("日", "")
+            .replace("号", "")
+            .replaceAll("\\s+", " ")
+            .trim();
+    }
+
+    private static int parsePositiveInt(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    private static void showTimelineCacheClearConfirmation(
+        final Activity activity,
+        final AlertDialog rangeDialog,
+        final long startMs,
+        final long endMs
+    ) {
+        AlertDialog confirmation = new AlertDialog.Builder(activity)
+            .setTitle("确认清除？")
+            .setMessage(
+                "将清除 " + formatTimelineClearTime(startMs)
+                    + " 至 " + formatTimelineClearTime(endMs)
+                    + " 发布的缓存微博。此操作无法撤销。"
+            )
+            .setNegativeButton("返回", null)
+            .setPositiveButton("确认清除", (dialog, which) -> {
+                rangeDialog.dismiss();
+                startTimelineCacheRangeClear(activity, startMs, endMs);
+            })
+            .create();
+        confirmation.setOnShowListener(ignored ->
+            styleDarkDialog(confirmation, activity.getWindow().getDecorView())
+        );
+        confirmation.show();
+    }
+
+    private static void startTimelineCacheRangeClear(
+        final Activity activity,
+        final long startMs,
+        final long endMs
+    ) {
+        if (startMs <= 0L || endMs < startMs) {
+            Toast.makeText(activity, "清理时间范围无效", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final Object presenter = sLastTimelinePresenter;
+        if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))
+            || getTimelineAction(presenter) == null) {
+            Toast.makeText(activity, "请先打开首页时间线，待微博显示后再清理", Toast.LENGTH_LONG).show();
+            return;
+        }
+        synchronized (WeiboLiteHook.class) {
+            if (sTimelineCacheClearInFlight) {
+                Toast.makeText(activity, "缓存正在清理，请稍候", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            sTimelineCacheClearInFlight = true;
+        }
+
+        final ArrayList liveStatuses = snapshotTimelineStatuses(presenter, null);
+        final ArrayList cumulativeStatuses;
+        synchronized (sTimelineCumulativeStatusesById) {
+            cumulativeStatuses = new ArrayList(sTimelineCumulativeStatusesById.values());
+        }
+        prepareTimelineStateForCacheClear(presenter);
+
+        ProgressBar progressBar = new ProgressBar(activity);
+        int progressPadding = dpToPx(activity.getWindow().getDecorView(), 24);
+        progressBar.setPadding(progressPadding, progressPadding, progressPadding, progressPadding);
+        final AlertDialog progressDialog = new AlertDialog.Builder(activity)
+            .setTitle("正在清除缓存")
+            .setMessage("正在安全改写缓存文件，请勿关闭微博轻享版。")
+            .setView(progressBar)
+            .setCancelable(false)
+            .create();
+        progressDialog.setOnShowListener(ignored ->
+            styleDarkDialog(progressDialog, activity.getWindow().getDecorView())
+        );
+        progressDialog.show();
+
+        sTimelinePersistExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                TimelineCacheRangeClearResult result = null;
+                Throwable error = null;
+                try {
+                    result = clearTimelineCacheRangeNow(
+                        presenter,
+                        liveStatuses,
+                        cumulativeStatuses,
+                        startMs,
+                        endMs
+                    );
+                } catch (Throwable t) {
+                    error = t;
+                }
+
+                final TimelineCacheRangeClearResult completed = result;
+                final Throwable failure = error;
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            if (progressDialog.isShowing()) progressDialog.dismiss();
+                            if (failure != null || completed == null) {
+                                resetPreloadState(presenter, "manual-cache-clear-failed");
+                                String detail = failure == null
+                                    ? "unknown error"
+                                    : failure.getClass().getSimpleName() + ": " + failure.getMessage();
+                                log("Timeline cache range clear failed: " + detail);
+                                Toast.makeText(activity, "缓存清理失败，请重试", Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            applyTimelineCacheRangeClear(presenter, completed);
+                            if (completed.removedCount <= 0) {
+                                resetPreloadState(presenter, "manual-cache-clear-empty");
+                                Toast.makeText(
+                                    activity,
+                                    "所选时间范围内没有缓存微博",
+                                    Toast.LENGTH_SHORT
+                                ).show();
+                            } else {
+                                Toast.makeText(
+                                    activity,
+                                    "已清除 " + completed.removedCount
+                                        + " 条，保留 " + completed.retainedStatuses.size() + " 条",
+                                    Toast.LENGTH_LONG
+                                ).show();
+                            }
+                        } finally {
+                            sTimelineCacheClearInFlight = false;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private static void prepareTimelineStateForCacheClear(Object presenter) {
+        synchronized (sTimelineRestoreLock) {
+            TimelineRestoreState state = sTimelineRestoreStates.get(presenter);
+            if (state == null) {
+                state = new TimelineRestoreState();
+                sTimelineRestoreStates.put(presenter, state);
+            }
+            state.generation++;
+            state.inFlight = false;
+            state.diskRestoreResolved = true;
+            state.pendingLiveStatuses = null;
+            state.pendingSource = null;
+        }
+        synchronized (sTimelinePersistQueueLock) {
+            sPendingTimelineNativePersist = null;
+            sPendingTimelineShadowPersist = null;
+        }
+        synchronized (sPreloadStates) {
+            PreloadState state = getPreloadStateLocked(presenter);
+            state.stopped = true;
+            state.scheduled = false;
+            state.inFlight = false;
+            state.retryScheduled = false;
+            state.requestToken++;
+            state.retryToken++;
+        }
+        synchronized (WeiboLiteHook.class) {
+            sPendingTimelineNoMoreSource = null;
+            sPendingTimelineNoMoreGeneration++;
+        }
+        stopTimelineGapFill("manual-cache-clear");
+        log("Timeline cache range clear prepared live=" + snapshotTimelineStatuses(presenter, null).size());
+    }
+
+    private static TimelineCacheRangeClearResult clearTimelineCacheRangeNow(
+        Object presenter,
+        List liveStatuses,
+        List cumulativeStatuses,
+        long startMs,
+        long endMs
+    ) throws Exception {
+        Object action = getTimelineAction(presenter);
+        if (action == null) throw new IllegalStateException("timeline action is missing");
+        Object builder = getTimelineCacheBuilder(action);
+        TimelineCacheLoad load = loadTimelineCacheSingleSource(action, builder, "manual-range-clear");
+        List diskStatuses = load == null ? null : load.statuses;
+        ArrayList merged = mergeTimelineStatusLists(diskStatuses, cumulativeStatuses, liveStatuses);
+        TimelineCacheRangeFilterResult filtered = filterTimelineCacheRange(
+            merged,
+            startMs,
+            endMs
+        );
+        ArrayList retained = new ArrayList(
+            sortTimelineNewestFirst(
+                filtered.retainedStatuses,
+                presenter,
+                "manual-range-clear",
+                false
+            )
+        );
+        String maxId = retained.isEmpty() ? "0" : getTimelineCacheMaxId(action, retained);
+        if (filtered.removedCount <= 0) {
+            return new TimelineCacheRangeClearResult(
+                retained,
+                filtered.sourceCount,
+                0,
+                false,
+                maxId
+            );
+        }
+
+        Object result = newTimelineStatusResult(action, retained, maxId);
+        File nativeFile = getTimelineNativeCacheFile(builder);
+        if (nativeFile == null) throw new IllegalStateException("timeline native cache file is missing");
+        writeTimelineNativeCacheStreaming(result, getTimelineCacheGson(builder), nativeFile);
+
+        File shadowFile = getTimelineShadowCacheFile();
+        File parent = shadowFile.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IllegalStateException("cannot create timeline shadow cache directory");
+        }
+        copyFile(nativeFile, shadowFile);
+        TimelineCacheStats stats = buildTimelineCacheStats(retained);
+        writeTimelineShadowCacheMeta(
+            nativeFile.getName(),
+            "manual-range-clear",
+            retained.size(),
+            maxId,
+            shadowFile.length(),
+            stats
+        );
+        sTimelineShadowCacheCount = retained.size();
+        log("Timeline cache range cleared start=" + startMs
+            + " end=" + endMs
+            + " source=" + (load == null ? "memory" : load.source)
+            + " before=" + filtered.sourceCount
+            + " removed=" + filtered.removedCount
+            + " retained=" + retained.size());
+        return new TimelineCacheRangeClearResult(
+            retained,
+            filtered.sourceCount,
+            filtered.removedCount,
+            filtered.removedLastRead,
+            maxId
+        );
+    }
+
+    private static TimelineCacheRangeFilterResult filterTimelineCacheRange(
+        List source,
+        long startMs,
+        long endMs
+    ) {
+        ArrayList statuses = collectTimelineStatuses(source);
+        ArrayList retained = new ArrayList(statuses.size());
+        int removed = 0;
+        boolean removedLastRead = false;
+        long lastReadId = sLastReadStatusId == null ? 0L : sLastReadStatusId.longValue();
+        for (int i = 0; i < statuses.size(); i++) {
+            Object status = unwrapStatus(statuses.get(i));
+            long createdMs = getStatusCreatedAtMillis(status);
+            if (shouldClearTimelineStatusCreatedAt(createdMs, startMs, endMs)) {
+                removed++;
+                if (lastReadId > 0L && getStatusId(status) == lastReadId) {
+                    removedLastRead = true;
+                }
+            } else {
+                retained.add(status);
+            }
+        }
+        return new TimelineCacheRangeFilterResult(
+            retained,
+            statuses.size(),
+            removed,
+            removedLastRead
+        );
+    }
+
+    static boolean shouldClearTimelineStatusCreatedAt(long createdMs, long startMs, long endMs) {
+        return createdMs > 0L && startMs > 0L && endMs >= startMs
+            && createdMs >= startMs && createdMs <= endMs;
+    }
+
+    private static void applyTimelineCacheRangeClear(
+        Object presenter,
+        TimelineCacheRangeClearResult result
+    ) {
+        if (result.removedCount <= 0) return;
+        try {
+            replaceTimelineCumulativeStatuses(
+                result.retainedStatuses,
+                presenter,
+                "manual-range-clear"
+            );
+            setTimelineCacheRestoring(presenter, true);
+            try {
+                setPresenterTimelineDataPrepared(
+                    presenter,
+                    result.retainedStatuses,
+                    result.retainedStatuses.size(),
+                    "manual-range-clear"
+                );
+            } finally {
+                setTimelineCacheRestoring(presenter, false);
+            }
+            Object action = getTimelineAction(presenter);
+            syncTimelineActionAfterCacheClear(action, result.maxId);
+            synchronized (sPersistedTimelineCacheCounts) {
+                sPersistedTimelineCacheCounts.put(
+                    presenter,
+                    Integer.valueOf(result.retainedStatuses.size())
+                );
+                sPersistedTimelineCacheNewestIds.put(
+                    presenter,
+                    Long.valueOf(getNewestTimelineStatusId(result.retainedStatuses))
+                );
+            }
+            forgetTimelinePreloadDone("manual-range-clear");
+            if (result.removedLastRead) forgetTimelineLastRead("manual-range-clear");
+            sTimelineOldestFirstMode = false;
+            sTimelineRestoredCacheMode = false;
+            log("Timeline cache range clear applied before=" + result.sourceCount
+                + " removed=" + result.removedCount
+                + " retained=" + result.retainedStatuses.size());
+        } catch (Throwable t) {
+            setTimelineCacheRestoring(presenter, false);
+            log("Timeline cache range clear apply error: " + t.getMessage());
+        }
+    }
+
+    private static void syncTimelineActionAfterCacheClear(Object action, String maxId) {
+        if (action == null || !hasMeaningfulString(maxId)) return;
+        if (!"0".equals(maxId)) {
+            syncTimelineActionMaxId(action, maxId, "manual-range-clear");
+            return;
+        }
+        try { XposedHelpers.callMethod(action, "setMaxId", "0"); } catch (Throwable ignored) {}
+        try { XposedHelpers.callMethod(action, "setMaxId", Long.valueOf(0L)); } catch (Throwable ignored) {}
+        String[] fields = new String[] {
+            "lastMaxId", "maxId", "mMaxId", "max_id", "maxid", "maxID", "maxIdStr", "max_id_str"
+        };
+        for (int i = 0; i < fields.length; i++) {
+            setTimelineCursorField(action, fields[i], "0");
+        }
+        log("Timeline cursor reset source=manual-range-clear");
     }
 
     private static GradientDrawable makeDarkDialogInputBackground(View anchor) {
@@ -2475,6 +3325,10 @@ public class WeiboLiteHook {
 
     private static void persistTimelineNativeCache(Object presenter, String source) {
         try {
+            if (sTimelineCacheClearInFlight) {
+                log("Timeline full cache persist skipped during manual clear source=" + source);
+                return;
+            }
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             if (isTimelineCacheRestoreInFlight(presenter)) {
                 log("Timeline full cache persist deferred source=" + source + " restore-in-flight");
@@ -2503,6 +3357,10 @@ public class WeiboLiteHook {
 
     private static boolean persistTimelineNativeCacheList(Object presenter, List list, String source, boolean force) {
         try {
+            if (sTimelineCacheClearInFlight) {
+                log("Timeline full cache list persist skipped during manual clear source=" + source);
+                return false;
+            }
             if (presenter == null || list == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
             if (!force && isTimelineCacheRestoreInFlight(presenter)) {
                 log("Timeline full cache persist deferred source=" + source + " restore-in-flight");
@@ -2582,6 +3440,10 @@ public class WeiboLiteHook {
         boolean force,
         TimelineCacheStats candidateStats
     ) {
+        if (sTimelineCacheClearInFlight) {
+            log("Timeline shadow cache persist skipped during manual clear source=" + source);
+            return;
+        }
         enqueueTimelineShadowCachePersist(new TimelineShadowPersistRequest(
             source,
             count,
@@ -2680,6 +3542,10 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineNativeCachePersist(TimelineNativePersistRequest request) {
+        if (sTimelineCacheClearInFlight) {
+            log("Timeline native cache enqueue skipped during manual clear source=" + request.source);
+            return;
+        }
         synchronized (sTimelinePersistQueueLock) {
             if (sPendingTimelineNativePersist != null) {
                 log("Timeline native cache write coalesced old=" + sPendingTimelineNativePersist.source
@@ -2694,6 +3560,10 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineShadowCachePersist(TimelineShadowPersistRequest request) {
+        if (sTimelineCacheClearInFlight) {
+            log("Timeline shadow cache enqueue skipped during manual clear source=" + request.source);
+            return;
+        }
         synchronized (sTimelinePersistQueueLock) {
             sPendingTimelineShadowPersist = request;
             scheduleTimelinePersistWorkerLocked();
@@ -3193,6 +4063,10 @@ public class WeiboLiteHook {
         boolean preferCumulative
     ) {
         try {
+            if (sTimelineCacheClearInFlight) {
+                log("Timeline cache restore skipped during manual clear source=" + source);
+                return false;
+            }
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
 
             ArrayList liveStatuses = snapshotTimelineStatuses(presenter, incomingData);
@@ -3534,6 +4408,7 @@ public class WeiboLiteHook {
         TimelineRestoreResult result,
         Throwable failure
     ) {
+        if (sTimelineCacheClearInFlight) return;
         ArrayList lateLiveStatuses = null;
         String lateSource = null;
         synchronized (sTimelineRestoreLock) {
@@ -5036,6 +5911,7 @@ public class WeiboLiteHook {
 
     private static void scheduleTimelineGapFill(final Object presenter, final String source) {
         try {
+            if (sTimelineCacheClearInFlight) return;
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             final long delayMs;
             synchronized (sTimelineGapFillState) {
@@ -7236,6 +8112,7 @@ public class WeiboLiteHook {
     private static void scheduleTimelinePreload(final Object presenter, final String source) {
         if (presenter == null) return;
         try {
+            if (sTimelineCacheClearInFlight) return;
             if (!"-1".equals(getTimelineGroupId(presenter))) return;
             rememberTimelinePresenter(presenter);
             int count = getTimelineStatusCount(presenter);

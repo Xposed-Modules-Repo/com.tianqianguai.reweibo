@@ -3,6 +3,7 @@ package com.tianqianguai.reweibo
 import org.junit.Test
 
 import org.junit.Assert.*
+import java.util.Calendar
 
 /**
  * Example local unit test, which will execute on the development machine (host).
@@ -146,6 +147,67 @@ class ExampleUnitTest {
             now - 3 * 24 * 60 * 60 * 1000L,
             WeiboLiteHook.timelineCacheCutoffMs(now, 3)
         )
+    }
+
+    @Test
+    fun cacheClearRangeIsInclusiveAndKeepsUnknownTimestamps() {
+        val start = 1_800_000_000_000L
+        val end = start + 60_000L
+
+        assertTrue(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(start, start, end))
+        assertTrue(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(end, start, end))
+        assertTrue(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(start + 30_000L, start, end))
+        assertFalse(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(start - 1L, start, end))
+        assertFalse(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(end + 1L, start, end))
+        assertFalse(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(0L, start, end))
+        assertFalse(WeiboLiteHook.shouldClearTimelineStatusCreatedAt(start, end, start))
+    }
+
+    @Test
+    fun looseSingleDayInputExpandsToTheWholeLocalDay() {
+        val reference = Calendar.getInstance()
+        val start = WeiboLiteHook.parseTimelineClearDateOnlyInput("7号", false)
+        val end = WeiboLiteHook.parseTimelineClearDateOnlyInput("7日", true)
+        val startValue = Calendar.getInstance().apply { timeInMillis = start }
+        val endValue = Calendar.getInstance().apply { timeInMillis = end }
+
+        assertTrue(start > 0L)
+        assertTrue(end > start)
+        assertEquals(reference.get(Calendar.YEAR), startValue.get(Calendar.YEAR))
+        assertEquals(reference.get(Calendar.MONTH), startValue.get(Calendar.MONTH))
+        assertEquals(7, startValue.get(Calendar.DAY_OF_MONTH))
+        assertEquals(0, startValue.get(Calendar.HOUR_OF_DAY))
+        assertEquals(0, startValue.get(Calendar.MINUTE))
+        assertEquals(0, startValue.get(Calendar.SECOND))
+        assertEquals(0, startValue.get(Calendar.MILLISECOND))
+        assertEquals(7, endValue.get(Calendar.DAY_OF_MONTH))
+        assertEquals(23, endValue.get(Calendar.HOUR_OF_DAY))
+        assertEquals(59, endValue.get(Calendar.MINUTE))
+        assertEquals(59, endValue.get(Calendar.SECOND))
+        assertEquals(999, endValue.get(Calendar.MILLISECOND))
+        assertEquals(start, WeiboLiteHook.parseTimelineClearDateOnlyInput("7", false))
+        assertEquals(
+            start,
+            WeiboLiteHook.parseTimelineClearDateOnlyInput(
+                "${reference.get(Calendar.MONTH) + 1}-7",
+                false
+            )
+        )
+    }
+
+    @Test
+    fun looseDateInputSupportsFullDatesAndRejectsImpossibleDates() {
+        val dayStart = WeiboLiteHook.parseTimelineClearTimeInput("2026-07-07", false)
+        val dayEnd = WeiboLiteHook.parseTimelineClearTimeInput("20260707", true)
+        val preciseStart = WeiboLiteHook.parseTimelineClearTimeInput("2026年7月7日 12:34", false)
+        val preciseEnd = WeiboLiteHook.parseTimelineClearTimeInput("2026/7/7 12:34", true)
+
+        assertTrue(dayStart > 0L)
+        assertTrue(dayEnd > dayStart)
+        assertEquals(59_999L, preciseEnd - preciseStart)
+        assertEquals(-1L, WeiboLiteHook.parseTimelineClearDateOnlyInput("2月30日", false))
+        assertEquals(-1L, WeiboLiteHook.parseTimelineClearTimeInput("2026-02-30 10:00", false))
+        assertEquals(-1L, WeiboLiteHook.parseTimelineClearDateOnlyInput("32号", false))
     }
 
     @Test

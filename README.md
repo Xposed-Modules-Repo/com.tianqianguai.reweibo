@@ -11,6 +11,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - 过滤广告样式和无实际内容的时间线条目。
 - 按设定的时间跨度补齐、裁剪并恢复首页时间线缓存；检测到缓存断层时分段回补并显示进度，降低刷新或缓存丢失后的内容缺口。
 - 在微博轻享版“我的”页提供 ReWeibo 设置入口，可控制入口显示并调整首页缓存时间跨度。
+- 可在 ReWeibo 设置中按微博发布时间清除指定范围；既可直接输入日期/时间（如 `7号`、`7-7`、`2026-07-07 12:30`），也可使用日历。仅输入日期时按当天整日处理，并同步清除原生缓存、ReWeibo shadow cache 和当前内存时间线中的匹配微博。
 - 在头像下方提供“跳转”按钮；深色弹窗会显示实际缓存条数与可跳转时间范围，并拒绝超出缓存范围的输入。
 - 在可信缓存恢复后保存并恢复上次阅读位置，并显示“上次读到这里”标记。
 - 在可行时刷新或替换时间线视频的过期缓存地址。
@@ -23,6 +24,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - Filters ad-like and contentless timeline entries.
 - Fills, trims, and restores the home timeline cache to a configured time span, backfilling detected gaps in stages with visible progress.
 - Adds a ReWeibo entry to Weibo Lite's profile drawer for controlling entry visibility and the home timeline cache window.
+- Clears cached statuses within an inclusive publication-time range across the native, ReWeibo shadow, and in-memory timeline caches. Users can type loose dates (for example `7`, `7-7`, or a full date/time) or use the calendar; date-only input covers the entire day.
 - Adds a "跳转" button below the avatar; its dark dialog shows the real cached item count and jumpable time range, and rejects out-of-range input.
 - Saves and restores the last-read position after trusted cache restoration, with a visible "上次读到这里" marker.
 - Refreshes or replaces expired cached timeline video URLs when possible.
