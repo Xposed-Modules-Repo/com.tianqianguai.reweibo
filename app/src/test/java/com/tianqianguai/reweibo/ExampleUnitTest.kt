@@ -368,4 +368,67 @@ class ExampleUnitTest {
         assertTrue(WeiboLiteHook.shouldUseTimelineLastRead(true, false))
         assertTrue(WeiboLiteHook.shouldUseTimelineLastRead(false, false))
     }
+
+    @Test
+    fun visibleHomeTimelineAlwaysBeatsALargerHiddenRecycler() {
+        val visibleHome = WeiboLiteHook.scoreTimelineRecyclerCandidate(
+            true, true, true, true, true, 800_000, 25
+        )
+        val hiddenStale = WeiboLiteHook.scoreTimelineRecyclerCandidate(
+            true, true, false, false, false, 0, 4_500
+        )
+        val unrelated = WeiboLiteHook.scoreTimelineRecyclerCandidate(
+            false, true, true, true, true, 800_000, 9_000
+        )
+
+        assertTrue(visibleHome > hiddenStale)
+        assertEquals(Int.MIN_VALUE, unrelated)
+        assertTrue(WeiboLiteHook.isTimelineNavigationCandidate(true, true, true, true, 1))
+        assertFalse(WeiboLiteHook.isTimelineNavigationCandidate(true, true, false, true, 1))
+        assertFalse(WeiboLiteHook.isTimelineNavigationCandidate(false, true, true, true, 1))
+    }
+
+    @Test
+    fun authoritativeCacheReplacesShortOrDifferentAdapterData() {
+        assertTrue(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_500, 25, 900L, 900L, 100L, 875L, false
+            )
+        )
+        assertTrue(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_500, 4_500, 900L, 899L, 100L, 100L, false
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_500, 4_502, 900L, 902L, 100L, 100L, false
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_500, 4_500, 900L, 901L, 100L, 100L, false
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_500, 4_500, 900L, 900L, 100L, 100L, false
+            )
+        )
+        assertTrue(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_500, 4_500, 900L, 900L, 100L, 100L, true
+            )
+        )
+        assertTrue(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_568, 4_571, 4_568, 900L, 900L, 100L, 850L, false
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldReplaceTimelineAdapterData(
+                4_568, 4_570, 4_570, 900L, 902L, 100L, 100L, false
+            )
+        )
+    }
 }
