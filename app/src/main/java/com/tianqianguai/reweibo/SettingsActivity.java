@@ -74,8 +74,8 @@ public class SettingsActivity extends Activity {
         );
         addInfoRow(
                 panel,
-                "首页缓存天数",
-                "请在微博轻享版的“我的”页点击 ReWeibo，在深色弹窗中保存 1-30 天；旧值会在首次打开时迁移"
+                "首页缓存管理",
+                "请在微博轻享版的“我的”页点击 ReWeibo：可保存 1-30 天缓存跨度，也可通过日历或直接输入日期（如 7号）清除指定日期范围的缓存"
         );
 
         setContentView(scrollView);

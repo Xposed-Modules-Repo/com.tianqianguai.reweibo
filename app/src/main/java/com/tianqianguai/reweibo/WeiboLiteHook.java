@@ -3,6 +3,8 @@ package com.tianqianguai.reweibo;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Application;
+import android.app.DatePickerDialog;
+import android.app.TimePickerDialog;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
@@ -11,6 +13,7 @@ import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Handler;
@@ -18,6 +21,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.system.Os;
 import android.text.InputType;
+import android.text.method.DigitsKeyListener;
 import android.util.AtomicFile;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
@@ -43,6 +47,8 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.text.ParsePosition;
@@ -132,9 +138,11 @@ public class WeiboLiteHook {
     private static final String TIMELINE_SHADOW_CACHE_FILE = "reweibo_weico_full_cache_shadow.txt";
     private static final String TIMELINE_SHADOW_CACHE_META_FILE = "reweibo_weico_full_cache_shadow.meta";
     private static final String TIMELINE_NATIVE_CACHE_BACKUP_SUFFIX = ".reweibo-native-backup";
+    private static final String TIMELINE_CLEAR_TIME_PATTERN = "yyyy-MM-dd HH:mm";
     private static final Map<Object, PreloadState> sPreloadStates = new WeakHashMap<>();
     private static final Map<Object, TopAnchorState> sTopAnchorStates = new WeakHashMap<>();
     private static final Map<Object, Boolean> sTimelineRecyclerViews = new WeakHashMap<>();
+    private static final Map<Object, TimelineRecyclerOwner> sHomeTimelineRecyclerOwners = new WeakHashMap<>();
     private static final Map<Object, Long> sTimelineUserMovedAt = new WeakHashMap<>();
     private static final Map<Object, Integer> sPersistedTimelineCacheCounts = new WeakHashMap<>();
     private static final Map<Object, Long> sPersistedTimelineCacheNewestIds = new WeakHashMap<>();
@@ -172,6 +180,7 @@ public class WeiboLiteHook {
     private static File sLogFile = null;
     private static Context sWeicoContext = null;
     private static volatile boolean sTimelineCacheDaysSettingConfirmed = false;
+    private static volatile boolean sTimelineCacheClearInFlight = false;
     private static TimelineNativePersistRequest sPendingTimelineNativePersist = null;
     private static TimelineShadowPersistRequest sPendingTimelineShadowPersist = null;
     private static boolean sTimelinePersistWorkerScheduled = false;
@@ -217,6 +226,9 @@ public class WeiboLiteHook {
     private static boolean sTimelineCursorActionDumped = false;
     private static String sPendingTimelineNoMoreSource = null;
     private static int sPendingTimelineNoMoreGeneration = 0;
+    private static int sTimelineAdapterSyncGeneration = 0;
+    private static WeakReference<Object> sLastActiveHomeTimelineRecyclerView = new WeakReference<>(null);
+    private static WeakReference<Object> sLastActiveHomeTimelinePresenter = new WeakReference<>(null);
 
     private static final class PreloadState {
         int requestedPages = 0;
@@ -272,6 +284,18 @@ public class WeiboLiteHook {
         boolean finishing = false;
     }
 
+    private static final class TimelineRecyclerOwner {
+        final WeakReference<Object> fragment;
+        final WeakReference<Object> presenter;
+        long lastSeenElapsedMs;
+
+        TimelineRecyclerOwner(Object fragment, Object presenter) {
+            this.fragment = new WeakReference<>(fragment);
+            this.presenter = new WeakReference<>(presenter);
+            this.lastSeenElapsedMs = SystemClock.elapsedRealtime();
+        }
+    }
+
     private static final class TimelineCacheStats {
         int count = 0;
         int datedCount = 0;
@@ -292,6 +316,22 @@ public class WeiboLiteHook {
         int dataPosition = -1;
         int searchedCount = 0;
         Object recyclerView = null;
+    }
+
+    private static final class TimelineJumpInput {
+        final long targetMs;
+        final long dayStartMs;
+        final long dayEndMs;
+
+        TimelineJumpInput(long targetMs, long dayStartMs, long dayEndMs) {
+            this.targetMs = targetMs;
+            this.dayStartMs = dayStartMs;
+            this.dayEndMs = dayEndMs;
+        }
+
+        boolean isDateOnly() {
+            return dayStartMs > 0L && dayEndMs >= dayStartMs;
+        }
     }
 
     private static final class TimelineRestoreState {
@@ -343,6 +383,7 @@ public class WeiboLiteHook {
         final long newestId;
         final String maxId;
         final String cacheSource;
+        final ArrayList adapterModels;
 
         TimelineRestoreResult(
             Object action,
@@ -353,7 +394,8 @@ public class WeiboLiteHook {
             TimelineGapScan gapScan,
             long newestId,
             String maxId,
-            String cacheSource
+            String cacheSource,
+            ArrayList adapterModels
         ) {
             this.action = action;
             this.builder = builder;
@@ -364,6 +406,7 @@ public class WeiboLiteHook {
             this.newestId = newestId;
             this.maxId = maxId;
             this.cacheSource = cacheSource;
+            this.adapterModels = adapterModels;
         }
     }
 
@@ -451,6 +494,54 @@ public class WeiboLiteHook {
             this.force = force;
             this.stats = stats;
         }
+    }
+
+    private static final class TimelineCacheRangeFilterResult {
+        final ArrayList retainedStatuses;
+        final int sourceCount;
+        final int removedCount;
+        final boolean removedLastRead;
+
+        TimelineCacheRangeFilterResult(
+            ArrayList retainedStatuses,
+            int sourceCount,
+            int removedCount,
+            boolean removedLastRead
+        ) {
+            this.retainedStatuses = retainedStatuses;
+            this.sourceCount = sourceCount;
+            this.removedCount = removedCount;
+            this.removedLastRead = removedLastRead;
+        }
+    }
+
+    private static final class TimelineCacheRangeClearResult {
+        final ArrayList retainedStatuses;
+        final ArrayList adapterModels;
+        final int sourceCount;
+        final int removedCount;
+        final boolean removedLastRead;
+        final String maxId;
+
+        TimelineCacheRangeClearResult(
+            ArrayList retainedStatuses,
+            ArrayList adapterModels,
+            int sourceCount,
+            int removedCount,
+            boolean removedLastRead,
+            String maxId
+        ) {
+            this.retainedStatuses = retainedStatuses;
+            this.adapterModels = adapterModels;
+            this.sourceCount = sourceCount;
+            this.removedCount = removedCount;
+            this.removedLastRead = removedLastRead;
+            this.maxId = maxId;
+        }
+    }
+
+    private interface TimelineDateTimeCallback {
+        void onSelected(long timeMs);
     }
 
     private static void log(String msg) {
@@ -828,6 +919,48 @@ public class WeiboLiteHook {
                 dpToPx(activity.getWindow().getDecorView(), 48)
             ));
 
+            View divider = new View(activity);
+            divider.setBackgroundColor(0xFF343946);
+            LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                Math.max(1, dpToPx(activity.getWindow().getDecorView(), 1))
+            );
+            dividerParams.setMargins(0, padding, 0, padding / 2);
+            panel.addView(divider, dividerParams);
+
+            TextView clearLabel = new TextView(activity);
+            clearLabel.setText("缓存微博清理");
+            clearLabel.setTextColor(Color.WHITE);
+            clearLabel.setTextSize(15f);
+            panel.addView(clearLabel);
+
+            TimelineCacheStats cacheStats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+            TextView clearDescription = new TextView(activity);
+            clearDescription.setText(
+                formatTimelineCacheRangeSummary(cacheStats)
+                    + "\n可按微博发布时间选择起止范围；清理后再次浏览仍可能重新缓存。"
+            );
+            clearDescription.setTextColor(Color.rgb(160, 169, 184));
+            clearDescription.setTextSize(12f);
+            clearDescription.setPadding(0, dpToPx(activity.getWindow().getDecorView(), 6), 0, 0);
+            panel.addView(clearDescription);
+
+            TextView clearButton = new TextView(activity);
+            clearButton.setText("选择时间范围并清除");
+            clearButton.setTextColor(0xFFFF6B73);
+            clearButton.setTextSize(14f);
+            clearButton.setGravity(Gravity.CENTER);
+            clearButton.setClickable(true);
+            clearButton.setFocusable(true);
+            clearButton.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+            LinearLayout.LayoutParams clearButtonParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 44)
+            );
+            clearButtonParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 12), 0, 0);
+            panel.addView(clearButton, clearButtonParams);
+            clearButton.setOnClickListener(v -> showTimelineCacheClearRangeDialog(activity));
+
             final AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle("ReWeibo 设置")
                 .setView(panel)
@@ -871,6 +1004,783 @@ public class WeiboLiteHook {
         } catch (Throwable t) {
             log("show ReWeibo settings dialog error: " + t.getMessage());
         }
+    }
+
+    private static String formatTimelineCacheRangeSummary(TimelineCacheStats stats) {
+        if (stats == null || stats.count <= 0) return "当前未检测到缓存微博";
+        if (stats.oldestMs <= 0L || stats.newestMs <= 0L) {
+            return "当前检测到 " + stats.count + " 条缓存微博，部分发布时间未知";
+        }
+        return "当前约 " + stats.count + " 条："
+            + formatTimelineClearTime(stats.oldestMs)
+            + " 至 "
+            + formatTimelineClearTime(stats.newestMs);
+    }
+
+    private static String formatTimelineClearTime(long timeMs) {
+        if (timeMs <= 0L) return "未知";
+        return new SimpleDateFormat(TIMELINE_CLEAR_TIME_PATTERN, Locale.getDefault())
+            .format(new Date(timeMs));
+    }
+
+    private static EditText newTimelineClearTimeInput(Activity activity, long timeMs) {
+        EditText input = new EditText(activity);
+        input.setSingleLine(true);
+        input.setSelectAllOnFocus(true);
+        input.setText(formatTimelineClearTime(timeMs));
+        input.setHint("yyyy-MM-dd HH:mm");
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.rgb(145, 155, 170));
+        input.setTextSize(14f);
+        input.setGravity(Gravity.CENTER_VERTICAL);
+        input.setPadding(dpToPx(activity.getWindow().getDecorView(), 12), 0, 0, 0);
+        input.setInputType(InputType.TYPE_CLASS_DATETIME | InputType.TYPE_DATETIME_VARIATION_NORMAL);
+        input.setKeyListener(DigitsKeyListener.getInstance("0123456789-/: .年月日号"));
+        input.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+        return input;
+    }
+
+    private static EditText newTimelineClearSingleDayInput(Activity activity) {
+        EditText input = newTimelineClearTimeInput(activity, 0L);
+        input.setText("");
+        input.setHint("如 7号、7-7、2026-07-07");
+        input.setContentDescription("缓存清理单日快捷输入");
+        return input;
+    }
+
+    private static TextView newTimelineClearCalendarButton(Activity activity, String contentDescription) {
+        TextView button = new TextView(activity);
+        button.setText("日历");
+        button.setContentDescription(contentDescription);
+        button.setTextColor(0xFFFF6B73);
+        button.setTextSize(14f);
+        button.setGravity(Gravity.CENTER);
+        button.setClickable(true);
+        button.setFocusable(true);
+        button.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+        return button;
+    }
+
+    private static void showTimelineCacheClearRangeDialog(final Activity activity) {
+        try {
+            TimelineCacheStats stats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+            long nowMs = System.currentTimeMillis();
+            long initialStart = stats != null && stats.oldestMs > 0L
+                ? stats.oldestMs
+                : nowMs - TIMELINE_CACHE_DAY_MS;
+            long initialEnd = stats != null && stats.newestMs > 0L
+                ? stats.newestMs
+                : nowMs;
+            final long[] selectedRange = new long[] {
+                normalizeTimelineClearMinute(initialStart, false),
+                normalizeTimelineClearMinute(initialEnd, true)
+            };
+
+            LinearLayout panel = new LinearLayout(activity);
+            panel.setOrientation(LinearLayout.VERTICAL);
+            int padding = dpToPx(activity.getWindow().getDecorView(), 20);
+            panel.setPadding(padding, padding / 2, padding, padding / 2);
+
+            TextView hint = new TextView(activity);
+            hint.setText(
+                "可直接输入日期或时间，也可使用右侧日历。日期支持 7号、7-7、"
+                    + "2026-07-07 等写法；清理范围包含起止边界。"
+            );
+            hint.setTextColor(Color.rgb(160, 169, 184));
+            hint.setTextSize(13f);
+            hint.setPadding(0, 0, 0, dpToPx(activity.getWindow().getDecorView(), 12));
+            panel.addView(hint);
+
+            TextView singleDayLabel = new TextView(activity);
+            singleDayLabel.setText("只清除某一天（可选，填写后优先）");
+            singleDayLabel.setTextColor(Color.WHITE);
+            singleDayLabel.setTextSize(14f);
+            panel.addView(singleDayLabel);
+
+            final EditText singleDayInput = newTimelineClearSingleDayInput(activity);
+            LinearLayout.LayoutParams singleDayParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            singleDayParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 6), 0,
+                dpToPx(activity.getWindow().getDecorView(), 14));
+            panel.addView(singleDayInput, singleDayParams);
+
+            TextView startLabel = new TextView(activity);
+            startLabel.setText("开始时间");
+            startLabel.setTextColor(Color.WHITE);
+            startLabel.setTextSize(14f);
+            panel.addView(startLabel);
+
+            final EditText startInput = newTimelineClearTimeInput(activity, selectedRange[0]);
+            startInput.setContentDescription("缓存清理开始时间");
+            final TextView startCalendar = newTimelineClearCalendarButton(
+                activity,
+                "为开始时间打开日历"
+            );
+            LinearLayout startRow = new LinearLayout(activity);
+            startRow.setOrientation(LinearLayout.HORIZONTAL);
+            startRow.setGravity(Gravity.CENTER_VERTICAL);
+            startRow.addView(startInput, new LinearLayout.LayoutParams(
+                0,
+                dpToPx(activity.getWindow().getDecorView(), 46),
+                1f
+            ));
+            LinearLayout.LayoutParams startCalendarParams = new LinearLayout.LayoutParams(
+                dpToPx(activity.getWindow().getDecorView(), 68),
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            startCalendarParams.setMargins(dpToPx(activity.getWindow().getDecorView(), 8), 0, 0, 0);
+            startRow.addView(startCalendar, startCalendarParams);
+            LinearLayout.LayoutParams timeParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            timeParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 6), 0,
+                dpToPx(activity.getWindow().getDecorView(), 14));
+            panel.addView(startRow, timeParams);
+
+            TextView endLabel = new TextView(activity);
+            endLabel.setText("结束时间");
+            endLabel.setTextColor(Color.WHITE);
+            endLabel.setTextSize(14f);
+            panel.addView(endLabel);
+
+            final EditText endInput = newTimelineClearTimeInput(activity, selectedRange[1]);
+            endInput.setContentDescription("缓存清理结束时间");
+            final TextView endCalendar = newTimelineClearCalendarButton(
+                activity,
+                "为结束时间打开日历"
+            );
+            LinearLayout endRow = new LinearLayout(activity);
+            endRow.setOrientation(LinearLayout.HORIZONTAL);
+            endRow.setGravity(Gravity.CENTER_VERTICAL);
+            endRow.addView(endInput, new LinearLayout.LayoutParams(
+                0,
+                dpToPx(activity.getWindow().getDecorView(), 46),
+                1f
+            ));
+            LinearLayout.LayoutParams endCalendarParams = new LinearLayout.LayoutParams(
+                dpToPx(activity.getWindow().getDecorView(), 68),
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            endCalendarParams.setMargins(dpToPx(activity.getWindow().getDecorView(), 8), 0, 0, 0);
+            endRow.addView(endCalendar, endCalendarParams);
+            LinearLayout.LayoutParams endParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 46)
+            );
+            endParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 6), 0, 0);
+            panel.addView(endRow, endParams);
+
+            startInput.setOnFocusChangeListener((view, hasFocus) -> {
+                if (hasFocus) singleDayInput.setText("");
+            });
+            endInput.setOnFocusChangeListener((view, hasFocus) -> {
+                if (hasFocus) singleDayInput.setText("");
+            });
+
+            startCalendar.setOnClickListener(v -> {
+                singleDayInput.setText("");
+                long typed = parseTimelineClearTimeInput(
+                    startInput.getText() == null ? null : startInput.getText().toString(),
+                    false
+                );
+                showTimelineClearDateTimePicker(
+                    activity,
+                    typed > 0L ? typed : selectedRange[0],
+                    false,
+                    timeMs -> {
+                        selectedRange[0] = timeMs;
+                        startInput.setError(null);
+                        startInput.setText(formatTimelineClearTime(timeMs));
+                    }
+                );
+            });
+            endCalendar.setOnClickListener(v -> {
+                singleDayInput.setText("");
+                long typed = parseTimelineClearTimeInput(
+                    endInput.getText() == null ? null : endInput.getText().toString(),
+                    true
+                );
+                showTimelineClearDateTimePicker(
+                    activity,
+                    typed > 0L ? typed : selectedRange[1],
+                    true,
+                    timeMs -> {
+                        selectedRange[1] = timeMs;
+                        endInput.setError(null);
+                        endInput.setText(formatTimelineClearTime(timeMs));
+                    }
+                );
+            });
+
+            final AlertDialog dialog = new AlertDialog.Builder(activity)
+                .setTitle("清除缓存微博")
+                .setView(panel)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("下一步", null)
+                .create();
+            dialog.setOnShowListener(ignored -> {
+                styleDarkDialog(dialog, activity.getWindow().getDecorView());
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                    String singleDayRaw = singleDayInput.getText() == null
+                        ? ""
+                        : singleDayInput.getText().toString().trim();
+                    if (!singleDayRaw.isEmpty()) {
+                        long dayStart = parseTimelineClearDateOnlyInput(singleDayRaw, false);
+                        long dayEnd = parseTimelineClearDateOnlyInput(singleDayRaw, true);
+                        if (dayStart <= 0L || dayEnd <= 0L) {
+                            singleDayInput.setError("请输入有效日期，如 7号、7-7 或 2026-07-07");
+                            singleDayInput.requestFocus();
+                            return;
+                        }
+                        selectedRange[0] = dayStart;
+                        selectedRange[1] = dayEnd;
+                        startInput.setText(formatTimelineClearTime(dayStart));
+                        endInput.setText(formatTimelineClearTime(dayEnd));
+                        singleDayInput.clearFocus();
+                        startInput.clearFocus();
+                        endInput.clearFocus();
+                        showTimelineCacheClearConfirmation(
+                            activity,
+                            dialog,
+                            dayStart,
+                            dayEnd
+                        );
+                        return;
+                    }
+                    long parsedStart = parseTimelineClearTimeInput(
+                        startInput.getText() == null ? null : startInput.getText().toString(),
+                        false
+                    );
+                    if (parsedStart <= 0L) {
+                        startInput.setError("请输入有效日期或时间，如 7号、7-7、2026-07-07 00:00");
+                        startInput.requestFocus();
+                        return;
+                    }
+                    long parsedEnd = parseTimelineClearTimeInput(
+                        endInput.getText() == null ? null : endInput.getText().toString(),
+                        true
+                    );
+                    if (parsedEnd <= 0L) {
+                        endInput.setError("请输入有效日期或时间，如 7号、7-7、2026-07-07 23:59");
+                        endInput.requestFocus();
+                        return;
+                    }
+                    if (parsedStart > parsedEnd) {
+                        startInput.setError("开始时间不能晚于结束时间");
+                        startInput.requestFocus();
+                        return;
+                    }
+                    selectedRange[0] = parsedStart;
+                    selectedRange[1] = parsedEnd;
+                    startInput.setText(formatTimelineClearTime(parsedStart));
+                    endInput.setText(formatTimelineClearTime(parsedEnd));
+                    startInput.clearFocus();
+                    endInput.clearFocus();
+                    showTimelineCacheClearConfirmation(
+                        activity,
+                        dialog,
+                        selectedRange[0],
+                        selectedRange[1]
+                    );
+                });
+            });
+            dialog.show();
+        } catch (Throwable t) {
+            log("show timeline cache clear range error: " + t.getMessage());
+            Toast.makeText(activity, "无法打开缓存清理，请重试", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private static void showTimelineClearDateTimePicker(
+        final Activity activity,
+        long initialTimeMs,
+        final boolean endOfMinute,
+        final TimelineDateTimeCallback callback
+    ) {
+        final Calendar selected = Calendar.getInstance();
+        selected.setTimeInMillis(initialTimeMs > 0L ? initialTimeMs : System.currentTimeMillis());
+        DatePickerDialog dateDialog = new DatePickerDialog(
+            activity,
+            (datePicker, year, month, dayOfMonth) -> {
+                selected.set(Calendar.YEAR, year);
+                selected.set(Calendar.MONTH, month);
+                selected.set(Calendar.DAY_OF_MONTH, dayOfMonth);
+                TimePickerDialog timeDialog = new TimePickerDialog(
+                    activity,
+                    (timePicker, hourOfDay, minute) -> {
+                        selected.set(Calendar.HOUR_OF_DAY, hourOfDay);
+                        selected.set(Calendar.MINUTE, minute);
+                        selected.set(Calendar.SECOND, endOfMinute ? 59 : 0);
+                        selected.set(Calendar.MILLISECOND, endOfMinute ? 999 : 0);
+                        callback.onSelected(selected.getTimeInMillis());
+                    },
+                    selected.get(Calendar.HOUR_OF_DAY),
+                    selected.get(Calendar.MINUTE),
+                    true
+                );
+                timeDialog.show();
+            },
+            selected.get(Calendar.YEAR),
+            selected.get(Calendar.MONTH),
+            selected.get(Calendar.DAY_OF_MONTH)
+        );
+        dateDialog.show();
+    }
+
+    private static long normalizeTimelineClearMinute(long timeMs, boolean endOfMinute) {
+        Calendar value = Calendar.getInstance();
+        value.setTimeInMillis(timeMs > 0L ? timeMs : System.currentTimeMillis());
+        value.set(Calendar.SECOND, endOfMinute ? 59 : 0);
+        value.set(Calendar.MILLISECOND, endOfMinute ? 999 : 0);
+        return value.getTimeInMillis();
+    }
+
+    static long parseTimelineClearTimeInput(String raw, boolean endOfMinute) {
+        if (raw == null) return -1L;
+        String text = raw.trim();
+        if (text.isEmpty()) return -1L;
+        String normalized = normalizeTimelineClearInput(text);
+        String[] patterns = new String[] {
+            "yyyy-M-d H:m",
+            "yyyy/M/d H:m",
+            "yyyy.M.d H:m",
+            "yyyyMMddHHmm"
+        };
+        for (int i = 0; i < patterns.length; i++) {
+            SimpleDateFormat parser = new SimpleDateFormat(patterns[i], Locale.getDefault());
+            parser.setLenient(false);
+            ParsePosition position = new ParsePosition(0);
+            Date parsed = parser.parse(normalized, position);
+            if (parsed == null || position.getIndex() != normalized.length()) continue;
+            return normalizeTimelineClearMinute(parsed.getTime(), endOfMinute);
+        }
+        return parseTimelineClearDateOnlyInput(text, endOfMinute);
+    }
+
+    static long parseTimelineClearDateOnlyInput(String raw, boolean endOfDay) {
+        if (raw == null) return -1L;
+        String text = normalizeTimelineClearInput(raw.trim());
+        if (text.isEmpty() || text.indexOf(':') >= 0) return -1L;
+
+        int year;
+        int month;
+        int day;
+        Calendar reference = Calendar.getInstance();
+        String[] parts;
+        if (text.matches("\\d{8}")) {
+            year = parsePositiveInt(text.substring(0, 4));
+            month = parsePositiveInt(text.substring(4, 6));
+            day = parsePositiveInt(text.substring(6, 8));
+        } else if (text.matches("\\d{4}[-/.]\\d{1,2}[-/.]\\d{1,2}")) {
+            parts = text.split("[-/.]");
+            year = parsePositiveInt(parts[0]);
+            month = parsePositiveInt(parts[1]);
+            day = parsePositiveInt(parts[2]);
+        } else if (text.matches("\\d{1,2}[-/.]\\d{1,2}")) {
+            parts = text.split("[-/.]");
+            year = reference.get(Calendar.YEAR);
+            month = parsePositiveInt(parts[0]);
+            day = parsePositiveInt(parts[1]);
+        } else if (text.matches("\\d{1,2}")) {
+            year = reference.get(Calendar.YEAR);
+            month = reference.get(Calendar.MONTH) + 1;
+            day = parsePositiveInt(text);
+        } else {
+            return -1L;
+        }
+
+        if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31) return -1L;
+        Calendar value = Calendar.getInstance();
+        value.clear();
+        value.setLenient(false);
+        value.set(
+            year,
+            month - 1,
+            day,
+            endOfDay ? 23 : 0,
+            endOfDay ? 59 : 0,
+            endOfDay ? 59 : 0
+        );
+        value.set(Calendar.MILLISECOND, endOfDay ? 999 : 0);
+        try {
+            return value.getTimeInMillis();
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    private static String normalizeTimelineClearInput(String raw) {
+        if (raw == null) return "";
+        return raw.trim()
+            .replace('年', '-')
+            .replace('月', '-')
+            .replace("日", "")
+            .replace("号", "")
+            .replaceAll("\\s+", " ")
+            .trim();
+    }
+
+    private static int parsePositiveInt(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    private static void showTimelineCacheClearConfirmation(
+        final Activity activity,
+        final AlertDialog rangeDialog,
+        final long startMs,
+        final long endMs
+    ) {
+        AlertDialog confirmation = new AlertDialog.Builder(activity)
+            .setTitle("确认清除？")
+            .setMessage(
+                "将清除 " + formatTimelineClearTime(startMs)
+                    + " 至 " + formatTimelineClearTime(endMs)
+                    + " 发布的缓存微博。此操作无法撤销。"
+            )
+            .setNegativeButton("返回", null)
+            .setPositiveButton("确认清除", (dialog, which) -> {
+                rangeDialog.dismiss();
+                startTimelineCacheRangeClear(activity, startMs, endMs);
+            })
+            .create();
+        confirmation.setOnShowListener(ignored ->
+            styleDarkDialog(confirmation, activity.getWindow().getDecorView())
+        );
+        confirmation.show();
+    }
+
+    private static void startTimelineCacheRangeClear(
+        final Activity activity,
+        final long startMs,
+        final long endMs
+    ) {
+        if (startMs <= 0L || endMs < startMs) {
+            Toast.makeText(activity, "清理时间范围无效", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final Object presenter = sLastTimelinePresenter;
+        if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))
+            || getTimelineAction(presenter) == null) {
+            Toast.makeText(activity, "请先打开首页时间线，待微博显示后再清理", Toast.LENGTH_LONG).show();
+            return;
+        }
+        synchronized (WeiboLiteHook.class) {
+            if (sTimelineCacheClearInFlight) {
+                Toast.makeText(activity, "缓存正在清理，请稍候", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            sTimelineCacheClearInFlight = true;
+        }
+
+        final ArrayList liveStatuses = snapshotTimelineStatuses(presenter, null);
+        final ArrayList cumulativeStatuses;
+        synchronized (sTimelineCumulativeStatusesById) {
+            cumulativeStatuses = new ArrayList(sTimelineCumulativeStatusesById.values());
+        }
+        prepareTimelineStateForCacheClear(presenter);
+
+        ProgressBar progressBar = new ProgressBar(activity);
+        int progressPadding = dpToPx(activity.getWindow().getDecorView(), 24);
+        progressBar.setPadding(progressPadding, progressPadding, progressPadding, progressPadding);
+        final AlertDialog progressDialog = new AlertDialog.Builder(activity)
+            .setTitle("正在清除缓存")
+            .setMessage("正在安全改写缓存文件，请勿关闭微博轻享版。")
+            .setView(progressBar)
+            .setCancelable(false)
+            .create();
+        progressDialog.setOnShowListener(ignored ->
+            styleDarkDialog(progressDialog, activity.getWindow().getDecorView())
+        );
+        progressDialog.show();
+
+        sTimelinePersistExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                TimelineCacheRangeClearResult result = null;
+                Throwable error = null;
+                try {
+                    result = clearTimelineCacheRangeNow(
+                        presenter,
+                        liveStatuses,
+                        cumulativeStatuses,
+                        startMs,
+                        endMs
+                    );
+                } catch (Throwable t) {
+                    error = t;
+                }
+
+                final TimelineCacheRangeClearResult completed = result;
+                final Throwable failure = error;
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            if (progressDialog.isShowing()) progressDialog.dismiss();
+                            if (failure != null || completed == null) {
+                                resetPreloadState(presenter, "manual-cache-clear-failed");
+                                String detail = failure == null
+                                    ? "unknown error"
+                                    : failure.getClass().getSimpleName() + ": " + failure.getMessage();
+                                log("Timeline cache range clear failed: " + detail);
+                                Toast.makeText(activity, "缓存清理失败，请重试", Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            applyTimelineCacheRangeClear(presenter, completed);
+                            if (completed.removedCount <= 0) {
+                                resetPreloadState(presenter, "manual-cache-clear-empty");
+                                Toast.makeText(
+                                    activity,
+                                    "所选时间范围内没有缓存微博",
+                                    Toast.LENGTH_SHORT
+                                ).show();
+                            } else {
+                                Toast.makeText(
+                                    activity,
+                                    "已清除 " + completed.removedCount
+                                        + " 条，保留 " + completed.retainedStatuses.size() + " 条",
+                                    Toast.LENGTH_LONG
+                                ).show();
+                            }
+                        } finally {
+                            sTimelineCacheClearInFlight = false;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private static void prepareTimelineStateForCacheClear(Object presenter) {
+        nextTimelineAdapterSyncGeneration();
+        synchronized (sTimelineRestoreLock) {
+            TimelineRestoreState state = sTimelineRestoreStates.get(presenter);
+            if (state == null) {
+                state = new TimelineRestoreState();
+                sTimelineRestoreStates.put(presenter, state);
+            }
+            state.generation++;
+            state.inFlight = false;
+            state.diskRestoreResolved = true;
+            state.pendingLiveStatuses = null;
+            state.pendingSource = null;
+        }
+        synchronized (sTimelinePersistQueueLock) {
+            sPendingTimelineNativePersist = null;
+            sPendingTimelineShadowPersist = null;
+        }
+        synchronized (sPreloadStates) {
+            PreloadState state = getPreloadStateLocked(presenter);
+            state.stopped = true;
+            state.scheduled = false;
+            state.inFlight = false;
+            state.retryScheduled = false;
+            state.requestToken++;
+            state.retryToken++;
+        }
+        synchronized (WeiboLiteHook.class) {
+            sPendingTimelineNoMoreSource = null;
+            sPendingTimelineNoMoreGeneration++;
+        }
+        stopTimelineGapFill("manual-cache-clear");
+        log("Timeline cache range clear prepared live=" + snapshotTimelineStatuses(presenter, null).size());
+    }
+
+    private static TimelineCacheRangeClearResult clearTimelineCacheRangeNow(
+        Object presenter,
+        List liveStatuses,
+        List cumulativeStatuses,
+        long startMs,
+        long endMs
+    ) throws Exception {
+        Object action = getTimelineAction(presenter);
+        if (action == null) throw new IllegalStateException("timeline action is missing");
+        Object builder = getTimelineCacheBuilder(action);
+        TimelineCacheLoad load = loadTimelineCacheSingleSource(action, builder, "manual-range-clear");
+        List diskStatuses = load == null ? null : load.statuses;
+        ArrayList merged = mergeTimelineStatusLists(diskStatuses, cumulativeStatuses, liveStatuses);
+        TimelineCacheRangeFilterResult filtered = filterTimelineCacheRange(
+            merged,
+            startMs,
+            endMs
+        );
+        ArrayList retained = new ArrayList(
+            sortTimelineNewestFirst(
+                filtered.retainedStatuses,
+                presenter,
+                "manual-range-clear",
+                false
+            )
+        );
+        String maxId = retained.isEmpty() ? "0" : getTimelineCacheMaxId(action, retained);
+        ArrayList adapterModels = buildTimelineStatusModels(
+            retained,
+            presenter,
+            "manual-range-clear"
+        );
+        if (filtered.removedCount <= 0) {
+            return new TimelineCacheRangeClearResult(
+                retained,
+                adapterModels,
+                filtered.sourceCount,
+                0,
+                false,
+                maxId
+            );
+        }
+
+        Object result = newTimelineStatusResult(action, retained, maxId);
+        File nativeFile = getTimelineNativeCacheFile(builder);
+        if (nativeFile == null) throw new IllegalStateException("timeline native cache file is missing");
+        writeTimelineNativeCacheStreaming(result, getTimelineCacheGson(builder), nativeFile);
+
+        File shadowFile = getTimelineShadowCacheFile();
+        File parent = shadowFile.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IllegalStateException("cannot create timeline shadow cache directory");
+        }
+        copyFile(nativeFile, shadowFile);
+        TimelineCacheStats stats = buildTimelineCacheStats(retained);
+        writeTimelineShadowCacheMeta(
+            nativeFile.getName(),
+            "manual-range-clear",
+            retained.size(),
+            maxId,
+            shadowFile.length(),
+            stats
+        );
+        sTimelineShadowCacheCount = retained.size();
+        log("Timeline cache range cleared start=" + startMs
+            + " end=" + endMs
+            + " source=" + (load == null ? "memory" : load.source)
+            + " before=" + filtered.sourceCount
+            + " removed=" + filtered.removedCount
+            + " retained=" + retained.size());
+        return new TimelineCacheRangeClearResult(
+            retained,
+            adapterModels,
+            filtered.sourceCount,
+            filtered.removedCount,
+            filtered.removedLastRead,
+            maxId
+        );
+    }
+
+    private static TimelineCacheRangeFilterResult filterTimelineCacheRange(
+        List source,
+        long startMs,
+        long endMs
+    ) {
+        ArrayList statuses = collectTimelineStatuses(source);
+        ArrayList retained = new ArrayList(statuses.size());
+        int removed = 0;
+        boolean removedLastRead = false;
+        long lastReadId = sLastReadStatusId == null ? 0L : sLastReadStatusId.longValue();
+        for (int i = 0; i < statuses.size(); i++) {
+            Object status = unwrapStatus(statuses.get(i));
+            long createdMs = getStatusCreatedAtMillis(status);
+            if (shouldClearTimelineStatusCreatedAt(createdMs, startMs, endMs)) {
+                removed++;
+                if (lastReadId > 0L && getStatusId(status) == lastReadId) {
+                    removedLastRead = true;
+                }
+            } else {
+                retained.add(status);
+            }
+        }
+        return new TimelineCacheRangeFilterResult(
+            retained,
+            statuses.size(),
+            removed,
+            removedLastRead
+        );
+    }
+
+    static boolean shouldClearTimelineStatusCreatedAt(long createdMs, long startMs, long endMs) {
+        return createdMs > 0L && startMs > 0L && endMs >= startMs
+            && createdMs >= startMs && createdMs <= endMs;
+    }
+
+    private static void applyTimelineCacheRangeClear(
+        Object presenter,
+        TimelineCacheRangeClearResult result
+    ) {
+        try {
+            boolean changed = result.removedCount > 0;
+            replaceTimelineCumulativeStatuses(
+                result.retainedStatuses,
+                presenter,
+                "manual-range-clear"
+            );
+            setTimelineCacheRestoring(presenter, true);
+            try {
+                setPresenterTimelineDataPrepared(
+                    presenter,
+                    result.retainedStatuses,
+                    result.retainedStatuses.size(),
+                    "manual-range-clear"
+                );
+            } finally {
+                setTimelineCacheRestoring(presenter, false);
+            }
+            Object action = getTimelineAction(presenter);
+            syncTimelineActionAfterCacheClear(action, result.maxId);
+            synchronized (sPersistedTimelineCacheCounts) {
+                sPersistedTimelineCacheCounts.put(
+                    presenter,
+                    Integer.valueOf(result.retainedStatuses.size())
+                );
+                sPersistedTimelineCacheNewestIds.put(
+                    presenter,
+                    Long.valueOf(getNewestTimelineStatusId(result.retainedStatuses))
+                );
+            }
+            if (changed) {
+                forgetTimelinePreloadDone("manual-range-clear");
+                if (result.removedLastRead) forgetTimelineLastRead("manual-range-clear");
+                sTimelineOldestFirstMode = false;
+                sTimelineRestoredCacheMode = false;
+            }
+            int adapterSyncGeneration = nextTimelineAdapterSyncGeneration();
+            applyPreparedHomeTimelineAdapters(
+                presenter,
+                result.adapterModels,
+                !changed && sTimelineRestoredCacheMode && isTimelinePreloadDone(),
+                changed ? "manual-range-clear" : "manual-range-clear-reconcile",
+                true,
+                adapterSyncGeneration
+            );
+            log("Timeline cache range clear applied before=" + result.sourceCount
+                + " removed=" + result.removedCount
+                + " retained=" + result.retainedStatuses.size());
+        } catch (Throwable t) {
+            setTimelineCacheRestoring(presenter, false);
+            log("Timeline cache range clear apply error: " + t.getMessage());
+        }
+    }
+
+    private static void syncTimelineActionAfterCacheClear(Object action, String maxId) {
+        if (action == null || !hasMeaningfulString(maxId)) return;
+        if (!"0".equals(maxId)) {
+            syncTimelineActionMaxId(action, maxId, "manual-range-clear");
+            return;
+        }
+        try { XposedHelpers.callMethod(action, "setMaxId", "0"); } catch (Throwable ignored) {}
+        try { XposedHelpers.callMethod(action, "setMaxId", Long.valueOf(0L)); } catch (Throwable ignored) {}
+        String[] fields = new String[] {
+            "lastMaxId", "maxId", "mMaxId", "max_id", "maxid", "maxID", "maxIdStr", "max_id_str"
+        };
+        for (int i = 0; i < fields.length; i++) {
+            setTimelineCursorField(action, fields[i], "0");
+        }
+        log("Timeline cursor reset source=manual-range-clear");
     }
 
     private static GradientDrawable makeDarkDialogInputBackground(View anchor) {
@@ -1446,7 +2356,9 @@ public class WeiboLiteHook {
                             @Override
                             public void run() {
                                 if (fixTimelineLayoutDirection(recyclerView, layoutManager)) {
-                                    beginTimelineTopAnchor(recyclerView, "setLayoutManager", true);
+                                    if (isCurrentHomeTimelineRecyclerView(recyclerView)) {
+                                        beginTimelineTopAnchor(recyclerView, "setLayoutManager", true);
+                                    }
                                 }
                             }
                         }, 300L);
@@ -1472,7 +2384,9 @@ public class WeiboLiteHook {
                                 try {
                                     Object layoutManager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
                                     if (fixTimelineLayoutDirection(recyclerView, layoutManager)) {
-                                        beginTimelineTopAnchor(recyclerView, "setAdapter", true);
+                                        if (isCurrentHomeTimelineRecyclerView(recyclerView)) {
+                                            beginTimelineTopAnchor(recyclerView, "setAdapter", true);
+                                        }
                                     }
                                 } catch (Throwable t) {
                                     log("Timeline layout adapter fix error: " + t.getMessage());
@@ -1549,6 +2463,7 @@ public class WeiboLiteHook {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         Object event = param.args[0];
                         if (!(event instanceof MotionEvent)) return;
+                        if (!isCurrentHomeTimelineRecyclerView(param.thisObject)) return;
                         int action = ((MotionEvent) event).getActionMasked();
                         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
                             markTimelineTopAnchorTouched(param.thisObject);
@@ -1570,7 +2485,7 @@ public class WeiboLiteHook {
                     protected void afterHookedMethod(MethodHookParam param) {
                         Object recyclerView = param.thisObject;
                         int state = ((Integer) param.args[0]).intValue();
-                        if (state == 0 && isTimelineRecyclerView(recyclerView)) {
+                        if (state == 0 && isCurrentHomeTimelineRecyclerView(recyclerView)) {
                             schedulePersistTimelineLastRead(recyclerView, "scroll-idle", 300L);
                         }
                     }
@@ -1593,7 +2508,6 @@ public class WeiboLiteHook {
             XposedHelpers.callMethod(layoutManager, "setReverseLayout", true);
             XposedHelpers.callMethod(layoutManager, "setStackFromEnd", false);
             rememberTimelineRecyclerView(recyclerView);
-            ensureTimelineTimeJumpButton(recyclerView, "layout-fix");
             log("Timeline layout fixed reverse adapter=" + adapterName);
             return true;
         } catch (Throwable t) {
@@ -1754,14 +2668,46 @@ public class WeiboLiteHook {
 
             Class<?> fragmentClass = Class.forName("com.weico.international.ui.indexv2.IndexV2Fragment", false, cl);
             Class<?> commonLoadEventClass = Class.forName("com.weico.international.flux.Events$CommonLoadEvent", false, cl);
+            XposedHelpers.findAndHookMethod(fragmentClass, "initData", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    rememberHomeTimelineFragment(param.thisObject, "fragment-initData");
+                }
+            });
             XposedHelpers.findAndHookMethod(fragmentClass, "showData", commonLoadEventClass,
                 new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
+                        rememberHomeTimelineFragment(param.thisObject, "showData-before");
                         normalizeShowDataEvent(param.thisObject, param.args[0]);
+                    }
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        rememberHomeTimelineFragment(param.thisObject, "showData-after");
+                        scheduleHomeTimelineAdapterSelfHeal(param.thisObject, "showData-after");
                     }
                 }
             );
+            XposedHelpers.findAndHookMethod(fragmentClass, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    rememberHomeTimelineFragment(param.thisObject, "fragment-resume");
+                    scheduleHomeTimelineAdapterSelfHeal(param.thisObject, "fragment-resume");
+                }
+            });
+            XposedHelpers.findAndHookMethod(fragmentClass, "onPause", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    markHomeTimelineFragmentPaused(param.thisObject);
+                }
+            });
+            XposedHelpers.findAndHookMethod(fragmentClass, "onDetach", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    forgetHomeTimelineFragment(param.thisObject);
+                }
+            });
 
             log("Timeline merge-order hooks installed");
         } catch (Throwable t) {
@@ -2450,9 +3396,17 @@ public class WeiboLiteHook {
             if (shouldLogTimelineNetworkProbe(presenter)) {
                 logTimelineShowDataEvent(presenter, type, data, "showData");
             }
-            if (shouldSkipShowDataNormalizeForGapFill()) return;
             if (data instanceof List) {
                 String source = "showData-" + type;
+                List display = filterTimelineDisplayArtifacts((List) data, presenter, source);
+                if (display != data) {
+                    setFieldValue(loadEvent, "data", display);
+                    data = display;
+                }
+                // Gap fill temporarily owns ordering, but duplicate and synthetic rows must
+                // never reach TimelineAdapter: reverse-layout navigation treats its raw tail
+                // as the oldest edge.
+                if (shouldSkipShowDataNormalizeForGapFill()) return;
                 hydrateTimelineStatusText((List) data, source);
                 List filtered = filterTimelineAds((List) data, presenter, source);
                 filtered = filterTimelineContentless(filtered, presenter, source);
@@ -2475,6 +3429,10 @@ public class WeiboLiteHook {
 
     private static void persistTimelineNativeCache(Object presenter, String source) {
         try {
+            if (sTimelineCacheClearInFlight) {
+                log("Timeline full cache persist skipped during manual clear source=" + source);
+                return;
+            }
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             if (isTimelineCacheRestoreInFlight(presenter)) {
                 log("Timeline full cache persist deferred source=" + source + " restore-in-flight");
@@ -2503,6 +3461,10 @@ public class WeiboLiteHook {
 
     private static boolean persistTimelineNativeCacheList(Object presenter, List list, String source, boolean force) {
         try {
+            if (sTimelineCacheClearInFlight) {
+                log("Timeline full cache list persist skipped during manual clear source=" + source);
+                return false;
+            }
             if (presenter == null || list == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
             if (!force && isTimelineCacheRestoreInFlight(presenter)) {
                 log("Timeline full cache persist deferred source=" + source + " restore-in-flight");
@@ -2582,6 +3544,10 @@ public class WeiboLiteHook {
         boolean force,
         TimelineCacheStats candidateStats
     ) {
+        if (sTimelineCacheClearInFlight) {
+            log("Timeline shadow cache persist skipped during manual clear source=" + source);
+            return;
+        }
         enqueueTimelineShadowCachePersist(new TimelineShadowPersistRequest(
             source,
             count,
@@ -2680,6 +3646,10 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineNativeCachePersist(TimelineNativePersistRequest request) {
+        if (sTimelineCacheClearInFlight) {
+            log("Timeline native cache enqueue skipped during manual clear source=" + request.source);
+            return;
+        }
         synchronized (sTimelinePersistQueueLock) {
             if (sPendingTimelineNativePersist != null) {
                 log("Timeline native cache write coalesced old=" + sPendingTimelineNativePersist.source
@@ -2694,6 +3664,10 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineShadowCachePersist(TimelineShadowPersistRequest request) {
+        if (sTimelineCacheClearInFlight) {
+            log("Timeline shadow cache enqueue skipped during manual clear source=" + request.source);
+            return;
+        }
         synchronized (sTimelinePersistQueueLock) {
             sPendingTimelineShadowPersist = request;
             scheduleTimelinePersistWorkerLocked();
@@ -3193,6 +4167,10 @@ public class WeiboLiteHook {
         boolean preferCumulative
     ) {
         try {
+            if (sTimelineCacheClearInFlight) {
+                log("Timeline cache restore skipped during manual clear source=" + source);
+                return false;
+            }
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
 
             ArrayList liveStatuses = snapshotTimelineStatuses(presenter, incomingData);
@@ -3495,6 +4473,11 @@ public class WeiboLiteHook {
         hydrateTimelineStatusText(statuses, "reweibo-cache-background");
         long newestId = records.isEmpty() ? 0L : records.get(0).id;
         String maxId = records.isEmpty() ? "0" : String.valueOf(records.get(records.size() - 1).id);
+        ArrayList adapterModels = buildTimelineStatusModels(
+            statuses,
+            request.presenter,
+            "reweibo-cache-background"
+        );
         return new TimelineRestoreResult(
             action,
             builder,
@@ -3504,7 +4487,8 @@ public class WeiboLiteHook {
             gapScan,
             newestId,
             maxId,
-            load.source
+            load.source,
+            adapterModels
         );
     }
 
@@ -3534,6 +4518,7 @@ public class WeiboLiteHook {
         TimelineRestoreResult result,
         Throwable failure
     ) {
+        if (sTimelineCacheClearInFlight) return;
         ArrayList lateLiveStatuses = null;
         String lateSource = null;
         synchronized (sTimelineRestoreLock) {
@@ -3612,6 +4597,15 @@ public class WeiboLiteHook {
             }
             sTimelineOldestFirstMode = false;
             sTimelineRestoredCacheMode = completeRestore;
+            int adapterSyncGeneration = nextTimelineAdapterSyncGeneration();
+            applyPreparedHomeTimelineAdapters(
+                request.presenter,
+                result.adapterModels,
+                completeRestore,
+                "presenter-cache-restore",
+                true,
+                adapterSyncGeneration
+            );
             log("Timeline full cache restored source=" + request.source
                 + " cacheSource=" + result.cacheSource
                 + " count=" + result.statuses.size()
@@ -3711,6 +4705,260 @@ public class WeiboLiteHook {
             }
         }
         log("Presenter timeline restored from cache source=" + source + " size=" + data.size());
+    }
+
+    private static ArrayList buildTimelineStatusModels(List statuses, Object owner, String source) {
+        if (statuses == null) return null;
+        try {
+            ClassLoader classLoader = owner == null
+                ? WeiboLiteHook.class.getClassLoader()
+                : owner.getClass().getClassLoader();
+            Class<?> statusClass = Class.forName(
+                "com.weico.international.model.sina.Status",
+                false,
+                classLoader
+            );
+            Class<?> modelClass = Class.forName(
+                "com.weico.international.adapter.StatusModel",
+                false,
+                classLoader
+            );
+            Constructor<?> constructor = modelClass.getConstructor(statusClass);
+            ArrayList models = new ArrayList(statuses.size());
+            for (int i = 0; i < statuses.size(); i++) {
+                Object status = unwrapStatus(statuses.get(i));
+                if (status == null || !statusClass.isInstance(status)) continue;
+                models.add(constructor.newInstance(status));
+                if ((i & 0xff) == 0xff) Thread.yield();
+            }
+            if (models.size() != statuses.size()) {
+                log("Timeline adapter model preparation incomplete source=" + source
+                    + " statuses=" + statuses.size() + " models=" + models.size());
+                return null;
+            }
+            return models;
+        } catch (Throwable t) {
+            log("Timeline adapter model preparation error source=" + source + ": " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static void scheduleHomeTimelineAdapterSelfHeal(Object fragment, String source) {
+        try {
+            if (fragment == null || sTimelineCacheClearInFlight) return;
+            Object presenter = callMethodSafe(fragment, "getPresenter");
+            if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
+            if (isTimelineCacheRestoreInFlight(presenter)) return;
+
+            Object recyclerView = getHomeTimelineInnerRecyclerView(fragment);
+            if (!isKnownHomeTimelineRecyclerView(recyclerView)) return;
+            ArrayList statuses;
+            synchronized (sTimelineCumulativeStatusesById) {
+                if (sTimelineCumulativeStatusesById.size() < TIMELINE_CACHE_MIN_ITEMS) return;
+                statuses = new ArrayList(sTimelineCumulativeStatusesById.values());
+            }
+            Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
+            int adapterCount = adapter == null ? -1 : callIntMethodSafe(adapter, "getCount", -1);
+            int adapterValidCount = getTimelineAdapterValidStatusCount(adapter, adapterCount);
+            long canonicalFirstId = statuses.isEmpty() ? 0L : getStatusId(unwrapStatus(statuses.get(0)));
+            long canonicalLastId = statuses.isEmpty()
+                ? 0L
+                : getStatusId(unwrapStatus(statuses.get(statuses.size() - 1)));
+            long adapterFirstId = adapterCount > 0 ? getTimelineAdapterDataStatusId(adapter, 0) : 0L;
+            long adapterLastId = adapterCount > 0
+                ? getTimelineAdapterDataStatusId(adapter, adapterCount - 1)
+                : 0L;
+            if (!shouldReplaceTimelineAdapterData(
+                statuses.size(),
+                adapterCount,
+                adapterValidCount,
+                canonicalFirstId,
+                adapterFirstId,
+                canonicalLastId,
+                adapterLastId,
+                false
+            )) return;
+
+            final ArrayList snapshot = statuses;
+            final Object targetPresenter = presenter;
+            final boolean complete = sTimelineRestoredCacheMode && isTimelinePreloadDone();
+            final int generation = nextTimelineAdapterSyncGeneration();
+            log("Timeline adapter self-heal scheduled source=" + source
+                + " canonical=" + snapshot.size() + " adapter=" + adapterCount
+                + " adapterValid=" + adapterValidCount
+                + " generation=" + generation);
+            sTimelineRestoreExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    final ArrayList models = buildTimelineStatusModels(
+                        snapshot,
+                        targetPresenter,
+                        source + "-self-heal"
+                    );
+                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            applyPreparedHomeTimelineAdapters(
+                                targetPresenter,
+                                models,
+                                complete,
+                                source + "-self-heal",
+                                false,
+                                generation
+                            );
+                        }
+                    });
+                }
+            });
+        } catch (Throwable t) {
+            log("Timeline adapter self-heal schedule error source=" + source + ": " + t.getMessage());
+        }
+    }
+
+    private static int nextTimelineAdapterSyncGeneration() {
+        synchronized (WeiboLiteHook.class) {
+            return ++sTimelineAdapterSyncGeneration;
+        }
+    }
+
+    private static boolean isTimelineAdapterSyncGenerationCurrent(int generation) {
+        synchronized (WeiboLiteHook.class) {
+            return generation == sTimelineAdapterSyncGeneration;
+        }
+    }
+
+    private static void applyPreparedHomeTimelineAdapters(
+        Object presenter,
+        ArrayList models,
+        boolean complete,
+        String source,
+        boolean force,
+        int generation
+    ) {
+        if (models == null || !isTimelineAdapterSyncGenerationCurrent(generation)) return;
+        if (sTimelineCacheClearInFlight && !source.contains("manual-range-clear")) return;
+        ArrayList recyclerViews = getKnownHomeTimelineRecyclerViews(null);
+        Object current = getCurrentHomeTimelineRecyclerView();
+        if (recyclerViews.isEmpty() && isKnownHomeTimelineRecyclerView(current)) {
+            recyclerViews.add(current);
+        }
+        int updated = 0;
+        long canonicalFirstId = models.isEmpty() ? 0L : getStatusId(unwrapStatus(models.get(0)));
+        long canonicalLastId = models.isEmpty()
+            ? 0L
+            : getStatusId(unwrapStatus(models.get(models.size() - 1)));
+        for (int i = 0; i < recyclerViews.size(); i++) {
+            Object recyclerView = recyclerViews.get(i);
+            try {
+                Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
+                if (adapter == null || !adapter.getClass().getName().contains("TimelineAdapter")) continue;
+                int before = callIntMethodSafe(adapter, "getCount", -1);
+                int validBefore = getTimelineAdapterValidStatusCount(adapter, before);
+                long adapterFirstId = before > 0 ? getTimelineAdapterDataStatusId(adapter, 0) : 0L;
+                long adapterLastId = before > 0
+                    ? getTimelineAdapterDataStatusId(adapter, before - 1)
+                    : 0L;
+                if (!shouldReplaceTimelineAdapterData(
+                    models.size(),
+                    before,
+                    validBefore,
+                    canonicalFirstId,
+                    adapterFirstId,
+                    canonicalLastId,
+                    adapterLastId,
+                    force
+                )) continue;
+
+                XposedHelpers.callMethod(adapter, "setItemsWithDiff", new ArrayList(models));
+                if (complete) {
+                    XposedHelpers.callMethod(adapter, "switch2NoMore");
+                } else {
+                    XposedHelpers.callMethod(adapter, "switch2LoadMore");
+                }
+                XposedHelpers.callMethod(adapter, "notifyDataSetChanged");
+                int after = callIntMethodSafe(adapter, "getCount", -1);
+                int validAfter = getTimelineAdapterValidStatusCount(adapter, after);
+                updated++;
+                log("Timeline adapter synchronized source=" + source
+                    + " recycler=" + identityText(recyclerView)
+                    + " before=" + before + " validBefore=" + validBefore
+                    + " after=" + after + " validAfter=" + validAfter
+                    + " complete=" + complete + " current=" + (recyclerView == current));
+            } catch (Throwable t) {
+                log("Timeline adapter synchronize error source=" + source
+                    + " recycler=" + identityText(recyclerView) + ": " + t.getMessage());
+            }
+        }
+        log("Timeline adapter synchronization finished source=" + source
+            + " models=" + models.size() + " updated=" + updated
+            + " candidates=" + recyclerViews.size() + " generation=" + generation);
+    }
+
+    static boolean shouldReplaceTimelineAdapterData(
+        int canonicalCount,
+        int adapterCount,
+        long canonicalFirstId,
+        long adapterFirstId,
+        long canonicalLastId,
+        long adapterLastId,
+        boolean force
+    ) {
+        return shouldReplaceTimelineAdapterData(
+            canonicalCount,
+            adapterCount,
+            adapterCount,
+            canonicalFirstId,
+            adapterFirstId,
+            canonicalLastId,
+            adapterLastId,
+            force
+        );
+    }
+
+    static boolean shouldReplaceTimelineAdapterData(
+        int canonicalCount,
+        int adapterCount,
+        int adapterValidCount,
+        long canonicalFirstId,
+        long adapterFirstId,
+        long canonicalLastId,
+        long adapterLastId,
+        boolean force
+    ) {
+        if (force) return canonicalCount >= 0;
+        if (canonicalCount < 0 || adapterCount < 0) return false;
+        if (canonicalCount <= 0) return false;
+        // A live refresh can briefly be newer than the cumulative snapshot. Never shrink
+        // that unique live data; the next merge will make it canonical.
+        if (adapterFirstId > canonicalFirstId) return false;
+        if (adapterValidCount >= 0) {
+            if (adapterValidCount > canonicalCount) return false;
+            if (adapterValidCount < canonicalCount) return true;
+            // Same number of unique statuses plus extra raw rows means duplicate or
+            // synthetic tail entries. Reapply the canonical model list to remove them.
+            if (adapterCount != adapterValidCount) return true;
+        } else {
+            if (canonicalCount < adapterCount) return false;
+            if (canonicalCount > adapterCount) return true;
+        }
+        return canonicalFirstId != adapterFirstId || canonicalLastId != adapterLastId;
+    }
+
+    private static int getTimelineAdapterValidStatusCount(Object adapter, int adapterCount) {
+        if (adapter == null || adapterCount < 0) return -1;
+        try {
+            Object items = callMethodSafe(adapter, "getItems");
+            if (items instanceof List) return countTimelineStatuses((List) items);
+
+            ArrayList snapshot = new ArrayList(adapterCount);
+            for (int i = 0; i < adapterCount; i++) {
+                Object item = XposedHelpers.callMethod(adapter, "getItem", i);
+                snapshot.add(item);
+            }
+            return countTimelineStatuses(snapshot);
+        } catch (Throwable ignored) {
+            return -1;
+        }
     }
 
     private static boolean restoreTimelineCumulativeCache(Object presenter, List incomingData, String source) {
@@ -4314,6 +5562,60 @@ public class WeiboLiteHook {
         return copy;
     }
 
+    private static List filterTimelineDisplayArtifacts(List list, Object owner, String source) {
+        if (list == null || list.isEmpty()) return list;
+
+        String groupId = getTimelineGroupId(owner);
+        if (!"-1".equals(groupId)) return list;
+
+        ArrayList copy = null;
+        HashSet<Long> statusIds = new HashSet<>();
+        int invalid = 0;
+        int loadMore = 0;
+        int duplicate = 0;
+        int ads = 0;
+        for (int i = 0; i < list.size(); i++) {
+            Object item = list.get(i);
+            Object status = unwrapStatus(item);
+            long id = getStatusId(status);
+            boolean synthetic = status != null && isLoadMoreStatus(status);
+            boolean ad = status != null && !synthetic && isTimelineAdStatus(status);
+            boolean repeated = false;
+            boolean remove;
+            if (status == null || id <= 0L) {
+                invalid++;
+                remove = true;
+            } else if (synthetic) {
+                loadMore++;
+                remove = true;
+            } else if (ad) {
+                ads++;
+                remove = true;
+            } else {
+                repeated = !statusIds.add(Long.valueOf(id));
+                if (repeated) duplicate++;
+                remove = repeated;
+            }
+
+            if (remove) {
+                if (copy == null) {
+                    copy = new ArrayList(list.size());
+                    copy.addAll(list.subList(0, i));
+                }
+            } else if (copy != null) {
+                copy.add(item);
+            }
+        }
+        if (copy == null) return list;
+
+        log("Timeline display artifacts filtered source=" + source + " group=" + groupId
+            + " removed=" + (list.size() - copy.size())
+            + " invalid=" + invalid + " loadMore=" + loadMore
+            + " duplicate=" + duplicate + " ads=" + ads
+            + " size=" + list.size() + " kept=" + copy.size());
+        return copy;
+    }
+
     private static List filterTimelineContentless(List list, Object owner, String source) {
         if (list == null || list.isEmpty()) return list;
 
@@ -4481,15 +5783,153 @@ public class WeiboLiteHook {
         }
     }
 
-    private static Object getAnyTimelineRecyclerView() {
+    private static void rememberHomeTimelineFragment(Object fragment, String source) {
+        if (fragment == null) return;
+        try {
+            Object presenter = callMethodSafe(fragment, "getPresenter");
+            if (presenter == null) {
+                log("Timeline home recycler unresolved presenter source=" + source);
+                return;
+            }
+            if (!"-1".equals(getTimelineGroupId(presenter))) return;
+            Object recyclerView = getHomeTimelineInnerRecyclerView(fragment);
+            if (!isTimelineRecyclerView(recyclerView)) {
+                Object outerRecycler = getFieldValueOrNull(fragment, "mIndexRecycler");
+                log("Timeline home recycler unresolved view source=" + source
+                    + " outer=" + identityText(outerRecycler)
+                    + " inner=" + identityText(recyclerView));
+                return;
+            }
+
+            rememberTimelineRecyclerView(recyclerView);
+            boolean newOwner = false;
+            synchronized (sTopAnchorStates) {
+                TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+                if (owner == null || owner.fragment.get() != fragment || owner.presenter.get() != presenter) {
+                    owner = new TimelineRecyclerOwner(fragment, presenter);
+                    sHomeTimelineRecyclerOwners.put(recyclerView, owner);
+                    newOwner = true;
+                } else {
+                    owner.lastSeenElapsedMs = SystemClock.elapsedRealtime();
+                }
+            }
+
+            if (isHomeTimelineFragmentCurrent(fragment, recyclerView)) {
+                Object previous = sLastActiveHomeTimelineRecyclerView.get();
+                sLastActiveHomeTimelineRecyclerView = new WeakReference<>(recyclerView);
+                sLastActiveHomeTimelinePresenter = new WeakReference<>(presenter);
+                sLastTimelinePresenter = presenter;
+                ensureTimelineTimeJumpButton(recyclerView, source);
+                if (newOwner || previous != recyclerView) {
+                    log("Timeline active home recycler selected source=" + source
+                        + " recycler=" + identityText(recyclerView)
+                        + " data=" + getTimelineRecyclerViewDataScore(recyclerView));
+                }
+            } else if (newOwner) {
+                log("Timeline home recycler registered inactive source=" + source
+                    + " recycler=" + identityText(recyclerView));
+            }
+        } catch (Throwable t) {
+            log("Timeline home recycler remember error source=" + source + ": " + t.getMessage());
+        }
+    }
+
+    private static void markHomeTimelineFragmentPaused(Object fragment) {
+        if (fragment == null) return;
         synchronized (sTopAnchorStates) {
-            ArrayList recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
+            for (Map.Entry<Object, TimelineRecyclerOwner> entry : sHomeTimelineRecyclerOwners.entrySet()) {
+                TimelineRecyclerOwner owner = entry.getValue();
+                if (owner != null && owner.fragment.get() == fragment) {
+                    owner.lastSeenElapsedMs = SystemClock.elapsedRealtime();
+                }
+            }
+        }
+    }
+
+    private static Object getHomeTimelineInnerRecyclerView(Object fragment) {
+        if (fragment == null) return null;
+        Object outerRecycler = getFieldValueOrNull(fragment, "mIndexRecycler");
+        Object recyclerView = callMethodSafe(outerRecycler, "getMRecycler");
+        if (recyclerView == null) recyclerView = callMethodSafe(outerRecycler, "getRecyclerView");
+        if (recyclerView == null) recyclerView = getFieldValueOrNull(outerRecycler, "mRecycler");
+        return recyclerView;
+    }
+
+    private static void forgetHomeTimelineFragment(Object fragment) {
+        if (fragment == null) return;
+        synchronized (sTopAnchorStates) {
+            ArrayList recyclerViews = new ArrayList(sHomeTimelineRecyclerOwners.keySet());
+            for (int i = 0; i < recyclerViews.size(); i++) {
+                Object recyclerView = recyclerViews.get(i);
+                TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+                if (owner == null || owner.fragment.get() == fragment) {
+                    Object ownerPresenter = owner == null ? null : owner.presenter.get();
+                    sHomeTimelineRecyclerOwners.remove(recyclerView);
+                    sTimelineRecyclerViews.remove(recyclerView);
+                    sTopAnchorStates.remove(recyclerView);
+                    sTimelineUserMovedAt.remove(recyclerView);
+                    if (sLastActiveHomeTimelineRecyclerView.get() == recyclerView) {
+                        sLastActiveHomeTimelineRecyclerView = new WeakReference<>(null);
+                    }
+                    if (ownerPresenter != null && sLastActiveHomeTimelinePresenter.get() == ownerPresenter) {
+                        sLastActiveHomeTimelinePresenter = new WeakReference<>(null);
+                    }
+                    if (ownerPresenter != null && sLastTimelinePresenter == ownerPresenter) {
+                        sLastTimelinePresenter = null;
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean isHomeTimelineFragmentCurrent(Object fragment, Object recyclerView) {
+        if (fragment == null || !(recyclerView instanceof View)) return false;
+        if (!"-1".equals(getTimelineGroupId(fragment))) return false;
+        View view = (View) recyclerView;
+        return callBooleanMethodSafe(fragment, "isAdded")
+            && callBooleanMethodSafe(fragment, "isMainTabEnable")
+            && isTimelineViewAttachedAndShown(view)
+            && getTimelineVisibleArea(view) > 0;
+    }
+
+    private static Object getAnyTimelineRecyclerView() {
+        return getCurrentHomeTimelineRecyclerView();
+    }
+
+    private static Object getCurrentHomeTimelineRecyclerView() {
+        synchronized (sTopAnchorStates) {
+            ArrayList recyclerViews = new ArrayList(sHomeTimelineRecyclerOwners.keySet());
             Object best = null;
-            int bestScore = -1;
+            int bestScore = Integer.MIN_VALUE;
             for (int i = 0; i < recyclerViews.size(); i++) {
                 Object recyclerView = recyclerViews.get(i);
                 if (!isTimelineRecyclerView(recyclerView)) continue;
-                int score = getTimelineRecyclerViewDataScore(recyclerView);
+                TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+                Object fragment = owner == null ? null : owner.fragment.get();
+                Object presenter = owner == null ? null : owner.presenter.get();
+                boolean homeOwned = presenter != null && "-1".equals(getTimelineGroupId(presenter));
+                View view = recyclerView instanceof View ? (View) recyclerView : null;
+                boolean attached = view != null && view.getWindowToken() != null;
+                boolean shown = view != null && isTimelineViewAttachedAndShown(view);
+                boolean resumed = fragment != null && callBooleanMethodSafe(fragment, "isResumed");
+                boolean mainTabEnabled = fragment != null && callBooleanMethodSafe(fragment, "isMainTabEnable");
+                int visibleArea = view == null ? 0 : getTimelineVisibleArea(view);
+                if (!isTimelineNavigationCandidate(
+                    homeOwned,
+                    attached,
+                    shown,
+                    mainTabEnabled,
+                    visibleArea
+                )) continue;
+                int score = scoreTimelineRecyclerCandidate(
+                    homeOwned,
+                    attached,
+                    shown,
+                    resumed,
+                    mainTabEnabled,
+                    visibleArea,
+                    getTimelineRecyclerViewDataScore(recyclerView)
+                );
                 if (best == null || score > bestScore) {
                     best = recyclerView;
                     bestScore = score;
@@ -4497,6 +5937,97 @@ public class WeiboLiteHook {
             }
             return best;
         }
+    }
+
+    static boolean isTimelineNavigationCandidate(
+        boolean homeOwned,
+        boolean attached,
+        boolean shown,
+        boolean mainTabEnabled,
+        int visibleArea
+    ) {
+        return homeOwned && attached && shown && mainTabEnabled && visibleArea > 0;
+    }
+
+    static int scoreTimelineRecyclerCandidate(
+        boolean homeOwned,
+        boolean attached,
+        boolean shown,
+        boolean resumed,
+        boolean mainTabEnabled,
+        int visibleArea,
+        int dataCount
+    ) {
+        if (!homeOwned) return Integer.MIN_VALUE;
+        int score = 0;
+        if (mainTabEnabled) score += 8_000_000;
+        if (resumed) score += 4_000_000;
+        if (attached) score += 2_000_000;
+        if (shown) score += 1_000_000;
+        score += Math.min(900_000, Math.max(0, visibleArea));
+        score += Math.min(100_000, Math.max(0, dataCount));
+        return score;
+    }
+
+    private static boolean isTimelineViewAttachedAndShown(View view) {
+        return view != null
+            && view.getWindowToken() != null
+            && view.getVisibility() == View.VISIBLE
+            && view.getWindowVisibility() == View.VISIBLE
+            && view.isShown();
+    }
+
+    private static int getTimelineVisibleArea(View view) {
+        if (view == null) return 0;
+        try {
+            Rect rect = new Rect();
+            if (!view.getGlobalVisibleRect(rect)) return 0;
+            long area = (long) Math.max(0, rect.width()) * (long) Math.max(0, rect.height());
+            return area > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) area;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private static boolean isCurrentHomeTimelineRecyclerView(Object recyclerView) {
+        return recyclerView != null && recyclerView == getCurrentHomeTimelineRecyclerView();
+    }
+
+    private static boolean isKnownHomeTimelineRecyclerView(Object recyclerView) {
+        if (recyclerView == null) return false;
+        synchronized (sTopAnchorStates) {
+            TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+            Object presenter = owner == null ? null : owner.presenter.get();
+            return presenter != null && "-1".equals(getTimelineGroupId(presenter));
+        }
+    }
+
+    private static Object getCurrentHomeTimelinePresenter() {
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        synchronized (sTopAnchorStates) {
+            TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+            Object presenter = owner == null ? null : owner.presenter.get();
+            if (presenter != null && "-1".equals(getTimelineGroupId(presenter))) return presenter;
+        }
+        Object lastActive = sLastActiveHomeTimelinePresenter.get();
+        return lastActive != null && "-1".equals(getTimelineGroupId(lastActive)) ? lastActive : null;
+    }
+
+    private static ArrayList getKnownHomeTimelineRecyclerViews(Object presenter) {
+        ArrayList result = new ArrayList();
+        synchronized (sTopAnchorStates) {
+            ArrayList recyclerViews = new ArrayList(sHomeTimelineRecyclerOwners.keySet());
+            for (int i = 0; i < recyclerViews.size(); i++) {
+                Object recyclerView = recyclerViews.get(i);
+                TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+                Object ownerPresenter = owner == null ? null : owner.presenter.get();
+                if (!isTimelineRecyclerView(recyclerView)
+                    || ownerPresenter == null
+                    || !"-1".equals(getTimelineGroupId(ownerPresenter))) continue;
+                if (presenter == null || ownerPresenter == presenter) result.add(recyclerView);
+            }
+        }
+        return result;
     }
 
     private static int getTimelineRecyclerViewDataScore(Object recyclerView) {
@@ -4524,15 +6055,10 @@ public class WeiboLiteHook {
         if (owner == null || !"-1".equals(getTimelineGroupId(owner))) return false;
         if (captureTimelineRefreshAnchorFromPendingHomeTab(source)) return true;
 
-        ArrayList recyclerViews;
-        synchronized (sTopAnchorStates) {
-            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-        }
-        for (int i = 0; i < recyclerViews.size(); i++) {
-            Object recyclerView = recyclerViews.get(i);
-            int[] viewport = new int[3];
-            long statusId = getVisibleTimelineStatusId(recyclerView, viewport);
-            if (statusId <= 0L) continue;
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        int[] viewport = new int[3];
+        long statusId = getVisibleTimelineStatusId(recyclerView, viewport);
+        if (statusId > 0L) {
             long lastReadId = getLastReadStatusId();
             if (lastReadId > 0L && lastReadId != statusId
                 && viewport[0] >= 0 && viewport[0] < 20
@@ -5036,6 +6562,7 @@ public class WeiboLiteHook {
 
     private static void scheduleTimelineGapFill(final Object presenter, final String source) {
         try {
+            if (sTimelineCacheClearInFlight) return;
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             final long delayMs;
             synchronized (sTimelineGapFillState) {
@@ -5398,7 +6925,7 @@ public class WeiboLiteHook {
 
     private static boolean ensureTimelineTimeJumpButton(Object recyclerView, String source) {
         try {
-            if (!isTimelineRecyclerView(recyclerView) || !(recyclerView instanceof View)) return false;
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !(recyclerView instanceof View)) return false;
             View anchor = (View) recyclerView;
             FrameLayout parent = findTimelineOverlayParent(anchor);
             if (parent == null) return false;
@@ -5440,9 +6967,11 @@ public class WeiboLiteHook {
                     }
                     if (action == MotionEvent.ACTION_UP) {
                         v.setAlpha(0.96f);
-                        Object currentRecyclerView = isTimelineRecyclerView(sTimelineTimeJumpRecyclerView)
-                            ? sTimelineTimeJumpRecyclerView
-                            : recyclerView;
+                        Object currentRecyclerView = getCurrentHomeTimelineRecyclerView();
+                        if (currentRecyclerView == null) {
+                            log("Timeline time-jump button ignored no active home recycler");
+                            return true;
+                        }
                         log("Timeline time-jump button tapped");
                         showTimelineTimeJumpDialog(currentRecyclerView);
                         return true;
@@ -5545,7 +7074,10 @@ public class WeiboLiteHook {
             container.setPadding(padding, dpToPx(anchor, 6), padding, 0);
 
             TextView hint = new TextView(activity);
-            hint.setText("输入目标微博时间，支持 07-09 18:30、18:30");
+            hint.setText(
+                "只填日期（如 7号、7-11）会跳到当天最早的缓存微博；"
+                    + "填写具体时间（如 7-11 18:30、18:30）会跳到该时间附近。"
+            );
             hint.setTextSize(13f);
             hint.setTextColor(0xFFB8BCC6);
             container.addView(hint, new LinearLayout.LayoutParams(
@@ -5591,7 +7123,7 @@ public class WeiboLiteHook {
                 activity,
                 android.R.style.Theme_Material_Dialog_Alert
             )
-                .setTitle("按时间跳转")
+                .setTitle("按日期或时间跳转")
                 .setView(container)
                 .setPositiveButton("跳转", null)
                 .setNegativeButton("取消", null)
@@ -5604,26 +7136,28 @@ public class WeiboLiteHook {
                             @Override
                             public void onClick(View v) {
                                 String text = input.getText() == null ? "" : input.getText().toString();
-                                long targetMs = parseTimelineJumpInputMillis(text);
-                                if (targetMs <= 0L) {
-                                    input.setError("时间格式不对");
+                                TimelineJumpInput jumpInput = parseTimelineJumpInput(text);
+                                if (jumpInput == null || jumpInput.targetMs <= 0L) {
+                                    input.setError("日期或时间格式不对，如 7号、7-11、18:30");
                                     return;
                                 }
                                 if (hasCacheRange
-                                    && !isTimelineJumpInputWithinCacheRange(text, targetMs, cacheStats)) {
+                                    && !isTimelineJumpInputWithinCacheRange(jumpInput, cacheStats)) {
                                     input.setError("超出缓存范围：" + cacheRangeText);
                                     return;
                                 }
                                 boolean accepted = jumpTimelineToTime(
                                     recyclerView,
-                                    targetMs,
+                                    jumpInput.targetMs,
+                                    jumpInput.dayStartMs,
+                                    jumpInput.dayEndMs,
                                     "time-dialog",
                                     0
                                 );
                                 if (accepted) {
                                     dialog.dismiss();
                                 } else {
-                                    input.setError("当前缓存里没有这个时间附近的微博");
+                                    input.setError("当前缓存里没有匹配的日期或时间");
                                 }
                             }
                         });
@@ -5665,51 +7199,78 @@ public class WeiboLiteHook {
         return null;
     }
 
-    private static long parseTimelineJumpInputMillis(String value) {
-        if (!hasMeaningfulString(value)) return 0L;
+    private static TimelineJumpInput parseTimelineJumpInput(String value) {
+        if (!hasMeaningfulString(value)) return null;
         String text = normalizeTimelineJumpInput(value);
         long parsed = parseTimelineJumpWithPatterns(text, new String[] {
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-dd HH:mm",
-            "yyyy-MM-dd"
+            "yyyy-M-d H:m:s",
+            "yyyy-M-d H:m"
         });
-        if (parsed > 0L) return parsed;
+        if (parsed > 0L) return new TimelineJumpInput(parsed, 0L, 0L);
 
         Calendar now = Calendar.getInstance();
         if (text.startsWith("今天") || text.startsWith("今日")) {
             String time = text.substring(2).trim();
-            return parseTimelineJumpWithToday(now, time, false);
+            parsed = parseTimelineJumpWithToday(now, time, false);
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
         if (text.startsWith("昨天")) {
             String time = text.substring(2).trim();
-            return parseTimelineJumpWithToday(now, time, true);
+            parsed = parseTimelineJumpWithToday(now, time, true);
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
-        if (text.matches("\\d{1,2}:\\d{2}(:\\d{2})?")) {
-            return parseTimelineJumpWithToday(now, text, false);
+        if (text.matches("\\d{1,2}:\\d{1,2}(:\\d{1,2})?")) {
+            parsed = parseTimelineJumpWithToday(now, text, false);
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
-        if (text.matches("\\d{1,2}-\\d{1,2}\\s+\\d{1,2}:\\d{2}(:\\d{2})?")) {
+        if (text.matches("\\d{1,2}-\\d{1,2}\\s+\\d{1,2}:\\d{1,2}(:\\d{1,2})?")) {
             int year = now.get(Calendar.YEAR);
             parsed = parseTimelineJumpWithPatterns(year + "-" + text, new String[] {
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-dd HH:mm"
+                "yyyy-M-d H:m:s",
+                "yyyy-M-d H:m"
             });
             if (parsed > now.getTimeInMillis() + TIMELINE_CACHE_DAY_MS) {
                 parsed = parseTimelineJumpWithPatterns((year - 1) + "-" + text, new String[] {
-                    "yyyy-MM-dd HH:mm:ss",
-                    "yyyy-MM-dd HH:mm"
+                    "yyyy-M-d H:m:s",
+                    "yyyy-M-d H:m"
                 });
             }
-            return parsed;
+            return parsed > 0L ? new TimelineJumpInput(parsed, 0L, 0L) : null;
         }
-        if (text.matches("\\d{1,2}-\\d{1,2}")) {
-            int year = now.get(Calendar.YEAR);
-            parsed = parseTimelineJumpWithPatterns(year + "-" + text, new String[] {"yyyy-MM-dd"});
-            if (parsed > now.getTimeInMillis() + TIMELINE_CACHE_DAY_MS) {
-                parsed = parseTimelineJumpWithPatterns((year - 1) + "-" + text, new String[] {"yyyy-MM-dd"});
+
+        long dayStartMs = parseTimelineClearDateOnlyInput(value, false);
+        if (dayStartMs > 0L) {
+            String looseDate = normalizeTimelineClearInput(value);
+            if (looseDate.matches("\\d{1,2}[-/.]\\d{1,2}")
+                && dayStartMs > now.getTimeInMillis() + TIMELINE_CACHE_DAY_MS) {
+                String[] parts = looseDate.split("[-/.]");
+                dayStartMs = parseTimelineClearDateOnlyInput(
+                    (now.get(Calendar.YEAR) - 1) + "-" + parts[0] + "-" + parts[1],
+                    false
+                );
             }
-            return parsed;
+            if (dayStartMs > 0L) {
+                long dayEndMs = getTimelineJumpDayEndMs(dayStartMs);
+                if (dayEndMs >= dayStartMs) {
+                    return new TimelineJumpInput(dayStartMs, dayStartMs, dayEndMs);
+                }
+            }
         }
-        return 0L;
+        return null;
+    }
+
+    static long[] parseTimelineJumpInputRange(String value) {
+        TimelineJumpInput input = parseTimelineJumpInput(value);
+        if (input == null) return new long[0];
+        return new long[] {input.targetMs, input.dayStartMs, input.dayEndMs};
+    }
+
+    private static long getTimelineJumpDayEndMs(long dayStartMs) {
+        if (dayStartMs <= 0L) return 0L;
+        Calendar dayEnd = Calendar.getInstance();
+        dayEnd.setTimeInMillis(dayStartMs);
+        dayEnd.add(Calendar.DAY_OF_MONTH, 1);
+        return dayEnd.getTimeInMillis() - 1L;
     }
 
     private static String normalizeTimelineJumpInput(String value) {
@@ -5719,7 +7280,8 @@ public class WeiboLiteHook {
             .replace('.', '-')
             .replace("年", "-")
             .replace("月", "-")
-            .replace("日", " ");
+            .replace("日", " ")
+            .replace("号", " ");
         while (text.contains("  ")) {
             text = text.replace("  ", " ");
         }
@@ -5734,14 +7296,14 @@ public class WeiboLiteHook {
         }
         String date = formatTimelineJumpDate(day);
         long parsed = parseTimelineJumpWithPatterns(date + " " + time, new String[] {
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-dd HH:mm"
+            "yyyy-M-d H:m:s",
+            "yyyy-M-d H:m"
         });
         if (!yesterday && parsed > now.getTimeInMillis() + TIME_JUMP_FUTURE_GRACE_MS) {
             day.add(Calendar.DAY_OF_MONTH, -1);
             parsed = parseTimelineJumpWithPatterns(formatTimelineJumpDate(day) + " " + time, new String[] {
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-dd HH:mm"
+                "yyyy-M-d H:m:s",
+                "yyyy-M-d H:m"
             });
         }
         return parsed;
@@ -5777,15 +7339,26 @@ public class WeiboLiteHook {
     private static boolean jumpTimelineToTime(
         final Object recyclerView,
         final long targetMs,
+        final long dayStartMs,
+        final long dayEndMs,
         final String source,
         final int attempt
     ) {
         try {
-            if (!isTimelineRecyclerView(recyclerView)) return false;
-            final TimelineTimeJumpTarget target = findTimelineTimeJumpTarget(recyclerView, targetMs);
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return false;
+            final TimelineTimeJumpTarget target = findTimelineTimeJumpTarget(
+                recyclerView,
+                targetMs,
+                dayStartMs,
+                dayEndMs
+            );
             if (target == null || target.statusId <= 0L) {
-                showTimelineToast(recyclerView, "当前已加载/缓存中没有可跳转的微博");
+                showTimelineToast(
+                    recyclerView,
+                    dayStartMs > 0L ? "当前缓存中没有这一天的微博" : "当前已加载/缓存中没有可跳转的微博"
+                );
                 log("Timeline time-jump missed source=" + source + " target=" + targetMs
+                    + " dayRange=" + dayStartMs + ".." + dayEndMs
                     + " " + describeTimelineTimeJumpSearch(recyclerView));
                 return false;
             }
@@ -5811,7 +7384,14 @@ public class WeiboLiteHook {
                     new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                         @Override
                         public void run() {
-                            jumpTimelineToTime(targetRecyclerView, targetMs, source + "-retry", attempt + 1);
+                            jumpTimelineToTime(
+                                targetRecyclerView,
+                                targetMs,
+                                dayStartMs,
+                                dayEndMs,
+                                source + "-retry",
+                                attempt + 1
+                            );
                         }
                     }, TIME_JUMP_RETRY_MS * 3);
                     return true;
@@ -5865,7 +7445,14 @@ public class WeiboLiteHook {
                 new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        jumpTimelineToTime(targetRecyclerView, targetMs, source, attempt + 1);
+                        jumpTimelineToTime(
+                            targetRecyclerView,
+                            targetMs,
+                            dayStartMs,
+                            dayEndMs,
+                            source,
+                            attempt + 1
+                        );
                     }
                 }, TIME_JUMP_RETRY_MS);
             }
@@ -5928,7 +7515,12 @@ public class WeiboLiteHook {
             + " cumulativeSample=" + cumulativeSample;
     }
 
-    private static TimelineTimeJumpTarget findTimelineTimeJumpTarget(Object recyclerView, long targetMs) {
+    private static TimelineTimeJumpTarget findTimelineTimeJumpTarget(
+        Object recyclerView,
+        long targetMs,
+        long dayStartMs,
+        long dayEndMs
+    ) {
         TimelineTimeJumpTarget adapterBest = null;
         TimelineTimeJumpTarget cumulativeBest = null;
         ArrayList recyclerViews = getTimelineTimeJumpRecyclerViews(recyclerView);
@@ -5944,6 +7536,8 @@ public class WeiboLiteHook {
                         adapterBest,
                         unwrapStatus(item),
                         targetMs,
+                        dayStartMs,
+                        dayEndMs,
                         Math.max(0, headerCount) + i,
                         i,
                         candidateRecyclerView
@@ -5962,6 +7556,8 @@ public class WeiboLiteHook {
                 cumulativeBest,
                 unwrapStatus(snapshot.get(i)),
                 targetMs,
+                dayStartMs,
+                dayEndMs,
                 -1,
                 -1,
                 null
@@ -5969,6 +7565,9 @@ public class WeiboLiteHook {
         }
 
         if (cumulativeBest != null && cumulativeBest.adapterPosition < 0) {
+            Object bestRecyclerView = null;
+            int bestPosition = -1;
+            int bestScore = Integer.MIN_VALUE;
             for (int r = 0; r < recyclerViews.size(); r++) {
                 Object candidateRecyclerView = recyclerViews.get(r);
                 try {
@@ -5976,13 +7575,23 @@ public class WeiboLiteHook {
                     int headerCount = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
                     int position = getTimelineStatusAdapterPosition(adapter, headerCount, cumulativeBest.statusId);
                     if (position >= 0) {
-                        cumulativeBest.adapterPosition = position;
-                        cumulativeBest.dataPosition = position - Math.max(0, headerCount);
-                        cumulativeBest.recyclerView = candidateRecyclerView;
-                        break;
+                        int score = getTimelineRecyclerViewDataScore(candidateRecyclerView);
+                        if (candidateRecyclerView == recyclerView) score += 1000000;
+                        if (bestRecyclerView == null || score > bestScore) {
+                            bestRecyclerView = candidateRecyclerView;
+                            bestPosition = position;
+                            bestScore = score;
+                        }
                     }
                 } catch (Throwable ignored) {
                 }
+            }
+            if (bestRecyclerView != null) {
+                Object adapter = XposedHelpers.callMethod(bestRecyclerView, "getAdapter");
+                int headerCount = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
+                cumulativeBest.adapterPosition = bestPosition;
+                cumulativeBest.dataPosition = bestPosition - Math.max(0, headerCount);
+                cumulativeBest.recyclerView = bestRecyclerView;
             }
         }
         if (cumulativeBest != null && cumulativeBest.adapterPosition >= 0) {
@@ -5999,14 +7608,11 @@ public class WeiboLiteHook {
 
     private static ArrayList getTimelineTimeJumpRecyclerViews(Object preferredRecyclerView) {
         ArrayList result = new ArrayList();
-        addTimelineTimeJumpRecyclerView(result, preferredRecyclerView);
-        synchronized (sTopAnchorStates) {
-            ArrayList recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-            for (int i = 0; i < recyclerViews.size(); i++) {
-                addTimelineTimeJumpRecyclerView(result, recyclerViews.get(i));
-            }
+        Object current = getCurrentHomeTimelineRecyclerView();
+        if (preferredRecyclerView == current) {
+            addTimelineTimeJumpRecyclerView(result, preferredRecyclerView);
         }
-        addTimelineTimeJumpRecyclerView(result, getAnyTimelineRecyclerView());
+        addTimelineTimeJumpRecyclerView(result, current);
         return result;
     }
 
@@ -6022,6 +7628,8 @@ public class WeiboLiteHook {
         TimelineTimeJumpTarget best,
         Object status,
         long targetMs,
+        long dayStartMs,
+        long dayEndMs,
         int adapterPosition,
         int dataPosition,
         Object recyclerView
@@ -6032,6 +7640,10 @@ public class WeiboLiteHook {
         long statusId = getStatusId(status);
         long createdMs = getStatusCreatedAtMillis(status);
         if (statusId <= 0L || createdMs <= 0L) return best;
+        if (dayStartMs > 0L && dayEndMs >= dayStartMs
+            && (createdMs < dayStartMs || createdMs > dayEndMs)) {
+            return best;
+        }
         long diff = createdMs >= targetMs ? createdMs - targetMs : targetMs - createdMs;
         if (best != null) best.searchedCount++;
         if (best != null && diff >= best.diffMs) return best;
@@ -6070,26 +7682,18 @@ public class WeiboLiteHook {
     }
 
     private static boolean isTimelineJumpInputWithinCacheRange(
-        String value,
-        long targetMs,
+        TimelineJumpInput input,
         TimelineCacheStats stats
     ) {
-        if (targetMs <= 0L || !hasTimelineTimeJumpCacheRange(stats)) return true;
-        String normalized = normalizeTimelineJumpInput(value);
-        boolean dateOnly = normalized.matches("\\d{4}-\\d{1,2}-\\d{1,2}")
-            || normalized.matches("\\d{1,2}-\\d{1,2}");
-        if (dateOnly) {
-            Calendar endOfDay = Calendar.getInstance();
-            endOfDay.setTimeInMillis(targetMs);
-            endOfDay.add(Calendar.DAY_OF_MONTH, 1);
-            long dayEndMs = endOfDay.getTimeInMillis() - 1L;
-            return targetMs <= stats.newestMs && dayEndMs >= stats.oldestMs;
+        if (input == null || input.targetMs <= 0L || !hasTimelineTimeJumpCacheRange(stats)) return true;
+        if (input.isDateOnly()) {
+            return input.dayStartMs <= stats.newestMs && input.dayEndMs >= stats.oldestMs;
         }
 
         long minuteMs = 60000L;
         long rangeStartMs = stats.oldestMs - (stats.oldestMs % minuteMs);
         long rangeEndMs = stats.newestMs - (stats.newestMs % minuteMs) + minuteMs - 1L;
-        return targetMs >= rangeStartMs && targetMs <= rangeEndMs;
+        return input.targetMs >= rangeStartMs && input.targetMs <= rangeEndMs;
     }
 
     private static String formatTimelineJumpRangeTime(long millis) {
@@ -6144,15 +7748,10 @@ public class WeiboLiteHook {
         if (statusId <= 0L) return false;
 
         cancelTimelineTopAnchorsForRefresh(source);
-        ArrayList recyclerViews;
-        synchronized (sTopAnchorStates) {
-            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-        }
         boolean scheduled = false;
         int generation = sTimelineRefreshAnchorGeneration;
-        for (int i = 0; i < recyclerViews.size(); i++) {
-            Object recyclerView = recyclerViews.get(i);
-            if (!isTimelineRecyclerView(recyclerView)) continue;
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (isCurrentHomeTimelineRecyclerView(recyclerView)) {
             scheduled = true;
             scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, 0, 50L);
             scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, 1, 250L);
@@ -6190,7 +7789,7 @@ public class WeiboLiteHook {
         try {
             if (statusId <= 0L || statusId != getActiveTimelineRefreshAnchorStatusId()) return;
             if (generation != sTimelineRefreshAnchorGeneration) return;
-            if (!isTimelineRecyclerView(recyclerView)) return;
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return;
 
             int target = getTimelineStatusAdapterPosition(recyclerView, statusId);
             if (target < 0) {
@@ -6329,40 +7928,23 @@ public class WeiboLiteHook {
     }
 
     private static void beginTimelineTopAnchorForKnownRecyclerViews(String source, boolean resetUserTouch) {
-        ArrayList recyclerViews;
-        synchronized (sTopAnchorStates) {
-            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-        }
-        for (int i = 0; i < recyclerViews.size(); i++) {
-            beginTimelineTopAnchor(recyclerViews.get(i), source, resetUserTouch);
-        }
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (recyclerView != null) beginTimelineTopAnchor(recyclerView, source, resetUserTouch);
     }
 
     private static void jumpTimelineToAbsoluteTopForKnownRecyclerViews(String source) {
-        ArrayList recyclerViews;
-        synchronized (sTopAnchorStates) {
-            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-        }
-        boolean jumped = false;
-        for (int i = 0; i < recyclerViews.size(); i++) {
-            jumped |= jumpTimelineToAbsoluteTop(recyclerViews.get(i), source, 0);
-        }
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        boolean jumped = jumpTimelineToAbsoluteTop(recyclerView, source, 0);
         if (!jumped) {
-            log("Timeline absolute top jump skipped source=" + source + " no recycler");
+            log("Timeline absolute top jump skipped source=" + source + " no active home recycler");
         }
     }
 
     private static void jumpTimelineToAbsoluteBottomForKnownRecyclerViews(String source) {
-        ArrayList recyclerViews;
-        synchronized (sTopAnchorStates) {
-            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-        }
-        boolean jumped = false;
-        for (int i = 0; i < recyclerViews.size(); i++) {
-            jumped |= jumpTimelineToAbsoluteBottom(recyclerViews.get(i), source, 0);
-        }
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        boolean jumped = jumpTimelineToAbsoluteBottom(recyclerView, source, 0);
         if (!jumped) {
-            log("Timeline absolute bottom jump skipped source=" + source + " no recycler");
+            log("Timeline absolute bottom jump skipped source=" + source + " no active home recycler");
         }
     }
 
@@ -6381,7 +7963,7 @@ public class WeiboLiteHook {
         final boolean top
     ) {
         try {
-            if (!isTimelineRecyclerView(recyclerView)) return false;
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return false;
 
             int target = top
                 ? getTimelineAbsoluteTopAdapterPosition(recyclerView)
@@ -6441,11 +8023,34 @@ public class WeiboLiteHook {
             int dataCount = callIntMethodSafe(adapter, "getCount", -1);
             int headerCount = callIntMethodSafe(adapter, "getHeaderCount", 0);
             if (dataCount >= TIMELINE_CACHE_MIN_ITEMS) {
+                long canonicalOldestId = getTimelineCumulativeEdgeStatusId(true);
+                int canonicalPosition = getTimelineStatusAdapterPosition(
+                    adapter,
+                    headerCount,
+                    canonicalOldestId
+                );
+                if (canonicalPosition >= 0) return canonicalPosition;
                 if (sTimelineOldestFirstMode) return Math.max(0, headerCount);
                 return Math.max(0, headerCount) + dataCount - 1;
             }
         } catch (Throwable ignored) {}
         return -1;
+    }
+
+    private static long getTimelineCumulativeEdgeStatusId(boolean oldest) {
+        synchronized (sTimelineCumulativeStatusesById) {
+            long edge = oldest ? Long.MAX_VALUE : Long.MIN_VALUE;
+            for (Object key : sTimelineCumulativeStatusesById.keySet()) {
+                if (!(key instanceof Number)) continue;
+                long id = ((Number) key).longValue();
+                if (id <= 0L) continue;
+                if (oldest ? id < edge : id > edge) {
+                    edge = id;
+                }
+            }
+            if (edge == Long.MAX_VALUE || edge == Long.MIN_VALUE) return 0L;
+            return edge;
+        }
     }
 
     private static int getTimelineAbsoluteBottomAdapterPosition(Object recyclerView) {
@@ -6483,13 +8088,8 @@ public class WeiboLiteHook {
     }
 
     private static void finishTimelineTopAnchorForKnownRecyclerViews(String source) {
-        ArrayList recyclerViews;
-        synchronized (sTopAnchorStates) {
-            recyclerViews = new ArrayList(sTimelineRecyclerViews.keySet());
-        }
-        for (int i = 0; i < recyclerViews.size(); i++) {
-            finishTimelineTopAnchor(recyclerViews.get(i), source);
-        }
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (recyclerView != null) finishTimelineTopAnchor(recyclerView, source);
     }
 
     private static void suspendTimelineTopAnchorsForPreload(String source) {
@@ -6755,7 +8355,7 @@ public class WeiboLiteHook {
     }
 
     private static void markTimelineLastReadTouched(Object recyclerView) {
-        if (!isTimelineRecyclerView(recyclerView)) return;
+        if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return;
         synchronized (sTimelineUserMovedAt) {
             sTimelineUserMovedAt.put(recyclerView, Long.valueOf(SystemClock.elapsedRealtime()));
         }
@@ -6769,7 +8369,7 @@ public class WeiboLiteHook {
     }
 
     private static void schedulePersistTimelineLastRead(final Object recyclerView, final String source, long delayMs) {
-        if (!isTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
+        if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
         new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -6780,7 +8380,7 @@ public class WeiboLiteHook {
 
     private static void persistTimelineLastRead(Object recyclerView, String source) {
         try {
-            if (!isTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
             if (!shouldUseTimelineLastRead(sTimelineRestoredCacheMode, isTimelinePreloadDone())) return;
             if (getActiveTimelineRefreshAnchorStatusId() > 0L) {
                 log("Timeline last-read save skipped source=" + source + " reason=refresh-anchor");
@@ -7125,7 +8725,21 @@ public class WeiboLiteHook {
 
     private static void rememberTimelinePresenter(Object presenter) {
         if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
+        Object pinned = sLastActiveHomeTimelinePresenter.get();
+        if (pinned != null && pinned != presenter && isKnownHomeTimelinePresenter(pinned)) {
+            return;
+        }
         sLastTimelinePresenter = presenter;
+    }
+
+    private static boolean isKnownHomeTimelinePresenter(Object presenter) {
+        if (presenter == null) return false;
+        synchronized (sTopAnchorStates) {
+            for (TimelineRecyclerOwner owner : sHomeTimelineRecyclerOwners.values()) {
+                if (owner != null && owner.presenter.get() == presenter) return true;
+            }
+        }
+        return false;
     }
 
     private static void markTimelineNoMoreContent(String source) {
@@ -7236,6 +8850,7 @@ public class WeiboLiteHook {
     private static void scheduleTimelinePreload(final Object presenter, final String source) {
         if (presenter == null) return;
         try {
+            if (sTimelineCacheClearInFlight) return;
             if (!"-1".equals(getTimelineGroupId(presenter))) return;
             rememberTimelinePresenter(presenter);
             int count = getTimelineStatusCount(presenter);
@@ -8029,6 +9644,12 @@ public class WeiboLiteHook {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private static String identityText(Object value) {
+        if (value == null) return "null";
+        return value.getClass().getSimpleName() + "@"
+            + Integer.toHexString(System.identityHashCode(value));
     }
 
     private static String getStringMethodOrField(Object target, String method, String field) {

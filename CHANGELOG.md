@@ -2,6 +2,20 @@
 
 # Changelog
 
+## Unreleased
+
+### 中文
+
+- 在微博轻享版内的 ReWeibo 设置中新增按发布时间范围清除缓存微博；既支持日历选择，也支持 `7号`、`7-7`、完整日期时间等松散输入，单独日期按整天处理。清理会同步更新原生缓存、shadow cache 与当前内存时间线，并阻止旧的异步任务回写已删除内容。
+- 时间线“跳转”同步支持 `7号`、`7-11`、中文完整日期等松散日期；仅输入日期时只在当天微博中定位，并优先滚动当前主时间线。
+- 修复清理或刷新后旧 Fragment 的短列表仍被误当成首页，以及广告、重复项混入列表尾部导致边界跳错的问题；缓存恢复现在会直接同步当前首页 Adapter，清理会同时刷新所有仍存活的首页实例，双击、日期跳转和阅读位置只允许当前可见首页响应，避免几十条短页或伪尾项提前显示“没有更多内容”。
+
+### English
+
+- Adds inclusive publication-time range clearing to the in-app ReWeibo settings, with both calendar selection and loose typed dates (date-only input covers the whole day), while updating native, shadow, and in-memory caches and blocking stale asynchronous writes.
+- Extends timeline jump input to loose dates such as `7号`, `7-11`, and full Chinese dates; date-only input searches only that day and targets the primary timeline.
+- Prevents stale or hidden timeline fragments and duplicate/ad tail rows from creating a false timeline boundary after clearing or refreshing; restored cache data is applied to the visible home adapter, while double-tap, time-jump, and last-read actions are scoped to the current home timeline.
+
 ## 1.0.1
 
 ### 中文
