@@ -196,6 +196,8 @@ public class WeiboLiteHook {
     private static ProgressBar sTimelineGapFillProgressBar = null;
     private static View sTimelineTimeJumpButton = null;
     private static WindowManager sTimelineTimeJumpWindowManager = null;
+    private static View sTimelineCacheClearButton = null;
+    private static WindowManager sTimelineCacheClearWindowManager = null;
     private static Activity sTimelineTimeJumpActivity = null;
     private static Object sTimelineTimeJumpRecyclerView = null;
     private static Long sLastReadStatusId = null;
@@ -6930,9 +6932,12 @@ public class WeiboLiteHook {
             FrameLayout parent = findTimelineOverlayParent(anchor);
             if (parent == null) return false;
             Activity activity = findHostActivity(anchor.getContext());
-            if (sTimelineTimeJumpButton != null && sTimelineTimeJumpActivity == activity) {
+            if (sTimelineTimeJumpButton != null
+                && sTimelineCacheClearButton != null
+                && sTimelineTimeJumpActivity == activity) {
                 sTimelineTimeJumpRecyclerView = recyclerView;
                 sTimelineTimeJumpButton.bringToFront();
+                sTimelineCacheClearButton.bringToFront();
                 return true;
             }
             removeTimelineTimeJumpButton("reparent");
@@ -6984,6 +6989,52 @@ public class WeiboLiteHook {
                 }
             });
 
+            TextView clearButton = new TextView(context);
+            clearButton.setText("删除");
+            clearButton.setTextColor(Color.WHITE);
+            clearButton.setTextSize(13f);
+            clearButton.setGravity(Gravity.CENTER);
+            clearButton.setIncludeFontPadding(false);
+            clearButton.setClickable(true);
+            clearButton.setFocusable(true);
+            clearButton.setContentDescription("ReWeibo 删除缓存微博");
+            clearButton.setPadding(paddingH, 0, paddingH, 0);
+
+            GradientDrawable clearBackground = new GradientDrawable();
+            clearBackground.setColor(0xE8E9515D);
+            clearBackground.setCornerRadius(dpToPx(anchor, 18));
+            clearBackground.setStroke(Math.max(1, dpToPx(anchor, 1)), 0x66FFFFFF);
+            clearButton.setBackground(clearBackground);
+            clearButton.setAlpha(0.96f);
+            clearButton.setElevation(dpToPx(anchor, 6));
+            clearButton.setOnTouchListener(new View.OnTouchListener() {
+                @Override
+                public boolean onTouch(View v, MotionEvent event) {
+                    int action = event.getActionMasked();
+                    if (action == MotionEvent.ACTION_DOWN) {
+                        v.setAlpha(0.76f);
+                        return true;
+                    }
+                    if (action == MotionEvent.ACTION_UP) {
+                        v.setAlpha(0.96f);
+                        Activity currentActivity = findHostActivity(v.getContext());
+                        if (currentActivity == null || currentActivity.isFinishing()
+                            || currentActivity.isDestroyed()) {
+                            log("Timeline cache-clear button skipped no activity");
+                            return true;
+                        }
+                        log("Timeline cache-clear button tapped");
+                        showTimelineCacheClearRangeDialog(currentActivity);
+                        return true;
+                    }
+                    if (action == MotionEvent.ACTION_CANCEL) {
+                        v.setAlpha(0.96f);
+                        return true;
+                    }
+                    return true;
+                }
+            });
+
             if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
                 try {
                     WindowManager.LayoutParams wparams = new WindowManager.LayoutParams(
@@ -6999,16 +7050,33 @@ public class WeiboLiteHook {
                     wparams.y = dpToPx(anchor, 108);
                     wparams.token = activity.getWindow().getDecorView().getWindowToken();
 
+                    WindowManager.LayoutParams clearWparams = new WindowManager.LayoutParams(
+                        dpToPx(anchor, 72),
+                        dpToPx(anchor, 44),
+                        WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT
+                    );
+                    clearWparams.gravity = Gravity.TOP | Gravity.END;
+                    clearWparams.x = dpToPx(anchor, 16);
+                    clearWparams.y = dpToPx(anchor, 108);
+                    clearWparams.token = activity.getWindow().getDecorView().getWindowToken();
+
                     WindowManager wm = (WindowManager) activity.getSystemService(Activity.WINDOW_SERVICE);
                     wm.addView(button, wparams);
                     sTimelineTimeJumpButton = button;
                     sTimelineTimeJumpWindowManager = wm;
                     sTimelineTimeJumpActivity = activity;
                     sTimelineTimeJumpRecyclerView = recyclerView;
-                    log("Timeline time-jump button shown source=" + source + " via WindowManager");
+                    wm.addView(clearButton, clearWparams);
+                    sTimelineCacheClearButton = clearButton;
+                    sTimelineCacheClearWindowManager = wm;
+                    log("Timeline shortcut buttons shown source=" + source + " via WindowManager");
                     return true;
                 } catch (Throwable t) {
                     log("Timeline time-jump WindowManager failed source=" + source + ": " + t.getMessage());
+                    removeTimelineTimeJumpButton("window-fallback");
                 }
             }
 
@@ -7024,10 +7092,22 @@ public class WeiboLiteHook {
             sTimelineTimeJumpWindowManager = null;
             sTimelineTimeJumpActivity = activity;
             sTimelineTimeJumpRecyclerView = recyclerView;
-            log("Timeline time-jump button shown source=" + source + " via parent");
+
+            FrameLayout.LayoutParams clearLp = new FrameLayout.LayoutParams(
+                dpToPx(anchor, 72),
+                dpToPx(anchor, 44)
+            );
+            clearLp.gravity = Gravity.TOP | Gravity.END;
+            clearLp.topMargin = dpToPx(anchor, 108);
+            clearLp.rightMargin = dpToPx(anchor, 16);
+            parent.addView(clearButton, clearLp);
+            sTimelineCacheClearButton = clearButton;
+            sTimelineCacheClearWindowManager = null;
+            log("Timeline shortcut buttons shown source=" + source + " via parent");
             return true;
         } catch (Throwable t) {
             log("Timeline time-jump button error source=" + source + ": " + t.getMessage());
+            removeTimelineTimeJumpButton("create-error");
             return false;
         }
     }
@@ -7044,11 +7124,23 @@ public class WeiboLiteHook {
                     }
                 }
             }
+            if (sTimelineCacheClearButton != null) {
+                if (sTimelineCacheClearWindowManager != null) {
+                    sTimelineCacheClearWindowManager.removeViewImmediate(sTimelineCacheClearButton);
+                } else {
+                    Object parent = sTimelineCacheClearButton.getParent();
+                    if (parent instanceof ViewGroup) {
+                        ((ViewGroup) parent).removeView(sTimelineCacheClearButton);
+                    }
+                }
+            }
         } catch (Throwable t) {
-            log("Timeline time-jump button remove error source=" + source + ": " + t.getMessage());
+            log("Timeline shortcut buttons remove error source=" + source + ": " + t.getMessage());
         } finally {
             sTimelineTimeJumpButton = null;
             sTimelineTimeJumpWindowManager = null;
+            sTimelineCacheClearButton = null;
+            sTimelineCacheClearWindowManager = null;
             sTimelineTimeJumpActivity = null;
             sTimelineTimeJumpRecyclerView = null;
         }
