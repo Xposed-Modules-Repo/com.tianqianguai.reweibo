@@ -7,6 +7,8 @@ public final class ModuleSettings {
     public static final String PROVIDER_AUTHORITY = "com.tianqianguai.reweibo.settings";
     public static final String SETTINGS_PATH = "settings";
     public static final String KEY_WEICO_PROFILE_ENTRY = "weico_profile_entry";
+    public static final String KEY_WEICO_TIMELINE_JUMP_BUTTON = "weico_timeline_jump_button";
+    public static final String KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON = "weico_timeline_cache_clear_button";
     public static final String KEY_WEICO_TIMELINE_CACHE_DAYS = "weico_timeline_cache_days";
     public static final int DEFAULT_WEICO_TIMELINE_CACHE_DAYS = 3;
     public static final int MIN_WEICO_TIMELINE_CACHE_DAYS = 1;
@@ -15,7 +17,9 @@ public final class ModuleSettings {
     private ModuleSettings() {}
 
     public static boolean defaultFor(String key) {
-        if (KEY_WEICO_PROFILE_ENTRY.equals(key)) {
+        if (KEY_WEICO_PROFILE_ENTRY.equals(key)
+                || KEY_WEICO_TIMELINE_JUMP_BUTTON.equals(key)
+                || KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key)) {
             return true;
         }
         return false;

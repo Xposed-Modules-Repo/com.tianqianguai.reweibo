@@ -72,6 +72,20 @@ public class SettingsActivity extends Activity {
                 prefs,
                 ModuleSettings.KEY_WEICO_PROFILE_ENTRY
         );
+        addSwitchRow(
+                panel,
+                "显示“跳转”按钮",
+                "在微博轻享版首页显示时间跳转快捷按钮",
+                prefs,
+                ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON
+        );
+        addSwitchRow(
+                panel,
+                "显示“删除”按钮",
+                "在微博轻享版首页显示缓存微博删除快捷按钮",
+                prefs,
+                ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON
+        );
         addInfoRow(
                 panel,
                 "首页缓存管理",

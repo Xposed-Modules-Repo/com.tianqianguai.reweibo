@@ -34,6 +34,7 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -921,6 +922,32 @@ public class WeiboLiteHook {
                 dpToPx(activity.getWindow().getDecorView(), 48)
             ));
 
+            final Switch jumpButtonToggle = new Switch(activity);
+            jumpButtonToggle.setText("显示首页“跳转”按钮");
+            jumpButtonToggle.setTextColor(Color.WHITE);
+            jumpButtonToggle.setTextSize(15f);
+            jumpButtonToggle.setChecked(isModuleOptionEnabled(
+                ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
+            ));
+            panel.addView(jumpButtonToggle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ));
+
+            final Switch clearButtonToggle = new Switch(activity);
+            clearButtonToggle.setText("显示首页“删除”按钮");
+            clearButtonToggle.setTextColor(Color.WHITE);
+            clearButtonToggle.setTextSize(15f);
+            clearButtonToggle.setChecked(isModuleOptionEnabled(
+                ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+                ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
+            ));
+            panel.addView(clearButtonToggle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ));
+
             View divider = new View(activity);
             divider.setBackgroundColor(0xFF343946);
             LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(
@@ -987,12 +1014,21 @@ public class WeiboLiteHook {
                     }
                     boolean saved = prefs.edit()
                         .putInt(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days)
+                        .putBoolean(
+                            ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                            jumpButtonToggle.isChecked()
+                        )
+                        .putBoolean(
+                            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+                            clearButtonToggle.isChecked()
+                        )
                         .commit();
                     if (!saved) {
                         input.setError("保存失败，请重试");
                         return;
                     }
                     rememberModuleIntSetting(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days);
+                    refreshTimelineShortcutButtons("settings-saved");
                     if (sLastTimelinePresenter != null) {
                         resetPreloadState(sLastTimelinePresenter, "settings-saved");
                         scheduleTimelinePreload(sLastTimelinePresenter, "settings-saved");
@@ -6925,6 +6961,34 @@ public class WeiboLiteHook {
         }
     }
 
+    private static void refreshTimelineShortcutButtons(String source) {
+        boolean showJumpButton = isModuleOptionEnabled(
+            ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+            ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
+        );
+        boolean showClearButton = isModuleOptionEnabled(
+            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+            ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
+        );
+        if (!showJumpButton && !showClearButton) {
+            removeTimelineTimeJumpButton(source + "-all-hidden");
+            return;
+        }
+        if (sTimelineTimeJumpButton != null && sTimelineCacheClearButton != null) {
+            sTimelineTimeJumpButton.setVisibility(showJumpButton ? View.VISIBLE : View.GONE);
+            sTimelineCacheClearButton.setVisibility(showClearButton ? View.VISIBLE : View.GONE);
+            if (showJumpButton) sTimelineTimeJumpButton.bringToFront();
+            if (showClearButton) sTimelineCacheClearButton.bringToFront();
+            log("Timeline shortcut button visibility updated source=" + source
+                + " jump=" + showJumpButton + " clear=" + showClearButton);
+            return;
+        }
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (recyclerView != null) {
+            ensureTimelineTimeJumpButton(recyclerView, source + "-create");
+        }
+    }
+
     private static boolean ensureTimelineTimeJumpButton(Object recyclerView, String source) {
         try {
             if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !(recyclerView instanceof View)) return false;
@@ -6932,17 +6996,35 @@ public class WeiboLiteHook {
             FrameLayout parent = findTimelineOverlayParent(anchor);
             if (parent == null) return false;
             Activity activity = findHostActivity(anchor.getContext());
+            boolean showJumpButton = isModuleOptionEnabled(
+                ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
+            );
+            boolean showClearButton = isModuleOptionEnabled(
+                ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+                ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
+            );
+            if (!showJumpButton && !showClearButton) {
+                removeTimelineTimeJumpButton(source + "-all-hidden");
+                return true;
+            }
             if (sTimelineTimeJumpButton != null
                 && sTimelineCacheClearButton != null
                 && sTimelineTimeJumpActivity == activity) {
                 sTimelineTimeJumpRecyclerView = recyclerView;
-                sTimelineTimeJumpButton.bringToFront();
-                sTimelineCacheClearButton.bringToFront();
+                sTimelineTimeJumpButton.setVisibility(showJumpButton ? View.VISIBLE : View.GONE);
+                sTimelineCacheClearButton.setVisibility(showClearButton ? View.VISIBLE : View.GONE);
+                if (showJumpButton) sTimelineTimeJumpButton.bringToFront();
+                if (showClearButton) sTimelineCacheClearButton.bringToFront();
                 return true;
             }
             removeTimelineTimeJumpButton("reparent");
 
             Context context = anchor.getContext();
+            int shortcutButtonWidth = dpToPx(anchor, 72);
+            int shortcutButtonHeight = dpToPx(anchor, 44);
+            int shortcutButtonHorizontalMargin = dpToPx(anchor, 16);
+            int shortcutButtonTopMargin = dpToPx(anchor, 108);
             TextView button = new TextView(context);
             button.setText("跳转");
             button.setTextColor(Color.WHITE);
@@ -6962,6 +7044,7 @@ public class WeiboLiteHook {
             button.setBackground(background);
             button.setAlpha(0.96f);
             button.setElevation(dpToPx(anchor, 6));
+            button.setVisibility(showJumpButton ? View.VISIBLE : View.GONE);
             button.setOnTouchListener(new View.OnTouchListener() {
                 @Override
                 public boolean onTouch(View v, MotionEvent event) {
@@ -7007,6 +7090,7 @@ public class WeiboLiteHook {
             clearButton.setBackground(clearBackground);
             clearButton.setAlpha(0.96f);
             clearButton.setElevation(dpToPx(anchor, 6));
+            clearButton.setVisibility(showClearButton ? View.VISIBLE : View.GONE);
             clearButton.setOnTouchListener(new View.OnTouchListener() {
                 @Override
                 public boolean onTouch(View v, MotionEvent event) {
@@ -7038,29 +7122,29 @@ public class WeiboLiteHook {
             if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
                 try {
                     WindowManager.LayoutParams wparams = new WindowManager.LayoutParams(
-                        dpToPx(anchor, 72),
-                        dpToPx(anchor, 44),
+                        shortcutButtonWidth,
+                        shortcutButtonHeight,
                         WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
                         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                         PixelFormat.TRANSLUCENT
                     );
                     wparams.gravity = Gravity.TOP | Gravity.START;
-                    wparams.x = dpToPx(anchor, 16);
-                    wparams.y = dpToPx(anchor, 108);
+                    wparams.x = shortcutButtonHorizontalMargin;
+                    wparams.y = shortcutButtonTopMargin;
                     wparams.token = activity.getWindow().getDecorView().getWindowToken();
 
                     WindowManager.LayoutParams clearWparams = new WindowManager.LayoutParams(
-                        dpToPx(anchor, 72),
-                        dpToPx(anchor, 44),
+                        shortcutButtonWidth,
+                        shortcutButtonHeight,
                         WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
                         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                         PixelFormat.TRANSLUCENT
                     );
                     clearWparams.gravity = Gravity.TOP | Gravity.END;
-                    clearWparams.x = dpToPx(anchor, 16);
-                    clearWparams.y = dpToPx(anchor, 108);
+                    clearWparams.x = shortcutButtonHorizontalMargin;
+                    clearWparams.y = shortcutButtonTopMargin;
                     clearWparams.token = activity.getWindow().getDecorView().getWindowToken();
 
                     WindowManager wm = (WindowManager) activity.getSystemService(Activity.WINDOW_SERVICE);
@@ -7081,12 +7165,12 @@ public class WeiboLiteHook {
             }
 
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                dpToPx(anchor, 72),
-                dpToPx(anchor, 44)
+                shortcutButtonWidth,
+                shortcutButtonHeight
             );
             lp.gravity = Gravity.TOP | Gravity.START;
-            lp.topMargin = dpToPx(anchor, 108);
-            lp.leftMargin = dpToPx(anchor, 16);
+            lp.topMargin = shortcutButtonTopMargin;
+            lp.leftMargin = shortcutButtonHorizontalMargin;
             parent.addView(button, lp);
             sTimelineTimeJumpButton = button;
             sTimelineTimeJumpWindowManager = null;
@@ -7094,12 +7178,12 @@ public class WeiboLiteHook {
             sTimelineTimeJumpRecyclerView = recyclerView;
 
             FrameLayout.LayoutParams clearLp = new FrameLayout.LayoutParams(
-                dpToPx(anchor, 72),
-                dpToPx(anchor, 44)
+                shortcutButtonWidth,
+                shortcutButtonHeight
             );
             clearLp.gravity = Gravity.TOP | Gravity.END;
-            clearLp.topMargin = dpToPx(anchor, 108);
-            clearLp.rightMargin = dpToPx(anchor, 16);
+            clearLp.topMargin = shortcutButtonTopMargin;
+            clearLp.rightMargin = shortcutButtonHorizontalMargin;
             parent.addView(clearButton, clearLp);
             sTimelineCacheClearButton = clearButton;
             sTimelineCacheClearWindowManager = null;
