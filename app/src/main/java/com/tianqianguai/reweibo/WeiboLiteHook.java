@@ -230,6 +230,10 @@ public class WeiboLiteHook {
     private static String sPendingTimelineNoMoreSource = null;
     private static int sPendingTimelineNoMoreGeneration = 0;
     private static int sTimelineAdapterSyncGeneration = 0;
+    private static int sTimelineGapFillViewportAnchorGeneration = 0;
+    private static TimelineViewportAnchor sTimelineGapFillViewportAnchor = null;
+    private static int sTimelineGapFillViewportAnchorScheduledGeneration = 0;
+    private static long sTimelineGapFillViewportAnchorScheduledAtMs = 0L;
     private static WeakReference<Object> sLastActiveHomeTimelineRecyclerView = new WeakReference<>(null);
     private static WeakReference<Object> sLastActiveHomeTimelinePresenter = new WeakReference<>(null);
 
@@ -285,6 +289,31 @@ public class WeiboLiteHook {
         long untilElapsedMs = 0L;
         boolean userTouched = false;
         boolean finishing = false;
+    }
+
+    private static final class TimelineViewportAnchor {
+        final WeakReference<Object> recyclerView;
+        final long statusId;
+        final int topOffset;
+        final int layoutOffset;
+        final int generation;
+        final long untilElapsedMs;
+
+        TimelineViewportAnchor(
+            Object recyclerView,
+            long statusId,
+            int topOffset,
+            int layoutOffset,
+            int generation,
+            long untilElapsedMs
+        ) {
+            this.recyclerView = new WeakReference<>(recyclerView);
+            this.statusId = statusId;
+            this.topOffset = topOffset;
+            this.layoutOffset = layoutOffset;
+            this.generation = generation;
+            this.untilElapsedMs = untilElapsedMs;
+        }
     }
 
     private static final class TimelineRecyclerOwner {
@@ -2561,6 +2590,9 @@ public class WeiboLiteHook {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    if (hasActiveTimelineGapFill()) {
+                        captureTimelineGapFillViewportAnchor("presenter-addData-before");
+                    }
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
                         int incoming = param.args[0] instanceof List ? ((List) param.args[0]).size() : -1;
                         log("Timeline addData suppressed stable-cache incoming=" + incoming);
@@ -2608,12 +2640,14 @@ public class WeiboLiteHook {
                     }
                     if (gapFillActive) {
                         if (pauseTimelineGapFillOnEmptyPage(param.thisObject, incomingData, mergedData, "presenter-addData")) {
+                            scheduleTimelineGapFillViewportAnchorRestore("presenter-addData-empty");
                             return;
                         }
                         markTimelineNoMoreIfEmptyPage(param.thisObject, incomingData, "presenter-addData");
                         continueTimelineGapFill(param.thisObject, mergedData, "presenter-addData");
                         checkpointTimelineGapFillCache(param.thisObject, mergedData, "presenter-addData");
                         consumePendingTimelineNoMoreContent("presenter-addData-gap");
+                        scheduleTimelineGapFillViewportAnchorRestore("presenter-addData-gap");
                         return;
                     }
                     normalizePresenterTimeline(param.thisObject, "presenter-addData");
@@ -4917,6 +4951,7 @@ public class WeiboLiteHook {
                 int after = callIntMethodSafe(adapter, "getCount", -1);
                 int validAfter = getTimelineAdapterValidStatusCount(adapter, after);
                 updated++;
+                scheduleTimelineGapFillViewportAnchorRestore(source + "-adapter-sync");
                 log("Timeline adapter synchronized source=" + source
                     + " recycler=" + identityText(recyclerView)
                     + " before=" + before + " validBefore=" + validBefore
@@ -7919,6 +7954,186 @@ public class WeiboLiteHook {
         }
     }
 
+    private static void captureTimelineGapFillViewportAnchor(String source) {
+        try {
+            Object recyclerView = getCurrentHomeTimelineRecyclerView();
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return;
+
+            Object layoutManager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
+            Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
+            if (layoutManager == null || adapter == null) return;
+
+            int first = callIntMethodSafe(layoutManager, "findFirstVisibleItemPosition", -1);
+            int last = callIntMethodSafe(layoutManager, "findLastVisibleItemPosition", -1);
+            if (first < 0 || last < 0) return;
+
+            int min = Math.min(first, last);
+            int max = Math.max(first, last);
+            int headerCount = Math.max(0, callIntMethodSafe(adapter, "getHeaderCount", 0));
+            int anchorPosition = -1;
+            long anchorStatusId = 0L;
+            int anchorTop = Integer.MAX_VALUE;
+            int anchorBottom = Integer.MIN_VALUE;
+
+            long lastReadStatusId = getLastReadStatusId();
+            if (lastReadStatusId > 0L) {
+                int lastReadPosition = getTimelineStatusAdapterPosition(recyclerView, lastReadStatusId);
+                if (lastReadPosition >= min && lastReadPosition <= max) {
+                    Object child = XposedHelpers.callMethod(
+                        layoutManager,
+                        "findViewByPosition",
+                        lastReadPosition
+                    );
+                    if (child instanceof View) {
+                        anchorPosition = lastReadPosition;
+                        anchorStatusId = lastReadStatusId;
+                        anchorTop = ((View) child).getTop();
+                        anchorBottom = ((View) child).getBottom();
+                    }
+                }
+            }
+
+            if (anchorStatusId <= 0L) {
+                for (int position = min; position <= max; position++) {
+                    int dataPosition = position - headerCount;
+                    long statusId = getTimelineAdapterDataStatusId(adapter, dataPosition);
+                    if (statusId <= 0L) continue;
+                    Object child = XposedHelpers.callMethod(
+                        layoutManager,
+                        "findViewByPosition",
+                        position
+                    );
+                    if (!(child instanceof View)) continue;
+                    int childTop = ((View) child).getTop();
+                    if (anchorPosition < 0 || childTop < anchorTop) {
+                        anchorPosition = position;
+                        anchorStatusId = statusId;
+                        anchorTop = childTop;
+                        anchorBottom = ((View) child).getBottom();
+                    }
+                }
+            }
+            if (anchorPosition < 0 || anchorStatusId <= 0L
+                || anchorTop == Integer.MAX_VALUE || anchorBottom == Integer.MIN_VALUE) {
+                return;
+            }
+
+            int generation;
+            int topOffset = Math.max(0, anchorTop);
+            int layoutOffset;
+            if (callBooleanMethodSafe(layoutManager, "getReverseLayout")) {
+                int height = callIntMethodSafe(recyclerView, "getHeight", 0);
+                int paddingBottom = callIntMethodSafe(recyclerView, "getPaddingBottom", 0);
+                layoutOffset = height - paddingBottom - anchorBottom;
+            } else {
+                int paddingTop = callIntMethodSafe(recyclerView, "getPaddingTop", 0);
+                layoutOffset = anchorTop - paddingTop;
+            }
+            synchronized (WeiboLiteHook.class) {
+                generation = ++sTimelineGapFillViewportAnchorGeneration;
+                sTimelineGapFillViewportAnchor = new TimelineViewportAnchor(
+                    recyclerView,
+                    anchorStatusId,
+                    topOffset,
+                    layoutOffset,
+                    generation,
+                    SystemClock.elapsedRealtime() + 3500L
+                );
+            }
+            log("Timeline gap-fill viewport anchor captured source=" + source
+                + " id=" + anchorStatusId
+                + " position=" + anchorPosition
+                + " top=" + topOffset
+                + " layoutOffset=" + layoutOffset
+                + " visible=" + min + ".." + max
+                + " generation=" + generation);
+        } catch (Throwable t) {
+            log("Timeline gap-fill viewport anchor capture error source=" + source + ": " + t.getMessage());
+        }
+    }
+
+    private static void scheduleTimelineGapFillViewportAnchorRestore(String source) {
+        final TimelineViewportAnchor anchor;
+        long now = SystemClock.elapsedRealtime();
+        synchronized (WeiboLiteHook.class) {
+            anchor = sTimelineGapFillViewportAnchor;
+            if (anchor == null || now > anchor.untilElapsedMs) return;
+            if (sTimelineGapFillViewportAnchorScheduledGeneration == anchor.generation
+                && now - sTimelineGapFillViewportAnchorScheduledAtMs < 40L) {
+                return;
+            }
+            sTimelineGapFillViewportAnchorScheduledGeneration = anchor.generation;
+            sTimelineGapFillViewportAnchorScheduledAtMs = now;
+        }
+        long[] delays = {0L, 80L, 300L, 900L};
+        for (int i = 0; i < delays.length; i++) {
+            final int attempt = i;
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    restoreTimelineGapFillViewportAnchor(anchor, source, attempt);
+                }
+            }, delays[i]);
+        }
+    }
+
+    private static void restoreTimelineGapFillViewportAnchor(
+        TimelineViewportAnchor anchor,
+        String source,
+        int attempt
+    ) {
+        try {
+            if (anchor == null || SystemClock.elapsedRealtime() > anchor.untilElapsedMs) return;
+            synchronized (WeiboLiteHook.class) {
+                if (sTimelineGapFillViewportAnchor != anchor
+                    || sTimelineGapFillViewportAnchorGeneration != anchor.generation) {
+                    return;
+                }
+            }
+
+            Object recyclerView = anchor.recyclerView.get();
+            if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return;
+            int target = getTimelineStatusAdapterPosition(recyclerView, anchor.statusId);
+            if (target < 0) return;
+
+            Object layoutManager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
+            XposedHelpers.callMethod(
+                layoutManager,
+                "scrollToPositionWithOffset",
+                target,
+                anchor.layoutOffset
+            );
+            if (attempt == 0 || attempt == 3) {
+                log("Timeline gap-fill viewport anchor restored source=" + source
+                    + " id=" + anchor.statusId
+                    + " target=" + target
+                    + " top=" + anchor.topOffset
+                    + " layoutOffset=" + anchor.layoutOffset
+                    + " attempt=" + attempt
+                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+            }
+        } catch (Throwable t) {
+            if (attempt == 3) {
+                log("Timeline gap-fill viewport anchor restore error source=" + source
+                    + ": " + t.getMessage());
+            }
+        }
+    }
+
+    private static void cancelTimelineGapFillViewportAnchor(String source) {
+        boolean cancelled = false;
+        synchronized (WeiboLiteHook.class) {
+            if (sTimelineGapFillViewportAnchor != null) {
+                cancelled = true;
+                sTimelineGapFillViewportAnchor = null;
+                sTimelineGapFillViewportAnchorGeneration++;
+            }
+        }
+        if (cancelled) {
+            log("Timeline gap-fill viewport anchor cancelled source=" + source);
+        }
+    }
+
     private static boolean scheduleTimelineRefreshAnchorForKnownRecyclerViews(String source) {
         long statusId = getActiveTimelineRefreshAnchorStatusId();
         if (statusId <= 0L) return false;
@@ -8532,6 +8747,7 @@ public class WeiboLiteHook {
 
     private static void markTimelineLastReadTouched(Object recyclerView) {
         if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return;
+        cancelTimelineGapFillViewportAnchor("user-touch");
         synchronized (sTimelineUserMovedAt) {
             sTimelineUserMovedAt.put(recyclerView, Long.valueOf(SystemClock.elapsedRealtime()));
         }
