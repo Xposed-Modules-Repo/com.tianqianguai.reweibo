@@ -32,6 +32,41 @@ Device: `192.168.6.17:5555` (Xiaomi, Android 16). Reconnect with `adb connect 19
 
 **When testing, simulate interactions yourself via adb.** Don't ask the user to tap buttons. Use `adb shell input tap x y` for taps, `adb shell input swipe` for scrolls. First confirm the target app is in the foreground with `adb shell dumpsys activity activities | grep mFocusedApp`.
 
+## Release notes
+
+When preparing a release:
+
+- Compare the previous release tag with the release commit and cover the complete interval, including any final uncommitted fixes that will ship.
+- Keep `CHANGELOG.md`, `docs/release/<version>.md`, README feature descriptions, and the GitHub Release body consistent.
+- Write release notes in both Chinese and English. The Chinese and English sections must describe the same shipped behavior.
+- Use the template below. Omit `修复` / `Fixes` only when the release contains no fixes.
+- Do not add `模块元数据` / `Module Metadata`, `验证` / `Verification`, `APK 校验` / `APK Checksum`, or `已知限制` / `Known Limit` sections unless the user explicitly requests them.
+- Use `docs/release/<version>.md` verbatim as the GitHub Release body.
+
+```markdown
+# ReWeibo <version>
+
+<中文版本摘要>
+
+<English release summary>
+
+## 新增与改进
+
+- <覆盖上个 release tag 至本次版本的中文更新内容>
+
+## Added And Improved
+
+- <English updates covering the same release interval>
+
+## 修复
+
+- <中文修复内容>
+
+## Fixes
+
+- <English fixes matching the Chinese section>
+```
+
 ## Debugging
 
 - **Use persistent file logging, NOT logcat buffer.** `XposedBridge.log()` goes to logcat which can overflow or get cleared. For durable logs, write to target app's internal storage via `context.getDir()` or `context.getFilesDir()`. Example: `new File(context.getFilesDir(), "reweibo.log")`.
