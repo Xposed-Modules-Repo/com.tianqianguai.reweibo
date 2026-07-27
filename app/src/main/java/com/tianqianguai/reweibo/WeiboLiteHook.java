@@ -1672,7 +1672,11 @@ public class WeiboLiteHook {
         Object builder = getTimelineCacheBuilder(action);
         TimelineCacheLoad load = loadTimelineCacheSingleSource(action, builder, "manual-range-clear");
         List diskStatuses = load == null ? null : load.statuses;
-        ArrayList merged = mergeTimelineStatusLists(diskStatuses, cumulativeStatuses, liveStatuses);
+        ArrayList merged = mergeTimelineCacheRangeClearSources(
+            liveStatuses,
+            cumulativeStatuses,
+            diskStatuses
+        );
         TimelineCacheRangeFilterResult filtered = filterTimelineCacheRange(
             merged,
             startMs,
@@ -1686,6 +1690,7 @@ public class WeiboLiteHook {
                 false
             )
         );
+        hydrateTimelineStatusText(retained, "manual-range-clear");
         String maxId = retained.isEmpty() ? "0" : getTimelineCacheMaxId(action, retained);
         ArrayList adapterModels = buildTimelineStatusModels(
             retained,
@@ -5403,6 +5408,14 @@ public class WeiboLiteHook {
         }
     }
 
+    static ArrayList mergeTimelineCacheRangeClearSources(
+        List liveStatuses,
+        List cumulativeStatuses,
+        List diskStatuses
+    ) {
+        return mergeTimelineStatusLists(liveStatuses, cumulativeStatuses, diskStatuses);
+    }
+
     static ArrayList mergeTimelineStatusLists(List first, List second, List third) {
         LinkedHashMap<Long, Object> merged = new LinkedHashMap<>();
         List[] sources = new List[] { first, second, third };
@@ -6949,7 +6962,11 @@ public class WeiboLiteHook {
             int margin = dpToPx(anchor, 16);
             lp.leftMargin = margin;
             lp.rightMargin = margin;
-            lp.topMargin = getTimelineTopOffset(anchor) + dpToPx(anchor, 10);
+            int contentTop = Math.max(
+                getTimelineTopOffset(anchor),
+                getTimelineOverlaySafeTopInset(anchor, parent)
+            );
+            lp.topMargin = contentTop + dpToPx(anchor, 10);
             lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
             parent.addView(card, lp);
 
@@ -6976,6 +6993,42 @@ public class WeiboLiteHook {
             return findTimelineMarkerParent(view);
         } catch (Throwable ignored) {
             return findTimelineMarkerParent(view);
+        }
+    }
+
+    private static int getTimelineOverlaySafeTopInset(View anchor, View parent) {
+        try {
+            int safeTop = 0;
+            android.view.WindowInsets insets = anchor.getRootWindowInsets();
+            if (insets != null) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    safeTop = insets.getInsets(
+                        android.view.WindowInsets.Type.statusBars()
+                            | android.view.WindowInsets.Type.displayCutout()
+                    ).top;
+                } else {
+                    safeTop = insets.getSystemWindowInsetTop();
+                    android.view.DisplayCutout cutout = insets.getDisplayCutout();
+                    if (cutout != null) {
+                        safeTop = Math.max(safeTop, cutout.getSafeInsetTop());
+                    }
+                }
+            }
+            if (safeTop <= 0) {
+                int resourceId = anchor.getResources().getIdentifier(
+                    "status_bar_height",
+                    "dimen",
+                    "android"
+                );
+                if (resourceId > 0) {
+                    safeTop = anchor.getResources().getDimensionPixelSize(resourceId);
+                }
+            }
+            int[] parentLocation = new int[2];
+            parent.getLocationInWindow(parentLocation);
+            return Math.max(0, safeTop - Math.max(0, parentLocation[1]));
+        } catch (Throwable ignored) {
+            return 0;
         }
     }
 

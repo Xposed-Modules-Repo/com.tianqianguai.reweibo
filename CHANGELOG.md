@@ -2,19 +2,27 @@
 
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 ### 中文
 
+- 将大型时间线缓存的读取、合并、过滤、正文/媒体补齐和断层扫描移出主线程，并合并重复恢复请求，降低大缓存恢复时的 ANR、重复读取和部分写入风险。
 - 在微博轻享版内的 ReWeibo 设置中新增按发布时间范围清除缓存微博；既支持日历选择，也支持 `7号`、`7-7`、完整日期时间等松散输入，单独日期按整天处理。清理会同步更新原生缓存、shadow cache 与当前内存时间线，并阻止旧的异步任务回写已删除内容。
+- 修复按日期清理后，未被删除日期的当前可见微博只剩作者和互动数、正文区域为空的问题；清理现在优先保留当前已渲染对象，并重新补齐保留微博的正文与媒体字段。
 - 时间线“跳转”同步支持 `7号`、`7-11`、中文完整日期等松散日期；仅输入日期时只在当天微博中定位，并优先滚动当前主时间线。
+- 在首页增加“跳转”和“删除”快捷按钮，并允许在 ReWeibo 设置中分别控制两个按钮是否显示。
 - 修复清理或刷新后旧 Fragment 的短列表仍被误当成首页，以及广告、重复项混入列表尾部导致边界跳错的问题；缓存恢复现在会直接同步当前首页 Adapter，清理会同时刷新所有仍存活的首页实例，双击、日期跳转和阅读位置只允许当前可见首页响应，避免几十条短页或伪尾项提前显示“没有更多内容”。
+- 断层补齐新增可见微博锚点捕获与恢复，批量插入历史微博时保持当前阅读位置；补齐进度窗同时避开状态栏和刘海安全区。
 
 ### English
 
+- Moves large timeline-cache loading, merging, filtering, text/media hydration, and gap scanning off the main thread, while coalescing duplicate restores to reduce ANRs, duplicate reads, and partial-write risk.
 - Adds inclusive publication-time range clearing to the in-app ReWeibo settings, with both calendar selection and loose typed dates (date-only input covers the whole day), while updating native, shadow, and in-memory caches and blocking stale asynchronous writes.
+- Fixes retained visible statuses becoming metadata-only rows with blank bodies after clearing another date; range clearing now prefers currently rendered objects and rehydrates text and media for every retained status.
 - Extends timeline jump input to loose dates such as `7号`, `7-11`, and full Chinese dates; date-only input searches only that day and targets the primary timeline.
+- Adds home timeline “跳转” and “删除” shortcuts, each independently configurable from ReWeibo settings.
 - Prevents stale or hidden timeline fragments and duplicate/ad tail rows from creating a false timeline boundary after clearing or refreshing; restored cache data is applied to the visible home adapter, while double-tap, time-jump, and last-read actions are scoped to the current home timeline.
+- Captures and restores the visible-status anchor during gap filling so inserted history does not move the current reading position, and keeps the progress card below status-bar and display-cutout insets.
 
 ## 1.0.1
 

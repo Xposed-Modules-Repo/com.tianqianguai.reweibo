@@ -96,6 +96,22 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun cacheRangeClearKeepsTheCurrentlyRenderedStatusInstance() {
+        val liveRendered = TestStatus(24L, "live-rendered")
+        val cumulativeDuplicate = TestStatus(24L, "cumulative")
+        val diskDuplicate = TestStatus(24L, "disk-deserialized")
+
+        val merged = WeiboLiteHook.mergeTimelineCacheRangeClearSources(
+            listOf(liveRendered),
+            listOf(cumulativeDuplicate),
+            listOf(diskDuplicate)
+        )
+
+        assertEquals(1, merged.size)
+        assertSame(liveRendered, merged[0])
+    }
+
+    @Test
     fun disjointFreshCacheCannotOverwriteHistoricalShadow() {
         val now = 1_800_000_000_000L
         val cutoff = now - 30 * 24 * 60 * 60 * 1000L
