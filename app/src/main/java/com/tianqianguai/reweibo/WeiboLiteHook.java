@@ -182,6 +182,7 @@ public class WeiboLiteHook {
     private static Context sWeicoContext = null;
     private static volatile boolean sTimelineCacheDaysSettingConfirmed = false;
     private static volatile boolean sTimelineCacheClearInFlight = false;
+    private static volatile boolean sTimelineCacheClearDialogLoading = false;
     private static TimelineNativePersistRequest sPendingTimelineNativePersist = null;
     private static TimelineShadowPersistRequest sPendingTimelineShadowPersist = null;
     private static boolean sTimelinePersistWorkerScheduled = false;
@@ -1129,8 +1130,57 @@ public class WeiboLiteHook {
     }
 
     private static void showTimelineCacheClearRangeDialog(final Activity activity) {
+        if (activity == null) return;
+        synchronized (WeiboLiteHook.class) {
+            if (sTimelineCacheClearInFlight) {
+                Toast.makeText(activity, "缓存正在清理，请稍候", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if (sTimelineCacheClearDialogLoading) {
+                Toast.makeText(activity, "正在读取缓存范围，请稍候", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            sTimelineCacheClearDialogLoading = true;
+        }
+
+        final Object presenter = sLastTimelinePresenter;
+        Toast.makeText(activity, "正在读取缓存范围，请稍候", Toast.LENGTH_SHORT).show();
+        log("Timeline cache-clear dialog stats loading");
         try {
-            TimelineCacheStats stats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+            sTimelineRestoreExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    TimelineCacheStats loadedStats;
+                    try {
+                        loadedStats = buildBestTimelineCacheStats(presenter);
+                    } catch (Throwable t) {
+                        log("Timeline cache-clear dialog stats error: " + t.getMessage());
+                        loadedStats = new TimelineCacheStats();
+                    }
+                    final TimelineCacheStats stats = loadedStats;
+                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            sTimelineCacheClearDialogLoading = false;
+                            if (activity.isFinishing()) return;
+                            log("Timeline cache-clear dialog stats ready count=" + stats.count);
+                            showTimelineCacheClearRangeDialog(activity, stats);
+                        }
+                    });
+                }
+            });
+        } catch (Throwable t) {
+            sTimelineCacheClearDialogLoading = false;
+            log("Timeline cache-clear dialog schedule error: " + t.getMessage());
+            Toast.makeText(activity, "无法读取缓存范围，请重试", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private static void showTimelineCacheClearRangeDialog(
+        final Activity activity,
+        TimelineCacheStats stats
+    ) {
+        try {
             long nowMs = System.currentTimeMillis();
             long initialStart = stats != null && stats.oldestMs > 0L
                 ? stats.oldestMs
