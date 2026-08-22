@@ -121,6 +121,7 @@ public class WeiboLiteHook {
     private static final int TIMELINE_GAP_FILL_EMPTY_PROOF_MIN = 4;
     private static final int TIMELINE_GAP_FILL_CHECKPOINT_PAGES = 5;
     private static final int TIMELINE_GAP_FILL_CHECKPOINT_ITEMS = 100;
+    private static final int TIMELINE_VERIFIED_NATURAL_GAP_LIMIT = 128;
     private static final int TIMELINE_PRELOAD_CHECKPOINT_ITEMS = 500;
     private static final int PRELOAD_DONE_MIN_ITEMS = 1300;
     private static final int PRELOAD_STABLE_DONE_ROUNDS = 8;
@@ -139,6 +140,8 @@ public class WeiboLiteHook {
     private static final String TIMELINE_SHADOW_CACHE_FILE = "reweibo_weico_full_cache_shadow.txt";
     private static final String TIMELINE_SHADOW_CACHE_META_FILE = "reweibo_weico_full_cache_shadow.meta";
     private static final String TIMELINE_NATIVE_CACHE_BACKUP_SUFFIX = ".reweibo-native-backup";
+    private static final String TIMELINE_VERIFIED_NATURAL_GAPS_PREFIX =
+        "reweibo_weico_verified_natural_gaps_";
     private static final String TIMELINE_CLEAR_TIME_PATTERN = "yyyy-MM-dd HH:mm";
     private static final Map<Object, PreloadState> sPreloadStates = new WeakHashMap<>();
     private static final Map<Object, TopAnchorState> sTopAnchorStates = new WeakHashMap<>();
@@ -148,6 +151,9 @@ public class WeiboLiteHook {
     private static final Map<Object, Integer> sPersistedTimelineCacheCounts = new WeakHashMap<>();
     private static final Map<Object, Long> sPersistedTimelineCacheNewestIds = new WeakHashMap<>();
     private static final Map<Object, Boolean> sRestoringTimelineCaches = new WeakHashMap<>();
+    private static final Object sTimelineVerifiedNaturalGapsLock = new Object();
+    private static final LinkedHashMap<String, Boolean> sTimelineVerifiedNaturalGaps = new LinkedHashMap<>();
+    private static String sTimelineVerifiedNaturalGapsScope = null;
     private static final Map<Object, TimelineRestoreState> sTimelineRestoreStates = new WeakHashMap<>();
     private static final Map<View, Boolean> sReWeiboProfileRows = new WeakHashMap<>();
     private static final ConcurrentHashMap<Class<?>, ConcurrentHashMap<String, FieldLookup>> sFieldLookups = new ConcurrentHashMap<>();
@@ -2680,6 +2686,11 @@ public class WeiboLiteHook {
                     if (param.args != null && param.args.length > 0 && param.args[0] instanceof List) {
                         incomingData = (List) param.args[0];
                         if (gapFillActive) {
+                            confirmTimelineGapBoundaryCrossed(
+                                param.thisObject,
+                                incomingData,
+                                "presenter-addData"
+                            );
                             mergedData = mergeTimelineCumulativeStatuses(
                                 incomingData,
                                 param.thisObject,
@@ -4255,6 +4266,15 @@ public class WeiboLiteHook {
         return new File("/data/data/com.weico.international/files", TIMELINE_SHADOW_CACHE_META_FILE);
     }
 
+    private static File getTimelineVerifiedNaturalGapsFile(String scope) {
+        String safeScope = scope == null ? "default" : scope.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (safeScope.length() > 96) safeScope = safeScope.substring(0, 96);
+        return new File(
+            "/data/data/com.weico.international/files",
+            TIMELINE_VERIFIED_NATURAL_GAPS_PREFIX + safeScope + ".txt"
+        );
+    }
+
     private static void forgetTimelinePreloadDone(String source) {
         try {
             File marker = getPreloadDoneFile();
@@ -4570,8 +4590,7 @@ public class WeiboLiteHook {
         ArrayList statuses = new ArrayList(records.size());
         LinkedHashMap<Long, Object> statusesById = new LinkedHashMap<>();
         TimelineCacheStats stats = new TimelineCacheStats();
-        TimelineGapScan gapScan = new TimelineGapScan();
-        long previousId = 0L;
+        TimelineGapScan gapScan;
         for (int i = 0; i < records.size(); i++) {
             TimelinePreparedStatus record = records.get(i);
             statuses.add(record.status);
@@ -4582,21 +4601,12 @@ public class WeiboLiteHook {
                 if (stats.newestMs <= 0L || record.createdMs > stats.newestMs) stats.newestMs = record.createdMs;
                 if (stats.oldestMs <= 0L || record.createdMs < stats.oldestMs) stats.oldestMs = record.createdMs;
             }
-            if (gapScan.gap == null && previousId > record.id) {
-                long distance = previousId - record.id;
-                if (distance >= TIMELINE_GAP_ID_THRESHOLD) {
-                    TimelineGap gap = new TimelineGap();
-                    gap.cursorId = previousId;
-                    gap.targetId = record.id;
-                    gap.distance = distance;
-                    gap.index = i;
-                    gapScan.gap = gap;
-                }
-            }
-            previousId = record.id;
             if ((i & 0xff) == 0xff) Thread.yield();
         }
-        gapScan.count = statuses.size();
+        gapScan = scanTimelineGap(
+            statuses,
+            getTimelineVerifiedNaturalGapKeys(request.presenter)
+        );
         hydrateTimelineStatusText(statuses, "reweibo-cache-background");
         long newestId = records.isEmpty() ? 0L : records.get(0).id;
         String maxId = records.isEmpty() ? "0" : String.valueOf(records.get(records.size() - 1).id);
@@ -6466,8 +6476,17 @@ public class WeiboLiteHook {
                 }
                 data = sortTimelineNewestFirst(data, presenter, source + "-gap-fill", false);
             }
-            TimelineGap gap = updateTimelineGapFill(presenter, data, source, false, true);
-            if (gap == null) return;
+            TimelineGapScan scan = scanTimelineGap(
+                data,
+                getTimelineVerifiedNaturalGapKeys(presenter)
+            );
+            TimelineGap gap = updateTimelineGapFill(presenter, source, false, true, scan);
+            if (gap == null) {
+                if (scan.gap == null) {
+                    scheduleTimelinePreload(presenter, source + "-gap-fill-complete");
+                }
+                return;
+            }
 
             Object action = getTimelineAction(presenter);
             if (action != null) {
@@ -6523,7 +6542,7 @@ public class WeiboLiteHook {
                 source,
                 allowStart,
                 responseArrived,
-                scanTimelineGap(sorted)
+                scanTimelineGap(sorted, getTimelineVerifiedNaturalGapKeys(presenter))
             );
         } catch (Throwable t) {
             log("Timeline gap-fill scan error source=" + source + ": " + t.getMessage());
@@ -6655,32 +6674,221 @@ public class WeiboLiteHook {
         return copy;
     }
 
-    private static TimelineGapScan scanTimelineGap(List list) {
+    private static TimelineGapScan scanTimelineGap(List list, Map<String, Boolean> verifiedGaps) {
         ArrayList statuses = collectTimelineStatuses(list);
         TimelineGapScan scan = new TimelineGapScan();
         scan.count = statuses.size();
         if (statuses.size() < 2) return scan;
 
-        long previousId = 0L;
+        long[] orderedIds = new long[statuses.size()];
         for (int i = 0; i < statuses.size(); i++) {
             Object status = unwrapStatus(statuses.get(i));
-            long id = getStatusId(status);
+            orderedIds[i] = getStatusId(status);
+        }
+        long[] candidate = findTimelineGapCandidate(orderedIds, verifiedGaps);
+        if (candidate != null) {
+            TimelineGap gap = new TimelineGap();
+            gap.cursorId = candidate[0];
+            gap.targetId = candidate[1];
+            gap.distance = candidate[2];
+            gap.index = (int) candidate[3];
+            scan.gap = gap;
+        }
+        return scan;
+    }
+
+    static long[] findTimelineGapCandidate(long[] orderedIds, Map<String, Boolean> verifiedGaps) {
+        if (orderedIds == null || orderedIds.length < 2) return null;
+        long previousId = 0L;
+        for (int i = 0; i < orderedIds.length; i++) {
+            long id = orderedIds[i];
             if (id <= 0L) continue;
             if (previousId > id) {
                 long distance = previousId - id;
-                if (distance >= TIMELINE_GAP_ID_THRESHOLD) {
-                    TimelineGap gap = new TimelineGap();
-                    gap.cursorId = previousId;
-                    gap.targetId = id;
-                    gap.distance = distance;
-                    gap.index = i;
-                    scan.gap = gap;
-                    return scan;
+                if (distance >= TIMELINE_GAP_ID_THRESHOLD
+                    && (verifiedGaps == null
+                        || !verifiedGaps.containsKey(timelineGapKey(previousId, id)))) {
+                    return new long[] {previousId, id, distance, i};
                 }
             }
             previousId = id;
         }
-        return scan;
+        return null;
+    }
+
+    static String timelineGapKey(long cursorId, long targetId) {
+        return cursorId + ":" + targetId;
+    }
+
+    static boolean shouldVerifyTimelineGapFromResponse(
+        long gapCursorId,
+        long targetId,
+        long requestedCursorId,
+        long returnedMaxId,
+        long returnedMinId,
+        int returnedCount,
+        boolean containsTarget
+    ) {
+        return gapCursorId > targetId
+            && requestedCursorId > targetId
+            && requestedCursorId <= gapCursorId
+            && returnedCount > 0
+            && returnedMaxId > 0L
+            && returnedMaxId <= gapCursorId
+            && returnedMinId > 0L
+            && (containsTarget || returnedMinId < targetId);
+    }
+
+    private static void confirmTimelineGapBoundaryCrossed(
+        Object presenter,
+        List incomingData,
+        String source
+    ) {
+        if (presenter == null || incomingData == null) return;
+        long gapCursorId;
+        long targetId;
+        long requestedCursorId;
+        synchronized (sTimelineGapFillState) {
+            GapFillState state = sTimelineGapFillState;
+            if (!state.active || !state.inFlight) return;
+            gapCursorId = state.gapCursorId;
+            targetId = state.targetId;
+            requestedCursorId = state.cursorId;
+        }
+
+        long returnedMaxId = 0L;
+        long returnedMinId = 0L;
+        int returnedCount = 0;
+        boolean containsTarget = false;
+        ArrayList statuses = collectTimelineStatuses(incomingData);
+        for (int i = 0; i < statuses.size(); i++) {
+            long id = getStatusId(unwrapStatus(statuses.get(i)));
+            if (id <= 0L) continue;
+            returnedCount++;
+            if (returnedMaxId <= 0L || id > returnedMaxId) returnedMaxId = id;
+            if (returnedMinId <= 0L || id < returnedMinId) returnedMinId = id;
+            if (id == targetId) containsTarget = true;
+        }
+        if (!shouldVerifyTimelineGapFromResponse(
+            gapCursorId,
+            targetId,
+            requestedCursorId,
+            returnedMaxId,
+            returnedMinId,
+            returnedCount,
+            containsTarget
+        )) {
+            return;
+        }
+
+        boolean added = rememberTimelineVerifiedNaturalGap(presenter, gapCursorId, targetId);
+        log("Timeline gap-fill boundary crossed source=" + source
+            + " gapCursor=" + gapCursorId
+            + " target=" + targetId
+            + " requestCursor=" + requestedCursorId
+            + " returnedMax=" + returnedMaxId
+            + " returnedMin=" + returnedMinId
+            + " returned=" + returnedCount
+            + " containsTarget=" + containsTarget
+            + " remembered=" + added);
+    }
+
+    private static Map<String, Boolean> getTimelineVerifiedNaturalGapKeys(Object presenter) {
+        String scope = resolveTimelineVerifiedNaturalGapScope(presenter);
+        synchronized (sTimelineVerifiedNaturalGapsLock) {
+            ensureTimelineVerifiedNaturalGapsLoadedLocked(scope);
+            return new LinkedHashMap<>(sTimelineVerifiedNaturalGaps);
+        }
+    }
+
+    private static boolean rememberTimelineVerifiedNaturalGap(
+        Object presenter,
+        long cursorId,
+        long targetId
+    ) {
+        if (cursorId <= targetId || targetId <= 0L) return false;
+        String scope = resolveTimelineVerifiedNaturalGapScope(presenter);
+        String key = timelineGapKey(cursorId, targetId);
+        String content;
+        synchronized (sTimelineVerifiedNaturalGapsLock) {
+            ensureTimelineVerifiedNaturalGapsLoadedLocked(scope);
+            if (sTimelineVerifiedNaturalGaps.containsKey(key)) return false;
+            sTimelineVerifiedNaturalGaps.put(key, Boolean.TRUE);
+            while (sTimelineVerifiedNaturalGaps.size() > TIMELINE_VERIFIED_NATURAL_GAP_LIMIT) {
+                String oldest = sTimelineVerifiedNaturalGaps.keySet().iterator().next();
+                sTimelineVerifiedNaturalGaps.remove(oldest);
+            }
+            content = buildTimelineVerifiedNaturalGapsContentLocked(scope);
+        }
+        try {
+            writeTextFileAtomically(getTimelineVerifiedNaturalGapsFile(scope), content);
+        } catch (Throwable t) {
+            log("Timeline verified natural gap persist error: " + t.getMessage());
+        }
+        return true;
+    }
+
+    private static String resolveTimelineVerifiedNaturalGapScope(Object presenter) {
+        try {
+            Object action = getTimelineAction(presenter);
+            if (action != null) {
+                Object builder = getTimelineCacheBuilder(action);
+                File nativeFile = getTimelineNativeCacheFile(builder);
+                if (nativeFile != null && hasMeaningfulString(nativeFile.getName())) {
+                    return nativeFile.getName();
+                }
+            }
+        } catch (Throwable ignored) {}
+        String shadowName = readTimelineShadowCacheFileName();
+        return hasMeaningfulString(shadowName) ? shadowName : "default";
+    }
+
+    private static void ensureTimelineVerifiedNaturalGapsLoadedLocked(String scope) {
+        String safeScope = hasMeaningfulString(scope) ? scope : "default";
+        if (safeScope.equals(sTimelineVerifiedNaturalGapsScope)) return;
+        sTimelineVerifiedNaturalGaps.clear();
+        sTimelineVerifiedNaturalGapsScope = safeScope;
+
+        BufferedReader reader = null;
+        try {
+            File file = getTimelineVerifiedNaturalGapsFile(safeScope);
+            if (!file.exists()) return;
+            reader = new BufferedReader(new FileReader(file));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!line.startsWith("gap=")) continue;
+                String key = line.substring("gap=".length()).trim();
+                if (!isTimelineGapKey(key)) continue;
+                sTimelineVerifiedNaturalGaps.put(key, Boolean.TRUE);
+                if (sTimelineVerifiedNaturalGaps.size() >= TIMELINE_VERIFIED_NATURAL_GAP_LIMIT) break;
+            }
+        } catch (Throwable t) {
+            log("Timeline verified natural gaps read error: " + t.getMessage());
+        } finally {
+            closeQuietly(reader);
+        }
+    }
+
+    private static boolean isTimelineGapKey(String key) {
+        if (!hasMeaningfulString(key)) return false;
+        int separator = key.indexOf(':');
+        if (separator <= 0 || separator >= key.length() - 1) return false;
+        try {
+            long cursorId = Long.parseLong(key.substring(0, separator));
+            long targetId = Long.parseLong(key.substring(separator + 1));
+            return cursorId > targetId && targetId > 0L;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static String buildTimelineVerifiedNaturalGapsContentLocked(String scope) {
+        StringBuilder content = new StringBuilder();
+        content.append("scope=").append(scope == null ? "default" : scope).append('\n');
+        for (String key : sTimelineVerifiedNaturalGaps.keySet()) {
+            content.append("gap=").append(key).append('\n');
+        }
+        return content.toString();
     }
 
     private static boolean hasActiveTimelineGapFill() {

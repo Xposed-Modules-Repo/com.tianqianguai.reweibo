@@ -447,4 +447,81 @@ class ExampleUnitTest {
             )
         )
     }
+
+    @Test
+    fun nonEmptyPageCrossingGapTargetVerifiesNaturalFeedPause() {
+        val gapCursor = 5_329_527_346_561_655L
+        val target = 5_329_438_413_685_926L
+
+        assertTrue(
+            WeiboLiteHook.shouldVerifyTimelineGapFromResponse(
+                gapCursor,
+                target,
+                gapCursor,
+                gapCursor,
+                5_329_411_676_835_391L,
+                24,
+                true
+            )
+        )
+        assertTrue(
+            WeiboLiteHook.shouldVerifyTimelineGapFromResponse(
+                gapCursor,
+                target,
+                gapCursor - 1L,
+                target - 1L,
+                5_329_410_987_134_511L,
+                24,
+                false
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldVerifyTimelineGapFromResponse(
+                gapCursor,
+                target,
+                gapCursor,
+                gapCursor,
+                target + 1L,
+                24,
+                false
+            )
+        )
+        assertFalse(
+            WeiboLiteHook.shouldVerifyTimelineGapFromResponse(
+                gapCursor,
+                target,
+                gapCursor,
+                0L,
+                0L,
+                0,
+                false
+            )
+        )
+    }
+
+    @Test
+    fun verifiedNaturalGapIsSkippedAndNextRealGapIsScanned() {
+        val firstCursor = 5_329_527_346_561_655L
+        val firstTarget = 5_329_438_413_685_926L
+        val secondCursor = 5_329_410_987_134_511L
+        val secondTarget = 5_329_269_320_319_843L
+        val ids = longArrayOf(firstCursor, firstTarget, secondCursor, secondTarget)
+
+        val first = WeiboLiteHook.findTimelineGapCandidate(ids, emptyMap())
+        assertNotNull(first)
+        assertArrayEquals(
+            longArrayOf(firstCursor, firstTarget, firstCursor - firstTarget, 1L),
+            first
+        )
+
+        val verified = linkedMapOf(
+            WeiboLiteHook.timelineGapKey(firstCursor, firstTarget) to true
+        )
+        val next = WeiboLiteHook.findTimelineGapCandidate(ids, verified)
+        assertNotNull(next)
+        assertArrayEquals(
+            longArrayOf(secondCursor, secondTarget, secondCursor - secondTarget, 3L),
+            next
+        )
+    }
 }
