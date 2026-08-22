@@ -2,6 +2,20 @@
 
 # Changelog
 
+## 1.1.1
+
+### 中文
+
+- 断层回补引入“已验证自然断层”记录：当补齐请求跨过边界、返回的数据不含目标微博时，将该间隔确认为信息流自身的自然断点并持久化保存（按缓存范围隔离，最多记住 128 条）；后续扫描自动跳过这些间隔并继续寻找下一个真实断层。
+- 修复打开“清除缓存”时间范围弹窗时在主线程统计大缓存导致的界面卡顿甚至 ANR；缓存范围现在改为后台线程读取并提示“正在读取缓存范围，请稍候”，读取中或清理进行中重复打开会得到相应提示而不再重复加载。
+- 补充自然断层判定与跳过逻辑的单元测试。
+
+### English
+
+- Adds verified natural-gap tracking to timeline gap filling: when a refill request crosses the boundary and returns data that does not contain the target status, the interval is confirmed as a natural feed pause and persisted per cache scope (up to 128 entries); later scans skip these intervals and continue searching for the next real gap.
+- Fixes UI freezes and ANRs caused by computing large-cache statistics on the main thread when opening the cache-clear range dialog; stats now load on a background thread with a “正在读取缓存范围，请稍候” toast, and reopening while loading or during an active clear shows a notice instead of reloading.
+- Adds unit tests covering verified-natural-gap detection and skipping.
+
 ## 1.1.0
 
 ### 中文
