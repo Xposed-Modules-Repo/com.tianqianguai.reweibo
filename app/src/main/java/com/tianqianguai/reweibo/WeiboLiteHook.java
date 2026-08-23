@@ -2853,35 +2853,67 @@ public class WeiboLiteHook {
         }
     }
 
+    private static boolean hookTimelineLambdaCandidates(
+        ClassLoader cl,
+        String label,
+        String[] classNames,
+        Class<?>[] parameterTypes,
+        XC_MethodHook callback
+    ) {
+        int count = Math.min(classNames.length, parameterTypes.length);
+        for (int i = 0; i < count; i++) {
+            try {
+                Class<?> lambdaClass = Class.forName(classNames[i], false, cl);
+                XposedHelpers.findAndHookMethod(lambdaClass, "invoke", parameterTypes[i], callback);
+                log(label + " hook installed class=" + classNames[i]
+                    + " invoke(" + parameterTypes[i].getName() + ")");
+                return true;
+            } catch (ClassNotFoundException ignored) {
+                // Try the next version-specific lambda name.
+            } catch (Throwable t) {
+                log(label + " candidate failed class=" + classNames[i] + ": " + t.getMessage());
+            }
+        }
+        return false;
+    }
+
     private static void hookV2TimelineDataOrder(ClassLoader cl) {
         try {
             Class<?> actionClass = Class.forName("com.weico.international.ui.indexv2.IndexV2Action", false, cl);
-            Class<?> batchClass = Class.forName("com.weico.international.ui.indexv2.IndexV2Action$doLoadData$4", false, cl);
-
-            XposedHelpers.findAndHookMethod(batchClass, "invoke", java.util.ArrayList.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        Object action = getOuterAction(param.thisObject);
-                        boolean loadNew = getBooleanFieldSafe(param.thisObject, "$isLoadNew", false);
-                        if (loadNew) {
-                            captureTimelineRefreshAnchorForKnownRecyclerViews(action, "v2-network-loadNew");
-                        }
-                        if (param.args[0] instanceof List) {
-                            List list = (List) param.args[0];
-                            hydrateTimelineStatusText(list, "v2-network");
-                            List filtered = filterTimelineAds(list, action, "v2-network");
-                            filtered = filterTimelineContentless(filtered, action, "v2-network");
-                            List ordered = ensureNewestFirst(filtered, action, "v2-network", loadNew);
-                            if (ordered != filtered) filtered = ordered;
-                            if (filtered != list) {
-                                replaceListContents(list, filtered, "v2-network");
-                                param.args[0] = filtered;
-                            }
+            XC_MethodHook networkHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object action = getOuterAction(param.thisObject);
+                    boolean loadNew = getTimelineLambdaLoadNew(param.thisObject);
+                    if (loadNew) {
+                        captureTimelineRefreshAnchorForKnownRecyclerViews(action, "v2-network-loadNew");
+                    }
+                    if (param.args[0] instanceof List) {
+                        List list = (List) param.args[0];
+                        hydrateTimelineStatusText(list, "v2-network");
+                        List filtered = filterTimelineAds(list, action, "v2-network");
+                        filtered = filterTimelineContentless(filtered, action, "v2-network");
+                        List ordered = ensureNewestFirst(filtered, action, "v2-network", loadNew);
+                        if (ordered != filtered) filtered = ordered;
+                        if (filtered != list) {
+                            replaceListContents(list, filtered, "v2-network");
+                            param.args[0] = filtered;
                         }
                     }
                 }
-            );
+            };
+            if (!hookTimelineLambdaCandidates(
+                cl,
+                "V2 timeline data-order",
+                new String[] {
+                    "com.weico.international.ui.indexv2.IndexV2Action$doLoadData$4",
+                    "com.weico.international.ui.indexv2.IndexV2Action$$ExternalSyntheticLambda28"
+                },
+                new Class<?>[] {java.util.ArrayList.class, Object.class},
+                networkHook
+            )) {
+                log("V2 timeline data-order network hook unavailable");
+            }
 
             XposedHelpers.findAndHookMethod(actionClass, "doLoadCache",
                 new XC_MethodHook() {
@@ -2910,7 +2942,6 @@ public class WeiboLiteHook {
     private static void hookV3TimelineDataOrder(ClassLoader cl) {
         try {
             Class<?> actionClass = Class.forName("com.weico.international.ui.indexv2.IndexV3Action", false, cl);
-            Class<?> batchClass = Class.forName("com.weico.international.ui.indexv2.IndexV3Action$doLoadData$1", false, cl);
             Class<?> feedResultClass = Class.forName("com.weico.international.ui.indexv2.FeedResult", false, cl);
 
             try {
@@ -2991,25 +3022,35 @@ public class WeiboLiteHook {
                 log("V3 timeline doLoadData probe hook error: " + t.getMessage());
             }
 
-            XposedHelpers.findAndHookMethod(batchClass, "invoke", feedResultClass,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        Object result = param.getResult();
-                        Object action = getOuterAction(param.thisObject);
-                        boolean loadNew = getBooleanFieldSafe(param.thisObject, "$isLoadNew", false);
-                        if (loadNew) {
-                            captureTimelineRefreshAnchorForKnownRecyclerViews(action, "v3-network-loadNew");
-                        }
-                        if (result instanceof List) {
-                            hydrateTimelineStatusText((List) result, "v3-network");
-                            List filtered = filterTimelineAds((List) result, action, "v3-network");
-                            filtered = filterTimelineContentless(filtered, action, "v3-network");
-                            param.setResult(ensureNewestFirst(filtered, action, "v3-network", loadNew));
-                        }
+            XC_MethodHook networkHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object result = param.getResult();
+                    Object action = getOuterAction(param.thisObject);
+                    boolean loadNew = getTimelineLambdaLoadNew(param.thisObject);
+                    if (loadNew) {
+                        captureTimelineRefreshAnchorForKnownRecyclerViews(action, "v3-network-loadNew");
+                    }
+                    if (result instanceof List) {
+                        hydrateTimelineStatusText((List) result, "v3-network");
+                        List filtered = filterTimelineAds((List) result, action, "v3-network");
+                        filtered = filterTimelineContentless(filtered, action, "v3-network");
+                        param.setResult(ensureNewestFirst(filtered, action, "v3-network", loadNew));
                     }
                 }
-            );
+            };
+            if (!hookTimelineLambdaCandidates(
+                cl,
+                "V3 timeline data-order",
+                new String[] {
+                    "com.weico.international.ui.indexv2.IndexV3Action$doLoadData$1",
+                    "com.weico.international.ui.indexv2.IndexV3Action$$ExternalSyntheticLambda2"
+                },
+                new Class<?>[] {feedResultClass, Object.class},
+                networkHook
+            )) {
+                log("V3 timeline data-order network hook unavailable");
+            }
 
             XposedHelpers.findAndHookMethod(actionClass, "doLoadCache",
                 new XC_MethodHook() {
@@ -10310,11 +10351,36 @@ public class WeiboLiteHook {
     }
 
     private static Object getOuterAction(Object lambda) {
+        if (lambda == null) return null;
         try {
-            return XposedHelpers.getObjectField(lambda, "this$0");
+            Object owner = XposedHelpers.getObjectField(lambda, "this$0");
+            if (owner != null) return owner;
         } catch (Throwable ignored) {
-            return null;
         }
+        String[] capturedFields = new String[] {"f$0", "f$1"};
+        for (int i = 0; i < capturedFields.length; i++) {
+            Object owner = getFieldValueOrNull(lambda, capturedFields[i]);
+            if (isTimelineAction(owner)) return owner;
+        }
+        return null;
+    }
+
+    private static boolean isTimelineAction(Object value) {
+        if (value == null) return false;
+        String className = value.getClass().getName();
+        return "com.weico.international.ui.indexv2.IndexV2Action".equals(className)
+            || "com.weico.international.ui.indexv2.IndexV3Action".equals(className);
+    }
+
+    private static boolean getTimelineLambdaLoadNew(Object lambda) {
+        Object legacyValue = getFieldValueOrNull(lambda, "$isLoadNew");
+        if (legacyValue instanceof Boolean) return (Boolean) legacyValue;
+        String[] capturedFields = new String[] {"f$1", "f$2"};
+        for (int i = 0; i < capturedFields.length; i++) {
+            Object value = getFieldValueOrNull(lambda, capturedFields[i]);
+            if (value instanceof Boolean) return (Boolean) value;
+        }
+        return false;
     }
 
     private static boolean getBooleanFieldSafe(Object target, String field, boolean fallback) {
