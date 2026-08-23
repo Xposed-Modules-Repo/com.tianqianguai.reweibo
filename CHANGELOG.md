@@ -2,6 +2,18 @@
 
 # Changelog
 
+## 1.1.2
+
+### 中文
+
+- 兼容微博轻享版 6.9.8 的 V2/V3 时间线数据顺序 hook：支持 R8 生成的 `ExternalSyntheticLambda` 候选和 `invoke(Object)` 签名，同时保留旧版 `doLoadData` lambda 候选。
+- 修复微博轻享版 6.9.8 因匿名类名称和参数签名变化导致 V2/V3 时间线数据顺序 hook 未安装的问题，恢复广告过滤、无实际内容条目过滤和新微博在前排序。
+
+### English
+
+- Adds Weibo Lite 6.9.8 V2/V3 timeline data-order compatibility for R8-generated `ExternalSyntheticLambda` candidates and `invoke(Object)` signatures, while keeping older `doLoadData` lambda candidates supported.
+- Fixes Weibo Lite 6.9.8 V2/V3 timeline data-order hooks failing to install after anonymous-class names and parameter signatures changed, restoring ad filtering, contentless-entry filtering, and newest-first ordering.
+
 ## 1.1.1
 
 ### 中文

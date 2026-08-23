@@ -44,6 +44,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - 模块包名：`com.tianqianguai.reweibo`。
 - 入口：`assets/xposed_init` -> `com.tianqianguai.reweibo.MainHook`。
 - 模块描述：微博轻享版 LSPosed/Xposed 模块：去广告、反向时间线、阅读位置恢复
+- 微博轻享版 6.9.8：V2/V3 时间线数据顺序 hook 支持 R8 `ExternalSyntheticLambda` 候选，旧版 `doLoadData` lambda 候选仍受支持。
 
 ## Compatibility
 
@@ -53,6 +54,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - Module package: `com.tianqianguai.reweibo`.
 - Entry point: `assets/xposed_init` -> `com.tianqianguai.reweibo.MainHook`.
 - Module description: Weibo Lite LSPosed/Xposed module for ad removal, reversed timeline, and reading-position recovery.
+- Weibo Lite 6.9.8: V2/V3 timeline data-order hooks support R8 `ExternalSyntheticLambda` candidates, while older `doLoadData` lambda candidates remain supported.
 
 ## 安装
 
