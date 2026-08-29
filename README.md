@@ -4,6 +4,8 @@ ReWeibo 是一个面向微博轻享版（`com.weico.international`）的 LSPosed
 
 ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 
+[![Telegram Official Group](https://img.shields.io/badge/Telegram-Official_Group-26A5E4?logo=telegram&logoColor=white)](https://t.me/reweibo_offical)
+
 ## 功能
 
 - 跳过微博轻享版启动页广告和时间线广告路径。
