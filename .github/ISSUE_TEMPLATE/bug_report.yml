@@ -1,0 +1,96 @@
+name: 问题反馈 / Bug Report
+description: 报告可复现的问题，帮助我们更快定位和修复
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进 ReWeibo！请尽量完整填写以下信息。
+
+        Thank you for helping improve ReWeibo. Please provide as much detail as possible.
+
+  - type: dropdown
+    id: target_app
+    attributes:
+      label: 目标应用 / Target App
+      options:
+        - 微博轻享版 / Weibo Lite
+        - 新浪微博 / Weibo
+        - Share
+        - 其他 / Other
+    validations:
+      required: true
+
+  - type: input
+    id: target_version
+    attributes:
+      label: 目标应用版本 / Target App Version
+      placeholder: 例如 6.9.8 / e.g. 6.9.8
+    validations:
+      required: true
+
+  - type: input
+    id: module_version
+    attributes:
+      label: ReWeibo 版本 / ReWeibo Version
+      placeholder: 例如 1.1.2 / e.g. 1.1.2
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境 / Environment
+      description: 请填写 Android、LSPosed 和设备信息。
+      placeholder: |
+        Android：
+        LSPosed：
+        设备型号：
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述 / Problem Description
+      description: 请说明发生了什么，以及问题出现的频率。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to Reproduce
+      placeholder: |
+        1. 打开……
+        2. 点击……
+        3. 出现……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为 / Expected Behavior
+      description: 请说明你期望发生什么。
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图 / Logs or Screenshots
+      description: 可粘贴相关日志、上传日志文件或截图；请先移除账号、Token 等隐私信息。
+      placeholder: 微博轻享版日志位于 /data/data/com.weico.international/files/reweibo_weico.log
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认 / Pre-submission Checklist
+      options:
+        - label: 我已搜索现有 Issues，确认没有相同问题。 / I searched existing issues and found no duplicate.
+          required: true
+        - label: 我正在使用最新发布版本，或已确认问题在最新版仍存在。 / I use the latest release or confirmed the issue still exists there.
+          required: true
