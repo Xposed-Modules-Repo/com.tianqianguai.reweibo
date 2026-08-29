@@ -58,18 +58,3 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - Module description: Weibo Lite LSPosed/Xposed module for ad removal, reversed timeline, and reading-position recovery.
 - Weibo Lite 6.9.8: V2/V3 timeline data-order hooks support R8 `ExternalSyntheticLambda` candidates, while older `doLoadData` lambda candidates remain supported.
 
-## 安装
-
-1. 安装 APK。
-2. 在 LSPosed 中启用模块。
-3. 应用微博轻享版的推荐 scope。
-4. 强制停止并重新打开微博轻享版。
-
-## Install
-
-1. Install the APK.
-2. Enable the module in LSPosed.
-3. Apply the recommended scope for Weibo Lite.
-4. Force stop and reopen Weibo Lite.
-
-
