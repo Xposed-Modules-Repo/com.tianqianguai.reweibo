@@ -7,6 +7,7 @@ import android.app.DatePickerDialog;
 import android.app.TimePickerDialog;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
@@ -16,6 +17,7 @@ import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -243,6 +245,18 @@ public class WeiboLiteHook {
     private static long sTimelineGapFillViewportAnchorScheduledAtMs = 0L;
     private static WeakReference<Object> sLastActiveHomeTimelineRecyclerView = new WeakReference<>(null);
     private static WeakReference<Object> sLastActiveHomeTimelinePresenter = new WeakReference<>(null);
+    private static final Object sCliOperationLock = new Object();
+    private static volatile boolean sCliBridgeRegistered = false;
+    private static long sCliOperationSequence = 0L;
+    private static String sCliLastOperationId = "";
+    private static String sCliLastOperationCommand = "";
+    private static String sCliLastOperationState = "idle";
+    private static String sCliLastOperationMessage = "";
+    private static long sCliLastOperationUpdatedAtMs = 0L;
+    private static int sCliLastCacheCount = -1;
+    private static int sCliLastCacheDatedCount = -1;
+    private static long sCliLastCacheNewestMs = 0L;
+    private static long sCliLastCacheOldestMs = 0L;
 
     private static final class PreloadState {
         int requestedPages = 0;
@@ -1063,6 +1077,21 @@ public class WeiboLiteHook {
                         input.setError("保存失败，请重试");
                         return;
                     }
+                    boolean providerSaved = writeModuleSettingToProvider(
+                        ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS,
+                        days
+                    );
+                    providerSaved &= writeModuleSettingToProvider(
+                        ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                        jumpButtonToggle.isChecked() ? 1 : 0
+                    );
+                    providerSaved &= writeModuleSettingToProvider(
+                        ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+                        clearButtonToggle.isChecked() ? 1 : 0
+                    );
+                    if (!providerSaved) {
+                        log("Settings dialog kept target-pref fallback because Provider sync failed");
+                    }
                     rememberModuleIntSetting(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days);
                     refreshTimelineShortcutButtons("settings-saved");
                     if (sLastTimelinePresenter != null) {
@@ -1584,20 +1613,33 @@ public class WeiboLiteHook {
         final long startMs,
         final long endMs
     ) {
+        startTimelineCacheRangeClear(activity, startMs, endMs, null);
+    }
+
+    private static boolean startTimelineCacheRangeClear(
+        final Activity activity,
+        final long startMs,
+        final long endMs,
+        final String cliOperationId
+    ) {
         if (startMs <= 0L || endMs < startMs) {
-            Toast.makeText(activity, "清理时间范围无效", Toast.LENGTH_SHORT).show();
-            return;
+            showTimelineCacheClearToast(activity, "清理时间范围无效", Toast.LENGTH_SHORT);
+            return false;
         }
         final Object presenter = sLastTimelinePresenter;
         if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))
             || getTimelineAction(presenter) == null) {
-            Toast.makeText(activity, "请先打开首页时间线，待微博显示后再清理", Toast.LENGTH_LONG).show();
-            return;
+            showTimelineCacheClearToast(
+                activity,
+                "请先打开首页时间线，待微博显示后再清理",
+                Toast.LENGTH_LONG
+            );
+            return false;
         }
         synchronized (WeiboLiteHook.class) {
             if (sTimelineCacheClearInFlight) {
-                Toast.makeText(activity, "缓存正在清理，请稍候", Toast.LENGTH_SHORT).show();
-                return;
+                showTimelineCacheClearToast(activity, "缓存正在清理，请稍候", Toast.LENGTH_SHORT);
+                return false;
             }
             sTimelineCacheClearInFlight = true;
         }
@@ -1608,20 +1650,30 @@ public class WeiboLiteHook {
             cumulativeStatuses = new ArrayList(sTimelineCumulativeStatusesById.values());
         }
         prepareTimelineStateForCacheClear(presenter);
+        log("Timeline cache range clear prepared live=" + liveStatuses.size());
 
-        ProgressBar progressBar = new ProgressBar(activity);
-        int progressPadding = dpToPx(activity.getWindow().getDecorView(), 24);
-        progressBar.setPadding(progressPadding, progressPadding, progressPadding, progressPadding);
-        final AlertDialog progressDialog = new AlertDialog.Builder(activity)
-            .setTitle("正在清除缓存")
-            .setMessage("正在安全改写缓存文件，请勿关闭微博轻享版。")
-            .setView(progressBar)
-            .setCancelable(false)
-            .create();
-        progressDialog.setOnShowListener(ignored ->
-            styleDarkDialog(progressDialog, activity.getWindow().getDecorView())
-        );
-        progressDialog.show();
+        final AlertDialog progressDialog;
+        if (activity != null) {
+            ProgressBar progressBar = new ProgressBar(activity);
+            int progressPadding = dpToPx(activity.getWindow().getDecorView(), 24);
+            progressBar.setPadding(progressPadding, progressPadding, progressPadding, progressPadding);
+            progressDialog = new AlertDialog.Builder(activity)
+                .setTitle("正在清除缓存")
+                .setMessage("正在安全改写缓存文件，请勿关闭微博轻享版。")
+                .setView(progressBar)
+                .setCancelable(false)
+                .create();
+            progressDialog.setOnShowListener(ignored ->
+                styleDarkDialog(progressDialog, activity.getWindow().getDecorView())
+            );
+            progressDialog.show();
+        } else {
+            progressDialog = null;
+        }
+
+        if (cliOperationId != null) {
+            updateCliOperation(cliOperationId, "running", "rewriting timeline cache");
+        }
 
         sTimelinePersistExecutor.execute(new Runnable() {
             @Override
@@ -1646,31 +1698,52 @@ public class WeiboLiteHook {
                     @Override
                     public void run() {
                         try {
-                            if (progressDialog.isShowing()) progressDialog.dismiss();
+                            if (progressDialog != null && progressDialog.isShowing()) {
+                                progressDialog.dismiss();
+                            }
                             if (failure != null || completed == null) {
                                 resetPreloadState(presenter, "manual-cache-clear-failed");
                                 String detail = failure == null
                                     ? "unknown error"
                                     : failure.getClass().getSimpleName() + ": " + failure.getMessage();
                                 log("Timeline cache range clear failed: " + detail);
-                                Toast.makeText(activity, "缓存清理失败，请重试", Toast.LENGTH_LONG).show();
+                                showTimelineCacheClearToast(
+                                    activity,
+                                    "缓存清理失败，请重试",
+                                    Toast.LENGTH_LONG
+                                );
+                                if (cliOperationId != null) {
+                                    finishCliOperation(cliOperationId, "error", detail);
+                                }
                                 return;
                             }
                             applyTimelineCacheRangeClear(presenter, completed);
                             if (completed.removedCount <= 0) {
                                 resetPreloadState(presenter, "manual-cache-clear-empty");
-                                Toast.makeText(
+                                showTimelineCacheClearToast(
                                     activity,
                                     "所选时间范围内没有缓存微博",
                                     Toast.LENGTH_SHORT
-                                ).show();
+                                );
                             } else {
-                                Toast.makeText(
+                                showTimelineCacheClearToast(
                                     activity,
                                     "已清除 " + completed.removedCount
                                         + " 条，保留 " + completed.retainedStatuses.size() + " 条",
                                     Toast.LENGTH_LONG
-                                ).show();
+                                );
+                            }
+                            if (cliOperationId != null) {
+                                TimelineCacheStats retainedStats = buildTimelineCacheStats(
+                                    completed.retainedStatuses
+                                );
+                                updateCliCacheStats(cliOperationId, retainedStats);
+                                finishCliOperation(
+                                    cliOperationId,
+                                    "completed",
+                                    "removed=" + completed.removedCount
+                                        + ", retained=" + completed.retainedStatuses.size()
+                                );
                             }
                         } finally {
                             sTimelineCacheClearInFlight = false;
@@ -1679,6 +1752,12 @@ public class WeiboLiteHook {
                 });
             }
         });
+        return true;
+    }
+
+    private static void showTimelineCacheClearToast(Activity activity, String message, int duration) {
+        if (activity == null) return;
+        Toast.makeText(activity, message, duration).show();
     }
 
     private static void prepareTimelineStateForCacheClear(Object presenter) {
@@ -1713,7 +1792,6 @@ public class WeiboLiteHook {
             sPendingTimelineNoMoreGeneration++;
         }
         stopTimelineGapFill("manual-cache-clear");
-        log("Timeline cache range clear prepared live=" + snapshotTimelineStatuses(presenter, null).size());
     }
 
     private static TimelineCacheRangeClearResult clearTimelineCacheRangeNow(
@@ -1974,10 +2052,392 @@ public class WeiboLiteHook {
         if (recovered) {
             log("Weico application context captured source=" + source);
         }
+        registerWeicoCliBridge(context, source);
         getTimelineCacheDaysSetting();
     }
 
+    private static void registerWeicoCliBridge(Context context, String source) {
+        if (sCliBridgeRegistered || context == null) return;
+        try {
+            boolean registered = CliCommandBridge.register(
+                context,
+                CliContract.PACKAGE_WEICO,
+                new CliCommandBridge.Handler() {
+                    @Override
+                    public CliCommandBridge.Result handle(String command, Bundle args) {
+                        return handleWeicoCliCommand(command, args);
+                    }
+                }
+            );
+            if (registered) {
+                sCliBridgeRegistered = true;
+                log("Weico CLI bridge registered source=" + source);
+            }
+        } catch (Throwable t) {
+            log("Weico CLI bridge registration error source=" + source + ": " + t.getMessage());
+        }
+    }
+
+    private static final class ModuleSettingRead {
+        boolean available = false;
+        boolean isSet = false;
+        int value = 0;
+    }
+
+    private static CliCommandBridge.Result handleWeicoCliCommand(String command, Bundle args) {
+        if ("status".equals(command)) {
+            return buildWeicoCliStatus();
+        }
+        if ("timeline.top".equals(command)) {
+            return runTimelineEdgeCliCommand(true);
+        }
+        if ("timeline.bottom".equals(command)) {
+            return runTimelineEdgeCliCommand(false);
+        }
+        if ("timeline.jump".equals(command)) {
+            return runTimelineJumpCliCommand(args);
+        }
+        if ("cache.stats".equals(command)) {
+            return runTimelineCacheStatsCliCommand();
+        }
+        if ("cache.clear".equals(command)) {
+            return runTimelineCacheClearCliCommand(args);
+        }
+        if ("preload.restart".equals(command)) {
+            return restartTimelinePreloadCliCommand();
+        }
+        if ("settings.reload".equals(command)) {
+            return reloadWeicoSettingsCliCommand();
+        }
+        return CliCommandBridge.Result.error("unsupported Weibo Lite command: " + command);
+    }
+
+    private static CliCommandBridge.Result buildWeicoCliStatus() {
+        Object presenter = sLastTimelinePresenter;
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        String operationId;
+        String operationCommand;
+        String operationState;
+        String operationMessage;
+        long operationUpdatedAtMs;
+        int cacheCount;
+        int cacheDatedCount;
+        long cacheNewestMs;
+        long cacheOldestMs;
+        synchronized (sCliOperationLock) {
+            operationId = sCliLastOperationId;
+            operationCommand = sCliLastOperationCommand;
+            operationState = sCliLastOperationState;
+            operationMessage = sCliLastOperationMessage;
+            operationUpdatedAtMs = sCliLastOperationUpdatedAtMs;
+            cacheCount = sCliLastCacheCount;
+            cacheDatedCount = sCliLastCacheDatedCount;
+            cacheNewestMs = sCliLastCacheNewestMs;
+            cacheOldestMs = sCliLastCacheOldestMs;
+        }
+        CliCommandBridge.Result result = CliCommandBridge.Result.ready("Weibo Lite hook status")
+            .with("context_ready", getWeicoContext() != null)
+            .with("timeline_ready", presenter != null && recyclerView != null)
+            .with("timeline_count", presenter == null ? -1 : getTimelineStatusCount(presenter))
+            .with("cache_clear_in_flight", sTimelineCacheClearInFlight)
+            .with("cache_days", getTimelineCacheDaysSetting())
+            .with(
+                "jump_button",
+                isModuleOptionEnabled(
+                    ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                    ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
+                )
+            )
+            .with(
+                "cache_clear_button",
+                isModuleOptionEnabled(
+                    ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+                    ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
+                )
+            )
+            .with("last_operation_id", operationId)
+            .with("last_operation_command", operationCommand)
+            .with("last_operation_state", operationState)
+            .with("last_operation_message", operationMessage)
+            .with("last_operation_updated_at_ms", operationUpdatedAtMs);
+        if (cacheCount >= 0) {
+            result.with("last_cache_count", cacheCount)
+                .with("last_cache_dated_count", cacheDatedCount)
+                .with("last_cache_newest_ms", cacheNewestMs)
+                .with("last_cache_oldest_ms", cacheOldestMs);
+        }
+        return result;
+    }
+
+    private static CliCommandBridge.Result runTimelineEdgeCliCommand(boolean top) {
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (recyclerView == null) {
+            return CliCommandBridge.Result.error("open the Weibo Lite home timeline first");
+        }
+        String command = top ? "timeline.top" : "timeline.bottom";
+        String operationId = beginCliOperation(command, "requested");
+        boolean accepted = top
+            ? jumpTimelineToAbsoluteTop(recyclerView, "cli", 0)
+            : jumpTimelineToAbsoluteBottom(recyclerView, "cli", 0);
+        if (!accepted) {
+            finishCliOperation(operationId, "error", "timeline edge is unavailable");
+            return CliCommandBridge.Result.error("timeline edge is unavailable")
+                .with("operation_id", operationId);
+        }
+        finishCliOperation(operationId, "completed", top ? "jumped to top" : "jumped to bottom");
+        return CliCommandBridge.Result.ready(top ? "jumped to timeline top" : "jumped to timeline bottom")
+            .with("operation_id", operationId);
+    }
+
+    private static CliCommandBridge.Result runTimelineJumpCliCommand(Bundle args) {
+        String value = getCliArgument(args, "value");
+        TimelineJumpInput input = parseTimelineJumpInput(value);
+        if (input == null || input.targetMs <= 0L) {
+            return CliCommandBridge.Result.error(
+                "invalid value; use a date/time such as 7号, 7-11, 18:30, or 2026-07-11 18:30"
+            );
+        }
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (recyclerView == null) {
+            return CliCommandBridge.Result.error("open the Weibo Lite home timeline first");
+        }
+        TimelineCacheStats cacheStats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+        if (hasTimelineTimeJumpCacheRange(cacheStats)
+            && !isTimelineJumpInputWithinCacheRange(input, cacheStats)) {
+            return CliCommandBridge.Result.error(
+                "outside cached range: " + formatTimelineTimeJumpCacheRange(cacheStats)
+            );
+        }
+        String operationId = beginCliOperation("timeline.jump", value);
+        boolean accepted = jumpTimelineToTime(
+            recyclerView,
+            input.targetMs,
+            input.dayStartMs,
+            input.dayEndMs,
+            "cli",
+            0
+        );
+        if (!accepted) {
+            finishCliOperation(operationId, "error", "no matching cached timeline item");
+            return CliCommandBridge.Result.error("no matching cached timeline item")
+                .with("operation_id", operationId);
+        }
+        finishCliOperation(operationId, "completed", "timeline jump accepted");
+        return CliCommandBridge.Result.ready("timeline jump accepted")
+            .with("operation_id", operationId)
+            .with("target_ms", input.targetMs)
+            .with("day_start_ms", input.dayStartMs)
+            .with("day_end_ms", input.dayEndMs);
+    }
+
+    private static CliCommandBridge.Result runTimelineCacheStatsCliCommand() {
+        final String operationId = beginCliOperation("cache.stats", "scheduled");
+        try {
+            sTimelineRestoreExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    updateCliOperation(operationId, "running", "reading cache statistics");
+                    try {
+                        TimelineCacheStats stats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+                        updateCliCacheStats(operationId, stats);
+                        finishCliOperation(
+                            operationId,
+                            "completed",
+                            formatTimelineCacheRangeSummary(stats)
+                        );
+                        log("Timeline CLI cache stats count=" + stats.count
+                            + " dated=" + stats.datedCount
+                            + " oldest=" + stats.oldestMs
+                            + " newest=" + stats.newestMs);
+                    } catch (Throwable t) {
+                        finishCliOperation(
+                            operationId,
+                            "error",
+                            t.getClass().getSimpleName() + ": " + t.getMessage()
+                        );
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            finishCliOperation(operationId, "error", "cannot schedule cache statistics");
+            return CliCommandBridge.Result.error("cannot schedule cache statistics")
+                .with("operation_id", operationId);
+        }
+        return CliCommandBridge.Result.accepted("cache statistics scheduled")
+            .with("operation_id", operationId);
+    }
+
+    private static CliCommandBridge.Result runTimelineCacheClearCliCommand(Bundle args) {
+        String day = getCliArgument(args, "day");
+        String start = getCliArgument(args, "start");
+        String end = getCliArgument(args, "end");
+        boolean hasDay = hasMeaningfulString(day);
+        boolean hasStart = hasMeaningfulString(start);
+        boolean hasEnd = hasMeaningfulString(end);
+        if (hasDay == (hasStart || hasEnd)) {
+            return CliCommandBridge.Result.error("provide exactly day, or both start and end");
+        }
+
+        long startMs;
+        long endMs;
+        if (hasDay) {
+            startMs = parseTimelineClearDateOnlyInput(day, false);
+            endMs = parseTimelineClearDateOnlyInput(day, true);
+            if (startMs <= 0L || endMs < startMs) {
+                return CliCommandBridge.Result.error(
+                    "invalid day; use a date such as 7号, 7-7, or 2026-07-07"
+                );
+            }
+        } else {
+            if (!hasStart || !hasEnd) {
+                return CliCommandBridge.Result.error("start and end must be provided together");
+            }
+            startMs = parseTimelineClearTimeInput(start, false);
+            endMs = parseTimelineClearTimeInput(end, true);
+            if (startMs <= 0L || endMs <= 0L) {
+                return CliCommandBridge.Result.error(
+                    "invalid range; use dates or yyyy-MM-dd HH:mm values"
+                );
+            }
+            if (startMs > endMs) {
+                return CliCommandBridge.Result.error("start must not be later than end");
+            }
+        }
+
+        Object presenter = sLastTimelinePresenter;
+        if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))
+            || getTimelineAction(presenter) == null) {
+            return CliCommandBridge.Result.error("open the Weibo Lite home timeline first");
+        }
+        synchronized (WeiboLiteHook.class) {
+            if (sTimelineCacheClearInFlight) {
+                return CliCommandBridge.Result.error("cache clear is already running");
+            }
+        }
+        String operationId = beginCliOperation(
+            "cache.clear",
+            formatTimelineClearTime(startMs) + " .. " + formatTimelineClearTime(endMs)
+        );
+        if (!startTimelineCacheRangeClear(null, startMs, endMs, operationId)) {
+            finishCliOperation(operationId, "error", "cache clear was not accepted");
+            return CliCommandBridge.Result.error("cache clear was not accepted")
+                .with("operation_id", operationId);
+        }
+        return CliCommandBridge.Result.accepted("cache clear scheduled")
+            .with("operation_id", operationId)
+            .with("start_ms", startMs)
+            .with("end_ms", endMs);
+    }
+
+    private static CliCommandBridge.Result restartTimelinePreloadCliCommand() {
+        Object presenter = sLastTimelinePresenter;
+        if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) {
+            return CliCommandBridge.Result.error("open the Weibo Lite home timeline first");
+        }
+        String operationId = beginCliOperation("preload.restart", "requested");
+        try {
+            forgetTimelinePreloadDone("cli-preload-restart");
+            resetPreloadState(presenter, "cli-preload-restart");
+            scheduleTimelinePreload(presenter, "cli-preload-restart");
+            finishCliOperation(operationId, "completed", "preload restarted");
+            return CliCommandBridge.Result.ready("timeline preload restarted")
+                .with("operation_id", operationId);
+        } catch (Throwable t) {
+            finishCliOperation(operationId, "error", t.getClass().getSimpleName() + ": " + t.getMessage());
+            return CliCommandBridge.Result.error("preload restart failed: " + t.getMessage())
+                .with("operation_id", operationId);
+        }
+    }
+
+    private static CliCommandBridge.Result reloadWeicoSettingsCliCommand() {
+        String operationId = beginCliOperation("settings.reload", "requested");
+        try {
+            reloadModuleSettingsFromProvider();
+            refreshTimelineShortcutButtons("cli-settings-reload");
+            Object presenter = sLastTimelinePresenter;
+            if (presenter != null) {
+                resetPreloadState(presenter, "cli-settings-reload");
+                scheduleTimelinePreload(presenter, "cli-settings-reload");
+            }
+            finishCliOperation(operationId, "completed", "settings reloaded");
+            return CliCommandBridge.Result.ready("settings reloaded")
+                .with("operation_id", operationId)
+                .with("cache_days", getTimelineCacheDaysSetting())
+                .with(
+                    "jump_button",
+                    isModuleOptionEnabled(
+                        ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                        ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
+                    )
+                )
+                .with(
+                    "cache_clear_button",
+                    isModuleOptionEnabled(
+                        ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+                        ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
+                    )
+                );
+        } catch (Throwable t) {
+            finishCliOperation(operationId, "error", t.getClass().getSimpleName() + ": " + t.getMessage());
+            return CliCommandBridge.Result.error("settings reload failed: " + t.getMessage())
+                .with("operation_id", operationId);
+        }
+    }
+
+    private static String getCliArgument(Bundle args, String key) {
+        if (args == null || key == null || !args.containsKey(key)) return null;
+        Object value = args.get(key);
+        return value == null ? null : String.valueOf(value).trim();
+    }
+
+    private static String beginCliOperation(String command, String message) {
+        synchronized (sCliOperationLock) {
+            sCliOperationSequence++;
+            sCliLastOperationId = "weico-" + System.currentTimeMillis() + "-" + sCliOperationSequence;
+            sCliLastOperationCommand = command == null ? "" : command;
+            sCliLastOperationState = "accepted";
+            sCliLastOperationMessage = message == null ? "" : message;
+            sCliLastOperationUpdatedAtMs = System.currentTimeMillis();
+            sCliLastCacheCount = -1;
+            sCliLastCacheDatedCount = -1;
+            sCliLastCacheNewestMs = 0L;
+            sCliLastCacheOldestMs = 0L;
+            return sCliLastOperationId;
+        }
+    }
+
+    private static void updateCliOperation(String operationId, String state, String message) {
+        synchronized (sCliOperationLock) {
+            if (!sCliLastOperationId.equals(operationId)) return;
+            sCliLastOperationState = state == null ? sCliLastOperationState : state;
+            sCliLastOperationMessage = message == null ? sCliLastOperationMessage : message;
+            sCliLastOperationUpdatedAtMs = System.currentTimeMillis();
+        }
+    }
+
+    private static void finishCliOperation(String operationId, String state, String message) {
+        updateCliOperation(operationId, state, message);
+    }
+
+    private static void updateCliCacheStats(String operationId, TimelineCacheStats stats) {
+        if (stats == null) return;
+        synchronized (sCliOperationLock) {
+            if (!sCliLastOperationId.equals(operationId)) return;
+            sCliLastCacheCount = stats.count;
+            sCliLastCacheDatedCount = stats.datedCount;
+            sCliLastCacheNewestMs = stats.newestMs;
+            sCliLastCacheOldestMs = stats.oldestMs;
+        }
+    }
+
     private static boolean isModuleOptionEnabled(String key, boolean fallback) {
+        ModuleSettingRead provider = readModuleSettingFromProvider(key, "enabled");
+        if (provider.available && provider.isSet) {
+            boolean value = provider.value != 0;
+            syncTargetBooleanSetting(key, value);
+            return value;
+        }
+
         SharedPreferences prefs = getWeicoSettingsPrefs();
         if (prefs != null && prefs.contains(key)) {
             try {
@@ -1985,40 +2445,19 @@ public class WeiboLiteHook {
             } catch (Throwable ignored) {
             }
         }
-        Context context = sWeicoContext;
-        if (context != null) {
-            Cursor cursor = null;
-            try {
-                Uri uri = ModuleSettings.settingsUriFor(key);
-                cursor = context.getContentResolver().query(uri, null, null, null, null);
-                if (cursor != null && cursor.moveToFirst()) {
-                    int enabledColumn = cursor.getColumnIndex("enabled");
-                    if (enabledColumn >= 0) {
-                        return cursor.getInt(enabledColumn) != 0;
-                    }
-                }
-            } catch (Throwable t) {
-                log("read module setting error: " + key + " " + t.getMessage());
-            } finally {
-                if (cursor != null) {
-                    try {
-                        cursor.close();
-                    } catch (Throwable ignored) {}
-                }
-            }
-        }
-
-        prefs = getWeicoSettingsPrefs();
-        if (prefs != null && prefs.contains(key)) {
-            try {
-                return prefs.getBoolean(key, fallback);
-            } catch (Throwable ignored) {
-            }
-        }
+        if (provider.available) return provider.value != 0;
         return fallback;
     }
 
     private static int readModuleIntSetting(String key, int fallback) {
+        ModuleSettingRead provider = readModuleSettingFromProvider(key, "value");
+        if (provider.available && provider.isSet) {
+            int value = provider.value;
+            syncTargetIntSetting(key, value);
+            rememberModuleIntSetting(key, value);
+            return value;
+        }
+
         SharedPreferences targetPrefs = getWeicoSettingsPrefs();
         if (targetPrefs != null && targetPrefs.contains(key)) {
             try {
@@ -2029,41 +2468,136 @@ public class WeiboLiteHook {
             }
         }
 
-        Context context = getWeicoContext();
-        if (context != null) {
-            Cursor cursor = null;
-            try {
-                Uri uri = ModuleSettings.settingsUriFor(key);
-                cursor = context.getContentResolver().query(uri, null, null, null, null);
-                if (cursor != null && cursor.moveToFirst()) {
-                    int valueColumn = cursor.getColumnIndex("value");
-                    if (valueColumn >= 0) {
-                        int value = cursor.getInt(valueColumn);
-                        rememberModuleIntSetting(key, value);
-                        return value;
-                    }
-                    int enabledColumn = cursor.getColumnIndex("enabled");
-                    if (enabledColumn >= 0) {
-                        int value = cursor.getInt(enabledColumn);
-                        rememberModuleIntSetting(key, value);
-                        return value;
-                    }
-                }
-            } catch (Throwable t) {
-                log("read module int setting error: " + key + " " + t.getMessage());
-            } finally {
-                if (cursor != null) {
-                    try {
-                        cursor.close();
-                    } catch (Throwable ignored) {}
-                }
-            }
+        if (provider.available) {
+            rememberModuleIntSetting(key, provider.value);
+            return provider.value;
         }
 
         Integer cached = sModuleIntSettings.get(key);
         if (cached != null) return cached.intValue();
 
         return fallback;
+    }
+
+    private static ModuleSettingRead readModuleSettingFromProvider(String key, String valueColumn) {
+        ModuleSettingRead result = new ModuleSettingRead();
+        Context context = getWeicoContext();
+        if (context == null) return result;
+        Cursor cursor = null;
+        try {
+            cursor = context.getContentResolver().query(
+                ModuleSettings.settingsUriFor(key),
+                null,
+                null,
+                null,
+                null
+            );
+            if (cursor == null || !cursor.moveToFirst()) return result;
+            int column = cursor.getColumnIndex(valueColumn);
+            if (column < 0 && !"enabled".equals(valueColumn)) {
+                column = cursor.getColumnIndex("enabled");
+            }
+            if (column < 0) return result;
+            result.value = cursor.getInt(column);
+            result.available = true;
+            int isSetColumn = cursor.getColumnIndex("is_set");
+            result.isSet = isSetColumn >= 0 && cursor.getInt(isSetColumn) != 0;
+        } catch (Throwable t) {
+            log("read module setting error: " + key + " " + t.getMessage());
+        } finally {
+            if (cursor != null) {
+                try {
+                    cursor.close();
+                } catch (Throwable ignored) {}
+            }
+        }
+        return result;
+    }
+
+    private static void syncTargetBooleanSetting(String key, boolean value) {
+        SharedPreferences prefs = getWeicoSettingsPrefs();
+        if (prefs == null) return;
+        try {
+            Object current = prefs.getAll().get(key);
+            if (current instanceof Boolean && ((Boolean) current).booleanValue() == value) return;
+            if (!prefs.edit().putBoolean(key, value).commit()) {
+                log("sync target boolean setting failed: " + key);
+            }
+        } catch (Throwable t) {
+            log("sync target boolean setting error: " + key + " " + t.getMessage());
+        }
+    }
+
+    private static void syncTargetIntSetting(String key, int value) {
+        SharedPreferences prefs = getWeicoSettingsPrefs();
+        if (prefs == null) return;
+        try {
+            Object current = prefs.getAll().get(key);
+            if (current instanceof Number && ((Number) current).intValue() == value) return;
+            if (!prefs.edit().putInt(key, value).commit()) {
+                log("sync target int setting failed: " + key);
+            }
+        } catch (Throwable t) {
+            log("sync target int setting error: " + key + " " + t.getMessage());
+        }
+    }
+
+    private static boolean writeModuleSettingToProvider(String key, int value) {
+        Context context = getWeicoContext();
+        if (context == null) return false;
+        try {
+            ContentValues values = new ContentValues();
+            values.put("value", Integer.valueOf(value));
+            values.put("enabled", Integer.valueOf(value));
+            return context.getContentResolver().update(
+                ModuleSettings.settingsUriFor(key),
+                values,
+                null,
+                null
+            ) == 1;
+        } catch (Throwable t) {
+            log("write module setting error: " + key + " " + t.getMessage());
+            return false;
+        }
+    }
+
+    private static void reloadModuleSettingsFromProvider() {
+        SharedPreferences prefs = getWeicoSettingsPrefs();
+        String[] booleanKeys = new String[] {
+            ModuleSettings.KEY_WEICO_PROFILE_ENTRY,
+            ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON
+        };
+        for (int i = 0; i < booleanKeys.length; i++) {
+            String key = booleanKeys[i];
+            ModuleSettingRead provider = readModuleSettingFromProvider(key, "enabled");
+            if (provider.available && provider.isSet) {
+                syncTargetBooleanSetting(key, provider.value != 0);
+            } else if (prefs != null && prefs.contains(key)) {
+                boolean legacy = prefs.getBoolean(key, ModuleSettings.defaultFor(key));
+                writeModuleSettingToProvider(key, legacy ? 1 : 0);
+            } else {
+                syncTargetBooleanSetting(key, ModuleSettings.defaultFor(key));
+            }
+        }
+
+        String key = ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS;
+        ModuleSettingRead provider = readModuleSettingFromProvider(key, "value");
+        int days;
+        if (provider.available && provider.isSet) {
+            days = ModuleSettings.clampTimelineCacheDays(provider.value);
+            syncTargetIntSetting(key, days);
+        } else if (prefs != null && prefs.contains(key)) {
+            days = ModuleSettings.clampTimelineCacheDays(
+                prefs.getInt(key, ModuleSettings.DEFAULT_WEICO_TIMELINE_CACHE_DAYS)
+            );
+            writeModuleSettingToProvider(key, days);
+        } else {
+            days = ModuleSettings.DEFAULT_WEICO_TIMELINE_CACHE_DAYS;
+            syncTargetIntSetting(key, days);
+        }
+        rememberModuleIntSetting(key, days);
+        log("Module settings reloaded cacheDays=" + days);
     }
 
     private static boolean rememberModuleIntSetting(String key, int value) {

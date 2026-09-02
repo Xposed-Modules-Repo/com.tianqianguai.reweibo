@@ -25,6 +25,29 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun cliContractRoutesWeiboLiteWithoutCoordinates() {
+        val weico = CliContract.commandFor("weico.cache.clear")
+
+        assertEquals("com.weico.international", weico.targetPackage)
+        assertEquals("cache.clear", weico.localName)
+        assertNull(CliContract.commandFor("weico.unknown"))
+    }
+
+    @Test
+    fun moduleSettingsRegistryKeepsLegacyKeysAndTypes() {
+        val keys = ModuleSettings.allKeys().toSet()
+
+        assertEquals(4, keys.size)
+        assertTrue(keys.contains(ModuleSettings.KEY_WEICO_PROFILE_ENTRY))
+        assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON))
+        assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON))
+        assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS))
+        assertTrue(ModuleSettings.isBooleanKey(ModuleSettings.KEY_WEICO_PROFILE_ENTRY))
+        assertTrue(ModuleSettings.isIntegerKey(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS))
+        assertFalse(ModuleSettings.isKnownKey("unknown"))
+    }
+
+    @Test
     fun timelineCacheSettingAcceptsThirtyDays() {
         assertEquals(1, ModuleSettings.clampTimelineCacheDays(0))
         assertEquals(3, ModuleSettings.clampTimelineCacheDays(3))

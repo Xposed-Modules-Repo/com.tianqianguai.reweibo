@@ -32,6 +32,38 @@ Device: `192.168.6.17:5555` (Xiaomi, Android 16). Reconnect with `adb connect 19
 
 **When testing, simulate interactions yourself via adb.** Don't ask the user to tap buttons. Use `adb shell input tap x y` for taps, `adb shell input swipe` for scrolls. First confirm the target app is in the foreground with `adb shell dumpsys activity activities | grep mFocusedApp`.
 
+## Agent ADB command interface
+
+For supported ReWeibo operations, use raw `adb shell content call` first. Do not use repository wrapper scripts, screenshots, UI dumps, or coordinate taps when a command exists.
+
+Provider URI: `content://com.tianqianguai.reweibo.settings/settings`
+
+```bash
+# Activate Weibo Lite first; Xiaomi may freeze background broadcast receivers.
+adb -s 192.168.6.17:5555 shell am start -n com.weico.international/.appicon_white
+
+# Discover the live contract and settings.
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method help
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.list
+
+# Read, set, or reset one setting. Run weico.settings.reload after changing a running target.
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.get --arg weico_timeline_cache_days
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.set --arg weico_timeline_cache_days --extra value:i:30
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.reset --arg weico_timeline_cache_days
+
+# Runtime status and actions.
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.status
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.top
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.bottom
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.jump --extra "value:s:7-11 18:30"
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.cache.stats
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.cache.clear --extra day:s:2026-07-07
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.preload.restart
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.settings.reload
+```
+
+`weico.cache.stats` and `weico.cache.clear` are asynchronous. Poll `weico.status` and read `last_operation_state` until it becomes `completed` or `error`.
+
 ## Release notes
 
 When preparing a release:

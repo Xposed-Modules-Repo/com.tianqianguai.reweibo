@@ -13,6 +13,12 @@ public final class ModuleSettings {
     public static final int DEFAULT_WEICO_TIMELINE_CACHE_DAYS = 3;
     public static final int MIN_WEICO_TIMELINE_CACHE_DAYS = 1;
     public static final int MAX_WEICO_TIMELINE_CACHE_DAYS = 30;
+    private static final String[] ALL_KEYS = new String[] {
+        KEY_WEICO_PROFILE_ENTRY,
+        KEY_WEICO_TIMELINE_JUMP_BUTTON,
+        KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+        KEY_WEICO_TIMELINE_CACHE_DAYS
+    };
 
     private ModuleSettings() {}
 
@@ -36,6 +42,28 @@ public final class ModuleSettings {
         if (days < MIN_WEICO_TIMELINE_CACHE_DAYS) return MIN_WEICO_TIMELINE_CACHE_DAYS;
         if (days > MAX_WEICO_TIMELINE_CACHE_DAYS) return MAX_WEICO_TIMELINE_CACHE_DAYS;
         return days;
+    }
+
+    public static String[] allKeys() {
+        return ALL_KEYS.clone();
+    }
+
+    public static boolean isKnownKey(String key) {
+        if (key == null) return false;
+        for (String candidate : ALL_KEYS) {
+            if (candidate.equals(key)) return true;
+        }
+        return false;
+    }
+
+    public static boolean isBooleanKey(String key) {
+        return KEY_WEICO_PROFILE_ENTRY.equals(key)
+            || KEY_WEICO_TIMELINE_JUMP_BUTTON.equals(key)
+            || KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key);
+    }
+
+    public static boolean isIntegerKey(String key) {
+        return KEY_WEICO_TIMELINE_CACHE_DAYS.equals(key);
     }
 
     public static Uri settingsUriFor(String key) {
