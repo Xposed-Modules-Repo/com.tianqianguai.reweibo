@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/reweibo-icon.svg" width="168" height="168" alt="ReWeibo red panda icon">
+  <img src="docs/assets/reweibo-icon.png" width="168" height="168" alt="ReWeibo red panda icon">
 </p>
 
 <h1 align="center">ReWeibo</h1>
