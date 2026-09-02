@@ -1,10 +1,25 @@
-# ReWeibo
+<p align="center">
+  <img src="docs/assets/reweibo-icon.svg" width="168" height="168" alt="ReWeibo red panda icon">
+</p>
 
-ReWeibo 是一个面向微博轻享版（`com.weico.international`）的 LSPosed/Xposed 模块。
+<h1 align="center">ReWeibo</h1>
 
-ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
+<p align="center">
+  面向微博轻享版（<code>com.weico.international</code>）的 LSPosed/Xposed 模块
+  <br>
+  An LSPosed/Xposed module for Weibo Lite
+</p>
 
-[![Telegram Official Group](https://img.shields.io/badge/Telegram-Official_Group-26A5E4?logo=telegram&logoColor=white)](https://t.me/reweibo_offical)
+<p align="center">
+  <a href="https://github.com/Xposed-Modules-Repo/com.tianqianguai.reweibo/stargazers"><img src="https://img.shields.io/github/stars/Xposed-Modules-Repo/com.tianqianguai.reweibo?style=for-the-badge&logo=github&label=Star" alt="GitHub Stars"></a>
+  <a href="https://t.me/reweibo_offical"><img src="https://img.shields.io/badge/Telegram-Official_Group-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Official Group"></a>
+</p>
+
+<p align="center">
+  如果 ReWeibo 对你有帮助，欢迎点一个 Star 支持项目 ⭐
+  <br>
+  If ReWeibo helps you, please consider leaving a Star.
+</p>
 
 ## 功能
 
