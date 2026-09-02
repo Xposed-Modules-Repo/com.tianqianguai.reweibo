@@ -13,10 +13,10 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import com.tianqianguai.reweibo.compat.XC_MethodHook;
+import com.tianqianguai.reweibo.compat.XposedBridge;
+import com.tianqianguai.reweibo.compat.XposedHelpers;
+import com.tianqianguai.reweibo.compat.XC_LoadPackage;
 
 public class ShareFeedHook {
 

@@ -3,8 +3,6 @@ package com.tianqianguai.reweibo;
 import android.app.Activity;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -12,9 +10,9 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.tianqianguai.reweibo.compat.XC_MethodHook;
+import com.tianqianguai.reweibo.compat.XposedBridge;
+import com.tianqianguai.reweibo.compat.XposedHelpers;
 
 public class FloatingButton {
 
@@ -22,6 +20,7 @@ public class FloatingButton {
     private static long sLastTap = 0;
     private static final long DOUBLE_TAP_MS = 500;
     private static Activity sLastActivity = null;
+    private static WindowManager sWindowManager = null;
     private static Runnable sPendingSingleTap = null;
     private static boolean sDoubleTapped = false;
 
@@ -53,18 +52,18 @@ public class FloatingButton {
                     sLastTap = 0;
                     sDoubleTapped = true;
                     if (sPendingSingleTap != null) {
-                        new Handler(Looper.getMainLooper()).removeCallbacks(sPendingSingleTap);
+                        HotReloadRuntime.removeCallbacks(sPendingSingleTap);
                         sPendingSingleTap = null;
                     }
                     v.setBackgroundColor(0xDD00AA00);
-                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    HotReloadRuntime.postDelayed(() -> {
                         v.setBackgroundColor(0xDDFF5722);
                     }, 300);
                     try { doubleAction.onDoubleTap(); } catch (Throwable t) {
                         XposedBridge.log("ReWeibo: doubleTap error: " + t.getMessage());
                     }
                     // Reset flag after a delay
-                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    HotReloadRuntime.postDelayed(() -> {
                         sDoubleTapped = false;
                     }, DOUBLE_TAP_MS);
                 } else {
@@ -72,7 +71,7 @@ public class FloatingButton {
                     sLastTap = now;
                     sDoubleTapped = false;
                     if (sPendingSingleTap != null) {
-                        new Handler(Looper.getMainLooper()).removeCallbacks(sPendingSingleTap);
+                        HotReloadRuntime.removeCallbacks(sPendingSingleTap);
                     }
                     sPendingSingleTap = () -> {
                         sPendingSingleTap = null;
@@ -82,7 +81,7 @@ public class FloatingButton {
                             }
                         }
                     };
-                    new Handler(Looper.getMainLooper()).postDelayed(sPendingSingleTap, DOUBLE_TAP_MS);
+                    HotReloadRuntime.postDelayed(sPendingSingleTap, DOUBLE_TAP_MS);
                 }
             }
             return true;
@@ -92,13 +91,26 @@ public class FloatingButton {
     private static void removeButton() {
         if (sButton == null) return;
         try {
-            if (sButton.getParent() instanceof WindowManager) {
-                ((WindowManager) sButton.getParent()).removeViewImmediate(sButton);
+            sButton.setOnTouchListener(null);
+            if (sWindowManager != null) {
+                sWindowManager.removeViewImmediate(sButton);
             } else if (sButton.getParent() instanceof FrameLayout) {
                 ((FrameLayout) sButton.getParent()).removeView(sButton);
             }
         } catch (Throwable ignored) {}
         sButton = null;
+        sWindowManager = null;
+    }
+
+    public static void cleanup() {
+        if (sPendingSingleTap != null) {
+            HotReloadRuntime.removeCallbacks(sPendingSingleTap);
+            sPendingSingleTap = null;
+        }
+        removeButton();
+        sLastActivity = null;
+        sLastTap = 0L;
+        sDoubleTapped = false;
     }
 
     public static void attachToActivity(Activity activity, DoubleTapAction doubleAction, SingleTapAction singleAction) {
@@ -128,6 +140,7 @@ public class FloatingButton {
 
                 WindowManager wm = (WindowManager) activity.getSystemService(Activity.WINDOW_SERVICE);
                 wm.addView(sButton, wparams);
+                sWindowManager = wm;
                 XposedBridge.log("ReWeibo: FloatingButton via WindowManager");
                 return;
             } catch (Throwable t) {
@@ -160,7 +173,7 @@ public class FloatingButton {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         Activity activity = (Activity) param.thisObject;
-                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        HotReloadRuntime.postDelayed(() -> {
                             attachToActivity(activity, doubleAction, singleAction);
                         }, 1000);
                     }

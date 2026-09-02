@@ -2,15 +2,13 @@
 
 ## What this is
 
-LSPosed/Xposed module (legacy `de.robv.android.xposed.*` API, **not** libxposed v2). Hooks into three target apps to modify feed layout and remove ads.
+LSPosed module using Modern `io.github.libxposed:api:102.0.0`. Its static scope contains only Weibo Lite. The older Weibo/Share hook source files remain for source compatibility, but `MainHook` does not dispatch them.
 
 | Target | Package | Hook class | Function |
 |--------|---------|------------|----------|
-| 微博 | `com.sina.weibo` | `WeiboFeedHook` | Reverse feed + auto-scroll to top |
-| Share | `com.hengye.share` | `ShareFeedHook` | Auto-scroll down to "上次阅读" marker + "显示更多" auto-click |
 | 微博轻享版 | `com.weico.international` | `WeiboLiteHook` | Remove splash + timeline ads + reverse feed + auto-scroll |
 
-Entry point: `MainHook` implements `IXposedHookLoadPackage`, dispatches by `lpparam.packageName`.
+Entry point: the sole Java `MainHook extends XposedModule`, dispatched from `onPackageReady`. Hot reload is implemented through `onHotReloading` / `onHotReloaded`, not by replaying package callbacks.
 
 ## Build & deploy
 
@@ -20,12 +18,12 @@ Entry point: `MainHook` implements `IXposedHookLoadPackage`, dispatches by `lppa
 
 APK output: `app/build/outputs/apk/release/app-release.apk`
 
-Install + restart target (example for Weibo):
+Install + restart target (when an explicit device deployment is requested):
 ```bash
 adb -s 192.168.6.17:5555 install -r app/build/outputs/apk/release/app-release.apk
-adb -s 192.168.6.17:5555 shell am force-stop com.sina.weibo
+adb -s 192.168.6.17:5555 shell am force-stop com.weico.international
 adb -s 192.168.6.17:5555 logcat -c
-adb -s 192.168.6.17:5555 shell monkey -p com.sina.weibo -c android.intent.category.LAUNCHER 1
+adb -s 192.168.6.17:5555 shell monkey -p com.weico.international -c android.intent.category.LAUNCHER 1
 ```
 
 Device: `192.168.6.17:5555` (Xiaomi, Android 16). Reconnect with `adb connect 192.168.6.17:5555` if dropped.
@@ -108,18 +106,28 @@ When preparing a release:
 
 ## Xposed config
 
-- `assets/xposed_init` → `com.tianqianguai.reweibo.MainHook`
-- `AndroidManifest.xml` meta-data: `xposedmodule=true`, `xposedminversion=82`
-- Scope: `res/values/arrays.xml` `xposed_scope` array
-- Dependency: `compileOnly(files("libs/xposed-bridge-api.jar"))` — **compileOnly**, not implementation
+- `META-INF/xposed/java_init.list` → `com.tianqianguai.reweibo.MainHook`
+- `META-INF/xposed/module.prop`: API 102, static scope, protective exception mode, automatic hot reload
+- `META-INF/xposed/scope.list`: only `com.weico.international`
+- Dependency: `compileOnly("io.github.libxposed:api:102.0.0")`; the API must not be packaged into the APK
+- Legacy `assets/xposed_init`, Manifest Xposed metadata, and the API 82 jar do not exist
 
-After changing scope or xposed_init, user must re-enable module in LSPosed manager and restart target app.
+`autoHotReload=true` updates an already-running scoped process. If a cache clear, background cache task, network probe/subscription, or module dialog is active, the old generation rejects reload and stays usable; retry after it becomes idle.
 
 ## Architecture
 
-**Single module, 7 Java files, no frameworks.** All hooks use `XposedHelpers.findAndHookMethod` / `XposedHelpers.findAndHookConstructor`. No Kotlin, no AndroidX Room/DataBinding in the module itself.
+**Single Java module, no app-side framework migration.** Existing hook code keeps its `XC_MethodHook` / `XposedHelpers` calling style through the local `com.tianqianguai.reweibo.compat` bridge, while production code and the APK contain no legacy API references.
+
+### API 102 hot reload
+
+- Every hook receives a deterministic executable-and-slot ID. `onHotReloaded` uses `HookHandle.replaceHook` for same-ID atomic replacement; a failed replacement retains the old handle, and a complete generation removes stale handles.
+- `HotReloadRuntime` owns main-thread callbacks and the cache executors. Reload cancels queued callbacks, stops executors, unregisters the CLI receiver, removes shortcut/progress views and listeners, and clears target-object caches.
+- Saved state is an `Object[]` containing only boot-classpath containers and target-classloader objects: Application context, current presenter, RecyclerView, owner fragment when present, Activity, and generation number.
+- Restored state re-registers the raw ADB CLI and recreates timeline shortcuts without restarting the target process. `weico.status` reports API, framework, generation, readiness, active tasks, and observable-probe evidence.
 
 ### FloatingButton
+
+This helper is retained for the non-dispatched Weibo/Share source files; it is not installed in the current static Weibo Lite scope.
 
 - Primary: `WindowManager` + `TYPE_APPLICATION_PANEL` + `activity.getWindow().getDecorView().getWindowToken()` — no `SYSTEM_ALERT_WINDOW` needed
 - Fallback: `activity.addContentView()` — works for Weibo/Share, but Weico's view hierarchy sometimes intercepts touches
@@ -129,6 +137,8 @@ After changing scope or xposed_init, user must re-enable module in LSPosed manag
 
 ### WeiboFeedHook
 
+Retained source only; `MainHook` does not dispatch `com.sina.weibo`.
+
 - `onLayout` hook on `RecyclerView` fires intermittently for main process — filter by adapter class name containing `RecyclerViewAdapter`
 - `setLayoutManager` hook fires on background thread — `postDelayed` callbacks may find adapter already consumed
 - Auto-scroll: `smoothScrollToPosition` triggers `onScrolled` → load-more. `scrollToPosition` does NOT.
@@ -136,6 +146,8 @@ After changing scope or xposed_init, user must re-enable module in LSPosed manag
 - SharedPreferences flag via `Application.onCreate` context
 
 ### ShareFeedHook
+
+Retained source only; `MainHook` does not dispatch `com.hengye.share`.
 
 - Share's `ShareRecyclerView` extends `OOo0oO` (obfuscated), NOT standard `RecyclerView`
 - `RecyclerView.onLayout` hook fires for the inner RV (standard RecyclerView)
@@ -173,7 +185,7 @@ After changing scope or xposed_init, user must re-enable module in LSPosed manag
 - **`onLayout` fires during `smoothScrollToPosition` animation** every frame — use idle-count polling, not layout callbacks.
 - **SharedPreferences works across app restarts** when obtained via target app's `Application.onCreate` context.
 - **`View.setOnClickListener` hook captures recycled listeners** — RecyclerView recycles ViewHolder, clearing and re-setting listeners on each bind.
-- **LSPosed processes**: Weibo hooks fire in 3 processes (`com.sina.weibo`, `:remote`, `.image`). Module code must be safe for concurrent multi-process execution.
+- **Static scope is Weibo Lite only.** Do not add another package to `scope.list` or dispatch another hook without a new explicit task.
 
 ## What doesn't work (don't retry)
 

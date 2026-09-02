@@ -14,6 +14,7 @@ import java.util.Map;
 
 public final class CliCommandBridge {
     private static BroadcastReceiver sReceiver;
+    private static Context sRegisteredContext;
     private static String sRegisteredPackage;
 
     private CliCommandBridge() {}
@@ -79,8 +80,35 @@ public final class CliCommandBridge {
             appContext.registerReceiver(receiver, filter);
         }
         sReceiver = receiver;
+        sRegisteredContext = appContext;
         sRegisteredPackage = targetPackage;
         return true;
+    }
+
+    /** Unregisters the generation-owned endpoint before API 102 releases its classloader. */
+    public static synchronized boolean unregister() {
+        BroadcastReceiver receiver = sReceiver;
+        Context context = sRegisteredContext;
+        if (receiver == null) {
+            sRegisteredContext = null;
+            sRegisteredPackage = null;
+            return true;
+        }
+        try {
+            if (context != null) context.unregisterReceiver(receiver);
+        } catch (IllegalArgumentException alreadyUnregistered) {
+            // The target process already removed it; clearing our references is still correct.
+        } catch (Throwable error) {
+            return false;
+        }
+        sReceiver = null;
+        sRegisteredContext = null;
+        sRegisteredPackage = null;
+        return true;
+    }
+
+    public static synchronized boolean cleanup() {
+        return unregister();
     }
 
     private static void finish(BroadcastReceiver receiver, Result result) {

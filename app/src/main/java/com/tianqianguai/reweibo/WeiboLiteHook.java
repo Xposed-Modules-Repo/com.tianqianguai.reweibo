@@ -18,8 +18,6 @@ import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.SystemClock;
 import android.system.Os;
 import android.text.InputType;
@@ -54,6 +52,7 @@ import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -69,14 +68,13 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import com.tianqianguai.reweibo.compat.XC_MethodHook;
+import com.tianqianguai.reweibo.compat.XC_MethodReplacement;
+import com.tianqianguai.reweibo.compat.XposedBridge;
+import com.tianqianguai.reweibo.compat.XposedHelpers;
+import com.tianqianguai.reweibo.compat.XC_LoadPackage;
 
 public class WeiboLiteHook {
 
@@ -158,32 +156,20 @@ public class WeiboLiteHook {
     private static String sTimelineVerifiedNaturalGapsScope = null;
     private static final Map<Object, TimelineRestoreState> sTimelineRestoreStates = new WeakHashMap<>();
     private static final Map<View, Boolean> sReWeiboProfileRows = new WeakHashMap<>();
+    private static final Map<View, Boolean> sTimelineLastReadMarkerViews = new WeakHashMap<>();
     private static final ConcurrentHashMap<Class<?>, ConcurrentHashMap<String, FieldLookup>> sFieldLookups = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Class<?>, ConcurrentHashMap<String, MethodLookup>> sNoArgMethodLookups = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Integer> sModuleIntSettings = new ConcurrentHashMap<>();
     private static final Object sTimelineFileLock = new Object();
     private static final Object sTimelinePersistQueueLock = new Object();
     private static final Object sTimelineRestoreLock = new Object();
-    private static final ExecutorService sTimelinePersistExecutor = Executors.newSingleThreadExecutor(
-        new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable runnable) {
-                Thread thread = new Thread(runnable, "ReWeibo-timeline-cache");
-                thread.setPriority(Thread.MIN_PRIORITY);
-                return thread;
-            }
-        }
-    );
-    private static final ExecutorService sTimelineRestoreExecutor = Executors.newSingleThreadExecutor(
-        new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable runnable) {
-                Thread thread = new Thread(runnable, "ReWeibo-timeline-restore");
-                thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-                return thread;
-            }
-        }
-    );
+    private static final ExecutorService sTimelinePersistExecutor =
+        HotReloadRuntime.newSingleThreadExecutor("ReWeibo-timeline-cache", Thread.MIN_PRIORITY);
+    private static final ExecutorService sTimelineRestoreExecutor =
+        HotReloadRuntime.newSingleThreadExecutor(
+            "ReWeibo-timeline-restore",
+            Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1)
+        );
     private static final Map sTimelineCumulativeStatusesById = new LinkedHashMap();
     private static final GapFillState sTimelineGapFillState = new GapFillState();
     private static File sLogFile = null;
@@ -257,6 +243,17 @@ public class WeiboLiteHook {
     private static int sCliLastCacheDatedCount = -1;
     private static long sCliLastCacheNewestMs = 0L;
     private static long sCliLastCacheOldestMs = 0L;
+    private static final AtomicInteger sActiveTimelineObservableSubscriptions = new AtomicInteger();
+    private static final List<WeakReference<Object>> sLiveTimelineObservableWrappers = new ArrayList<>();
+    private static volatile boolean sHotReloadPreparing = false;
+    private static volatile boolean sHotReloadReady = false;
+    private static volatile boolean sHotReloadStateRestored = false;
+    private static volatile long sHotReloadGeneration = 1L;
+    private static volatile int sTimelineAdHookCount = 0;
+    private static volatile String sTimelineAdHookStrategy = "none";
+    private static final Object sHotReloadLock = new Object();
+    private static boolean sHotReloadReadyBeforePrepare = false;
+    private static boolean sHotReloadStateRestoredBeforePrepare = false;
 
     private static final class PreloadState {
         int requestedPages = 0;
@@ -618,24 +615,324 @@ public class WeiboLiteHook {
         } catch (Throwable ignored) {}
     }
 
-    public static void hook(XC_LoadPackage.LoadPackageParam lpparam) {
-        try {
-            log("WeicoHook start");
-            initLogFile();
-            hookMainProfileSettingsEntry(lpparam.classLoader);
-            forceNativeReverseOrder(lpparam.classLoader);
-            forceTimelineLayoutDirection(lpparam.classLoader);
-            forceTimelineDataOrder(lpparam.classLoader);
-            hookTopBarDoubleTap(lpparam.classLoader);
-            hookStaleVideoOpenRefresh(lpparam.classLoader);
-            disableWeicoPullRefresh(lpparam.classLoader);
-            removeSplashAd(lpparam.classLoader);
-            removeTimelineAd(lpparam.classLoader);
+    static void initializeHotReloadRuntime(long generation, boolean restored) {
+        sHotReloadGeneration = Math.max(1L, generation);
+        sHotReloadStateRestored = restored;
+        sHotReloadPreparing = false;
+        sHotReloadReady = false;
+        sTimelineAdHookCount = 0;
+        sTimelineAdHookStrategy = "none";
+    }
 
-            log("WeicoHook done");
-        } catch (Throwable t) {
-            log("WeicoHook failed: " + t.getMessage());
+    static void markHotReloadReady(boolean ready) {
+        sHotReloadReady = ready;
+    }
+
+    static Object captureHotReloadState() {
+        String blocker = findHotReloadBlocker(false);
+        if (blocker != null) return null;
+
+        Context context = sWeicoContext;
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        if (recyclerView == null) recyclerView = sLastActiveHomeTimelineRecyclerView.get();
+        Object presenter = getCurrentHomeTimelinePresenter();
+        if (presenter == null) presenter = sLastTimelinePresenter;
+        if (presenter == null) presenter = sLastActiveHomeTimelinePresenter.get();
+        Object ownerFragment = null;
+        synchronized (sTopAnchorStates) {
+            TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+            if (owner != null) {
+                ownerFragment = owner.fragment.get();
+                if (presenter == null) presenter = owner.presenter.get();
+            }
         }
+        Activity activity = sTimelineTimeJumpActivity;
+        if (activity == null && recyclerView instanceof View) {
+            activity = findHostActivity(((View) recyclerView).getContext());
+        }
+        return HotReloadState.compose(
+            context,
+            presenter,
+            recyclerView,
+            ownerFragment,
+            activity,
+            sHotReloadGeneration
+        );
+    }
+
+    static String hotReloadBlocker() {
+        String blocker = findHotReloadBlocker(true);
+        return blocker == null ? "none" : blocker;
+    }
+
+    private static String findHotReloadBlocker(boolean includePreparing) {
+        if (includePreparing && sHotReloadPreparing) return "generation-retiring";
+        if (sTimelineCacheClearInFlight) return "cache-clear-active";
+        if (sTimelineCacheClearDialogLoading) return "cache-dialog-loading";
+        synchronized (sTimelinePersistQueueLock) {
+            String persistBlocker = timelinePersistBlockerForState(
+                sPendingTimelineNativePersist != null,
+                sPendingTimelineShadowPersist != null,
+                sTimelinePersistWorkerScheduled
+            );
+            if (persistBlocker != null) return persistBlocker;
+        }
+        if (sActiveTimelineObservableSubscriptions.get() > 0) {
+            return "observable-subscriptions=" + sActiveTimelineObservableSubscriptions.get();
+        }
+        int observableWrappers = liveTimelineObservableWrapperCount();
+        if (observableWrappers > 0) return "observable-wrappers=" + observableWrappers;
+        if (HotReloadRuntime.hasOpenDialogs()) return "dialog-open";
+        if (HotReloadRuntime.hasActiveTasks()) {
+            return "generation-tasks=" + HotReloadRuntime.activeTaskCount();
+        }
+        synchronized (sTimelineGapFillState) {
+            if (sTimelineGapFillState.active
+                || sTimelineGapFillState.scheduled
+                || sTimelineGapFillState.inFlight) return "gap-fill-active";
+        }
+        synchronized (sPreloadStates) {
+            for (PreloadState state : sPreloadStates.values()) {
+                if (state != null && state.inFlight) return "preload-network-active";
+            }
+        }
+        synchronized (sTimelineRestoreLock) {
+            for (TimelineRestoreState state : sTimelineRestoreStates.values()) {
+                if (state != null && state.inFlight) return "cache-restore-active";
+            }
+        }
+        return null;
+    }
+
+    static String timelinePersistBlockerForState(
+            boolean nativePending,
+            boolean shadowPending,
+            boolean workerScheduled
+    ) {
+        if (nativePending) return "persist-native-pending";
+        if (shadowPending) return "persist-shadow-pending";
+        if (workerScheduled) return "persist-worker-scheduled";
+        return null;
+    }
+
+    static boolean shouldAcceptTimelinePersistEnqueue(
+            boolean hotReloadPreparing,
+            boolean runtimeAccepting
+    ) {
+        return !hotReloadPreparing && runtimeAccepting;
+    }
+
+    static boolean prepareForHotReload(Object savedState) {
+        if (findHotReloadBlocker(false) != null) return false;
+        synchronized (sHotReloadLock) {
+            if (sHotReloadPreparing) return false;
+            sHotReloadReadyBeforePrepare = sHotReloadReady;
+            sHotReloadStateRestoredBeforePrepare = sHotReloadStateRestored;
+            sHotReloadPreparing = true;
+            sHotReloadReady = false;
+        }
+        if (findHotReloadBlocker(false) != null) {
+            restoreRejectedHotReloadFlags();
+            return false;
+        }
+        boolean prepared = HotReloadPreparation.run(
+            () -> HotReloadRuntime.runMainCleanup(new Runnable() {
+                @Override
+                public void run() {
+                    removeTimelineGapFillProgressView("hot-reload");
+                    removeTimelineTimeJumpButton("hot-reload");
+                    removeTimelineLastReadMarkers();
+                    FloatingButton.cleanup();
+                }
+            }, 1_500L),
+            () -> {
+                boolean released = CliCommandBridge.cleanup();
+                if (released) sCliBridgeRegistered = false;
+                return released;
+            },
+            () -> findHotReloadBlocker(false) == null
+                && HotReloadRuntime.prepareForHotReload()
+        );
+        if (!prepared) {
+            resumeAfterRejectedHotReload(savedState);
+            return false;
+        }
+        clearGenerationOwnedReferences();
+        return true;
+    }
+
+    private static void resumeAfterRejectedHotReload(Object savedState) {
+        HotReloadRuntime.resumeAfterRejectedReload();
+        restoreHotReloadStateInternal(savedState, sHotReloadGeneration, false);
+        restoreRejectedHotReloadFlags();
+        HotReloadRuntime.post(new Runnable() {
+            @Override
+            public void run() {
+                refreshTimelineShortcutButtons("hot-reload-rejected");
+            }
+        });
+    }
+
+    private static void restoreRejectedHotReloadFlags() {
+        synchronized (sHotReloadLock) {
+            sHotReloadPreparing = false;
+            sHotReloadReady = sHotReloadReadyBeforePrepare;
+            sHotReloadStateRestored = sHotReloadStateRestoredBeforePrepare;
+        }
+    }
+
+    static boolean restoreHotReloadState(Object savedState, long generation) {
+        initializeHotReloadRuntime(generation, true);
+        if (!HotReloadState.isValid(savedState, WeiboLiteHook.class.getClassLoader())) {
+            sHotReloadStateRestored = false;
+            return false;
+        }
+        return restoreHotReloadStateInternal(savedState, generation, true);
+    }
+
+    private static boolean restoreHotReloadStateInternal(
+            Object savedState,
+            long generation,
+            boolean hotReloaded
+    ) {
+        if (!HotReloadState.isValid(savedState, WeiboLiteHook.class.getClassLoader())) return false;
+        Context context = HotReloadState.applicationContext(savedState) instanceof Context
+            ? (Context) HotReloadState.applicationContext(savedState)
+            : null;
+        Object presenter = HotReloadState.presenter(savedState);
+        Object recyclerView = HotReloadState.recyclerView(savedState);
+        Object ownerFragment = HotReloadState.ownerFragment(savedState);
+        Activity activity = HotReloadState.activity(savedState) instanceof Activity
+            ? (Activity) HotReloadState.activity(savedState)
+            : null;
+
+        sHotReloadGeneration = Math.max(1L, generation);
+        sHotReloadStateRestored = hotReloaded;
+        sHotReloadPreparing = false;
+        if (context != null) {
+            Context applicationContext = context.getApplicationContext();
+            sWeicoContext = applicationContext == null ? context : applicationContext;
+            registerWeicoCliBridge(sWeicoContext, hotReloaded ? "hot-reload" : "hot-reload-rejected");
+        }
+        sLastTimelinePresenter = presenter;
+        sLastActiveHomeTimelinePresenter = new WeakReference<>(presenter);
+        sLastActiveHomeTimelineRecyclerView = new WeakReference<>(recyclerView);
+        if (recyclerView != null) {
+            synchronized (sTopAnchorStates) {
+                sTimelineRecyclerViews.put(recyclerView, Boolean.TRUE);
+                if (presenter != null || ownerFragment != null) {
+                    sHomeTimelineRecyclerOwners.put(
+                        recyclerView,
+                        new TimelineRecyclerOwner(ownerFragment, presenter)
+                    );
+                }
+            }
+        }
+        sTimelineTimeJumpActivity = activity;
+        sTimelineTimeJumpRecyclerView = recyclerView;
+        return context != null || presenter != null || recyclerView != null;
+    }
+
+    static void finishHotReloadRestore() {
+        sHotReloadPreparing = false;
+        final Object presenter = sLastTimelinePresenter;
+        HotReloadRuntime.post(new Runnable() {
+            @Override
+            public void run() {
+                refreshTimelineShortcutButtons("hot-reload-restored");
+                if (presenter != null && "-1".equals(getTimelineGroupId(presenter))) {
+                    resetPreloadState(presenter, "hot-reload-restored");
+                    scheduleTimelinePreload(presenter, "hot-reload-restored");
+                }
+            }
+        });
+    }
+
+    private static void clearGenerationOwnedReferences() {
+        synchronized (sPreloadStates) {
+            sPreloadStates.clear();
+        }
+        synchronized (sTopAnchorStates) {
+            sTopAnchorStates.clear();
+            sTimelineRecyclerViews.clear();
+            sHomeTimelineRecyclerOwners.clear();
+            sTimelineUserMovedAt.clear();
+            sPersistedTimelineCacheCounts.clear();
+            sPersistedTimelineCacheNewestIds.clear();
+        }
+        synchronized (sTimelineRestoreLock) {
+            sRestoringTimelineCaches.clear();
+            sTimelineRestoreStates.clear();
+        }
+        synchronized (sTimelinePersistQueueLock) {
+            sPendingTimelineNativePersist = null;
+            sPendingTimelineShadowPersist = null;
+            sTimelinePersistWorkerScheduled = false;
+        }
+        synchronized (sTimelineCumulativeStatusesById) {
+            sTimelineCumulativeStatusesById.clear();
+        }
+        synchronized (sTimelineGapFillState) {
+            resetTimelineGapFillLocked(sTimelineGapFillState);
+        }
+        synchronized (sReWeiboProfileRows) {
+            sReWeiboProfileRows.clear();
+        }
+        synchronized (sTimelineLastReadMarkerViews) {
+            sTimelineLastReadMarkerViews.clear();
+        }
+        synchronized (sTimelineVerifiedNaturalGapsLock) {
+            sTimelineVerifiedNaturalGaps.clear();
+            sTimelineVerifiedNaturalGapsScope = null;
+        }
+        sFieldLookups.clear();
+        sNoArgMethodLookups.clear();
+        synchronized (sLiveTimelineObservableWrappers) {
+            sLiveTimelineObservableWrappers.clear();
+        }
+        sLastTimelinePresenter = null;
+        sLastActiveHomeTimelinePresenter = new WeakReference<>(null);
+        sLastActiveHomeTimelineRecyclerView = new WeakReference<>(null);
+        sTimelineGapFillViewportAnchor = null;
+        sTimelineTimeJumpActivity = null;
+        sTimelineTimeJumpRecyclerView = null;
+        sWeicoContext = null;
+        sLogFile = null;
+        HotReloadRuntime.clearDialogReferences();
+    }
+
+    private interface HookRegistrationAction {
+        void run() throws Throwable;
+    }
+
+    private static void registerHookGroup(String name, HookRegistrationAction action) {
+        XposedBridge.beginRegistrationGroup(name);
+        try {
+            action.run();
+        } catch (Throwable error) {
+            XposedBridge.markCurrentRegistrationGroupIncomplete(
+                "registration group threw before completion",
+                error
+            );
+            log("Hook registration group failed name=" + name + ": " + error.getMessage());
+        } finally {
+            XposedBridge.completeRegistrationGroup(name);
+        }
+    }
+
+    public static void hook(final XC_LoadPackage.LoadPackageParam lpparam) {
+        log("WeicoHook start");
+        initLogFile();
+        registerHookGroup("profile-settings", () -> hookMainProfileSettingsEntry(lpparam.classLoader));
+        registerHookGroup("native-reverse", () -> forceNativeReverseOrder(lpparam.classLoader));
+        registerHookGroup("timeline-layout", () -> forceTimelineLayoutDirection(lpparam.classLoader));
+        registerHookGroup("timeline-data", () -> forceTimelineDataOrder(lpparam.classLoader));
+        registerHookGroup("top-bar", () -> hookTopBarDoubleTap(lpparam.classLoader));
+        registerHookGroup("video-refresh", () -> hookStaleVideoOpenRefresh(lpparam.classLoader));
+        registerHookGroup("pull-refresh", () -> disableWeicoPullRefresh(lpparam.classLoader));
+        registerHookGroup("splash-ad", () -> removeSplashAd(lpparam.classLoader));
+        registerHookGroup("timeline-ad", () -> removeTimelineAd(lpparam.classLoader));
+        log("WeicoHook done");
     }
 
     private static void hookMainProfileSettingsEntry(final ClassLoader cl) {
@@ -757,9 +1054,8 @@ public class WeiboLiteHook {
         }
 
         try {
-            Class<?> onUpdateClass = Class.forName(
+            Class<?> onUpdateClass = XposedHelpers.findClass(
                 "com.weico.international.view.node.ProfileItemNode$onUpdate$2",
-                false,
                 cl
             );
             XposedHelpers.findAndHookMethod(
@@ -1103,6 +1399,7 @@ public class WeiboLiteHook {
                 });
             });
             dialog.show();
+            HotReloadRuntime.trackDialog(dialog);
             input.requestFocus();
         } catch (Throwable t) {
             log("show ReWeibo settings dialog error: " + t.getMessage());
@@ -1193,7 +1490,7 @@ public class WeiboLiteHook {
                         loadedStats = new TimelineCacheStats();
                     }
                     final TimelineCacheStats stats = loadedStats;
-                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    HotReloadRuntime.post(new Runnable() {
                         @Override
                         public void run() {
                             sTimelineCacheClearDialogLoading = false;
@@ -1440,6 +1737,7 @@ public class WeiboLiteHook {
                 });
             });
             dialog.show();
+            HotReloadRuntime.trackDialog(dialog);
         } catch (Throwable t) {
             log("show timeline cache clear range error: " + t.getMessage());
             Toast.makeText(activity, "无法打开缓存清理，请重试", Toast.LENGTH_SHORT).show();
@@ -1474,12 +1772,14 @@ public class WeiboLiteHook {
                     true
                 );
                 timeDialog.show();
+                HotReloadRuntime.trackDialog(timeDialog);
             },
             selected.get(Calendar.YEAR),
             selected.get(Calendar.MONTH),
             selected.get(Calendar.DAY_OF_MONTH)
         );
         dateDialog.show();
+        HotReloadRuntime.trackDialog(dateDialog);
     }
 
     private static long normalizeTimelineClearMinute(long timeMs, boolean endOfMinute) {
@@ -1606,6 +1906,7 @@ public class WeiboLiteHook {
             styleDarkDialog(confirmation, activity.getWindow().getDecorView())
         );
         confirmation.show();
+        HotReloadRuntime.trackDialog(confirmation);
     }
 
     private static void startTimelineCacheRangeClear(
@@ -1622,6 +1923,7 @@ public class WeiboLiteHook {
         final long endMs,
         final String cliOperationId
     ) {
+        if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
         if (startMs <= 0L || endMs < startMs) {
             showTimelineCacheClearToast(activity, "清理时间范围无效", Toast.LENGTH_SHORT);
             return false;
@@ -1667,6 +1969,7 @@ public class WeiboLiteHook {
                 styleDarkDialog(progressDialog, activity.getWindow().getDecorView())
             );
             progressDialog.show();
+            HotReloadRuntime.trackDialog(progressDialog);
         } else {
             progressDialog = null;
         }
@@ -1694,7 +1997,7 @@ public class WeiboLiteHook {
 
                 final TimelineCacheRangeClearResult completed = result;
                 final Throwable failure = error;
-                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                HotReloadRuntime.post(new Runnable() {
                     @Override
                     public void run() {
                         try {
@@ -2044,7 +2347,7 @@ public class WeiboLiteHook {
     }
 
     private static void rememberWeicoContext(Context context, String source) {
-        if (context == null) return;
+        if (context == null || sHotReloadPreparing) return;
         Context applicationContext = context.getApplicationContext();
         if (applicationContext != null) context = applicationContext;
         boolean recovered = sWeicoContext == null;
@@ -2087,6 +2390,9 @@ public class WeiboLiteHook {
     private static CliCommandBridge.Result handleWeicoCliCommand(String command, Bundle args) {
         if ("status".equals(command)) {
             return buildWeicoCliStatus();
+        }
+        if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) {
+            return CliCommandBridge.Result.error("hot reload is preparing; retry after readiness returns");
         }
         if ("timeline.top".equals(command)) {
             return runTimelineEdgeCliCommand(true);
@@ -2136,6 +2442,24 @@ public class WeiboLiteHook {
             cacheOldestMs = sCliLastCacheOldestMs;
         }
         CliCommandBridge.Result result = CliCommandBridge.Result.ready("Weibo Lite hook status")
+            .with("api", XposedBridge.apiVersion())
+            .with("xposed_api", XposedBridge.apiVersion())
+            .with("framework", XposedBridge.frameworkName())
+            .with("framework_version", XposedBridge.frameworkVersion())
+            .with("hot_reload_generation", sHotReloadGeneration)
+            .with("hot_reload_ready", sHotReloadReady)
+            .with("hot_reload_state_restored", sHotReloadStateRestored)
+            .with("hot_reload_preparing", sHotReloadPreparing)
+            .with("hot_reload_blocker", hotReloadBlocker())
+            .with("hot_reload_active_tasks", HotReloadRuntime.activeTaskCount())
+            .with("hot_reload_pending_callbacks", HotReloadRuntime.pendingMainTaskCount())
+            .with(
+                "hot_reload_observable_subscriptions",
+                sActiveTimelineObservableSubscriptions.get()
+            )
+            .with("hot_reload_observable_wrappers", liveTimelineObservableWrapperCount())
+            .with("timeline_ad_hooks", sTimelineAdHookCount)
+            .with("timeline_ad_strategy", sTimelineAdHookStrategy)
             .with("context_ready", getWeicoContext() != null)
             .with("timeline_ready", presenter != null && recyclerView != null)
             .with("timeline_count", presenter == null ? -1 : getTimelineStatusCount(presenter))
@@ -2776,18 +3100,22 @@ public class WeiboLiteHook {
 
     private static void hookStaleVideoOpenRefresh(final ClassLoader cl) {
         try {
-            final Class<?> activityClass = Class.forName(
+            final Class<?> activityClass = XposedHelpers.findClass(
                 "com.weico.international.ui.smallvideo.SmallVideoActivity",
-                false,
                 cl
             );
-            final Class<?> companionClass = Class.forName(
+            final Class<?> companionClass = XposedHelpers.findClass(
                 "com.weico.international.ui.smallvideo.SmallVideoActivity$Companion",
-                false,
                 cl
             );
-            final Class<?> videoInfoClass = Class.forName("com.weico.international.data.VideoInfo", false, cl);
-            final Class<?> statusClass = Class.forName("com.weico.international.model.sina.Status", false, cl);
+            final Class<?> videoInfoClass = XposedHelpers.findClass(
+                "com.weico.international.data.VideoInfo",
+                cl
+            );
+            final Class<?> statusClass = XposedHelpers.findClass(
+                "com.weico.international.model.sina.Status",
+                cl
+            );
 
             XposedHelpers.findAndHookMethod(
                 activityClass,
@@ -3000,9 +3328,8 @@ public class WeiboLiteHook {
                 "androidx.recyclerview.widget.RecyclerView",
                 cl
             );
-            Class<?> layoutManagerClass = Class.forName(
+            Class<?> layoutManagerClass = XposedHelpers.findClass(
                 "androidx.recyclerview.widget.RecyclerView$LayoutManager",
-                false,
                 cl
             );
             XposedHelpers.findAndHookMethod(
@@ -3014,7 +3341,7 @@ public class WeiboLiteHook {
                     protected void afterHookedMethod(final MethodHookParam param) {
                         final Object recyclerView = param.thisObject;
                         final Object layoutManager = param.args[0];
-                        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                        HotReloadRuntime.postDelayed(new Runnable() {
                             @Override
                             public void run() {
                                 if (fixTimelineLayoutDirection(recyclerView, layoutManager)) {
@@ -3027,9 +3354,8 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            Class<?> adapterClass = Class.forName(
+            Class<?> adapterClass = XposedHelpers.findClass(
                 "androidx.recyclerview.widget.RecyclerView$Adapter",
-                false,
                 cl
             );
             XposedHelpers.findAndHookMethod(
@@ -3040,7 +3366,7 @@ public class WeiboLiteHook {
                     @Override
                     protected void afterHookedMethod(final MethodHookParam param) {
                         final Object recyclerView = param.thisObject;
-                        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                        HotReloadRuntime.postDelayed(new Runnable() {
                             @Override
                             public void run() {
                                 try {
@@ -3180,7 +3506,10 @@ public class WeiboLiteHook {
 
     private static void hookTimelineMergeOrder(ClassLoader cl) {
         try {
-            Class<?> presenterClass = Class.forName("com.weico.international.ui.indexv2.IndexV2Presenter", false, cl);
+            Class<?> presenterClass = XposedHelpers.findClass(
+                "com.weico.international.ui.indexv2.IndexV2Presenter",
+                cl
+            );
             XposedHelpers.findAndHookMethod(presenterClass, "addData", List.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -3338,8 +3667,14 @@ public class WeiboLiteHook {
                 }
             });
 
-            Class<?> fragmentClass = Class.forName("com.weico.international.ui.indexv2.IndexV2Fragment", false, cl);
-            Class<?> commonLoadEventClass = Class.forName("com.weico.international.flux.Events$CommonLoadEvent", false, cl);
+            Class<?> fragmentClass = XposedHelpers.findClass(
+                "com.weico.international.ui.indexv2.IndexV2Fragment",
+                cl
+            );
+            Class<?> commonLoadEventClass = XposedHelpers.findClass(
+                "com.weico.international.flux.Events$CommonLoadEvent",
+                cl
+            );
             XposedHelpers.findAndHookMethod(fragmentClass, "initData", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -3413,7 +3748,10 @@ public class WeiboLiteHook {
 
     private static void hookV2TimelineDataOrder(ClassLoader cl) {
         try {
-            Class<?> actionClass = Class.forName("com.weico.international.ui.indexv2.IndexV2Action", false, cl);
+            Class<?> actionClass = XposedHelpers.findClass(
+                "com.weico.international.ui.indexv2.IndexV2Action",
+                cl
+            );
             XC_MethodHook networkHook = new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -3446,6 +3784,10 @@ public class WeiboLiteHook {
                 new Class<?>[] {java.util.ArrayList.class, Object.class},
                 networkHook
             )) {
+                XposedBridge.markCurrentRegistrationGroupIncomplete(
+                    "V2 timeline network hook candidates unavailable",
+                    null
+                );
                 log("V2 timeline data-order network hook unavailable");
             }
 
@@ -3475,8 +3817,14 @@ public class WeiboLiteHook {
 
     private static void hookV3TimelineDataOrder(ClassLoader cl) {
         try {
-            Class<?> actionClass = Class.forName("com.weico.international.ui.indexv2.IndexV3Action", false, cl);
-            Class<?> feedResultClass = Class.forName("com.weico.international.ui.indexv2.FeedResult", false, cl);
+            Class<?> actionClass = XposedHelpers.findClass(
+                "com.weico.international.ui.indexv2.IndexV3Action",
+                cl
+            );
+            Class<?> feedResultClass = XposedHelpers.findClass(
+                "com.weico.international.ui.indexv2.FeedResult",
+                cl
+            );
 
             try {
                 XposedHelpers.findAndHookMethod(actionClass, "loadHomeTimeline",
@@ -3583,6 +3931,10 @@ public class WeiboLiteHook {
                 new Class<?>[] {feedResultClass, Object.class},
                 networkHook
             )) {
+                XposedBridge.markCurrentRegistrationGroupIncomplete(
+                    "V3 timeline network hook candidates unavailable",
+                    null
+                );
                 log("V3 timeline data-order network hook unavailable");
             }
 
@@ -3616,10 +3968,13 @@ public class WeiboLiteHook {
         final String source,
         final boolean feedResultValues
     ) {
-        if (observable == null || !shouldLogTimelineNetworkProbe(action)) return observable;
+        if (observable == null || sHotReloadPreparing || !shouldLogTimelineNetworkProbe(action)) {
+            return observable;
+        }
         try {
             final int probeId = nextTimelineNetworkProbeSeq();
             final boolean[] seenNext = new boolean[]{false};
+            final AtomicInteger activeSubscriptions = new AtomicInteger();
             Class<?> consumerClass = Class.forName("io.reactivex.functions.Consumer", false, cl);
             Object wrapped = observable;
 
@@ -3633,6 +3988,8 @@ public class WeiboLiteHook {
                             return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnSubscribe");
                         }
                         if ("accept".equals(method.getName())) {
+                            activeSubscriptions.incrementAndGet();
+                            sActiveTimelineObservableSubscriptions.incrementAndGet();
                             log("Timeline v3 observable subscribe"
                                 + " probe=" + probeId
                                 + " source=" + source
@@ -3732,6 +4089,27 @@ public class WeiboLiteHook {
                 }
             );
             wrapped = XposedHelpers.callMethod(wrapped, "doOnComplete", onComplete);
+
+            Object onFinally = java.lang.reflect.Proxy.newProxyInstance(
+                actionClass.getClassLoader(),
+                new Class[]{actionClass},
+                new java.lang.reflect.InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+                        if (isObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnFinally")) {
+                            return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnFinally");
+                        }
+                        if ("run".equals(method.getName())) {
+                            finishTimelineObservableSubscription(activeSubscriptions);
+                        }
+                        return null;
+                    }
+                }
+            );
+            wrapped = XposedHelpers.callMethod(wrapped, "doFinally", onFinally);
+            synchronized (sLiveTimelineObservableWrappers) {
+                sLiveTimelineObservableWrappers.add(new WeakReference<>(wrapped));
+            }
             return wrapped;
         } catch (Throwable t) {
             log("Timeline v3 observable probe wrap error"
@@ -3754,6 +4132,31 @@ public class WeiboLiteHook {
     private static int nextTimelineNetworkProbeSeq() {
         synchronized (WeiboLiteHook.class) {
             return ++sTimelineNetworkProbeSeq;
+        }
+    }
+
+    private static void finishTimelineObservableSubscription(AtomicInteger activeSubscriptions) {
+        while (true) {
+            int active = activeSubscriptions.get();
+            if (active <= 0) return;
+            if (activeSubscriptions.compareAndSet(active, active - 1)) {
+                sActiveTimelineObservableSubscriptions.decrementAndGet();
+                return;
+            }
+        }
+    }
+
+    private static int liveTimelineObservableWrapperCount() {
+        synchronized (sLiveTimelineObservableWrappers) {
+            int count = 0;
+            for (int index = sLiveTimelineObservableWrappers.size() - 1; index >= 0; index--) {
+                if (sLiveTimelineObservableWrappers.get(index).get() == null) {
+                    sLiveTimelineObservableWrappers.remove(index);
+                } else {
+                    count++;
+                }
+            }
+            return count;
         }
     }
 
@@ -4142,6 +4545,7 @@ public class WeiboLiteHook {
 
     private static void persistTimelineNativeCache(Object presenter, String source) {
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) {
                 log("Timeline full cache persist skipped during manual clear source=" + source);
                 return;
@@ -4174,6 +4578,7 @@ public class WeiboLiteHook {
 
     private static boolean persistTimelineNativeCacheList(Object presenter, List list, String source, boolean force) {
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (sTimelineCacheClearInFlight) {
                 log("Timeline full cache list persist skipped during manual clear source=" + source);
                 return false;
@@ -4241,6 +4646,7 @@ public class WeiboLiteHook {
     }
 
     private static void persistTimelineShadowCache(String source, int count, String maxId, boolean force) {
+        if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         persistTimelineShadowCache(
             source,
             count,
@@ -4359,11 +4765,16 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineNativeCachePersist(TimelineNativePersistRequest request) {
+        if (request == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         if (sTimelineCacheClearInFlight) {
             log("Timeline native cache enqueue skipped during manual clear source=" + request.source);
             return;
         }
         synchronized (sTimelinePersistQueueLock) {
+            if (!shouldAcceptTimelinePersistEnqueue(
+                sHotReloadPreparing,
+                HotReloadRuntime.isAccepting()
+            )) return;
             if (sPendingTimelineNativePersist != null) {
                 log("Timeline native cache write coalesced old=" + sPendingTimelineNativePersist.source
                     + " new=" + request.source
@@ -4377,11 +4788,16 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineShadowCachePersist(TimelineShadowPersistRequest request) {
+        if (request == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         if (sTimelineCacheClearInFlight) {
             log("Timeline shadow cache enqueue skipped during manual clear source=" + request.source);
             return;
         }
         synchronized (sTimelinePersistQueueLock) {
+            if (!shouldAcceptTimelinePersistEnqueue(
+                sHotReloadPreparing,
+                HotReloadRuntime.isAccepting()
+            )) return;
             sPendingTimelineShadowPersist = request;
             scheduleTimelinePersistWorkerLocked();
         }
@@ -4889,6 +5305,7 @@ public class WeiboLiteHook {
         boolean preferCumulative
     ) {
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (sTimelineCacheClearInFlight) {
                 log("Timeline cache restore skipped during manual clear source=" + source);
                 return false;
@@ -5004,7 +5421,7 @@ public class WeiboLiteHook {
         final TimelineRestoreRequest completedRequest = effectiveRequest;
         final TimelineRestoreResult prepared = result;
         final Throwable failure = error;
-        new Handler(Looper.getMainLooper()).post(new Runnable() {
+        HotReloadRuntime.post(new Runnable() {
             @Override
             public void run() {
                 applyTimelineCacheRestore(completedRequest, prepared, failure);
@@ -5457,6 +5874,7 @@ public class WeiboLiteHook {
 
     private static void scheduleHomeTimelineAdapterSelfHeal(Object fragment, String source) {
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (fragment == null || sTimelineCacheClearInFlight) return;
             Object presenter = callMethodSafe(fragment, "getPresenter");
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
@@ -5507,7 +5925,7 @@ public class WeiboLiteHook {
                         targetPresenter,
                         source + "-self-heal"
                     );
-                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    HotReloadRuntime.post(new Runnable() {
                         @Override
                         public void run() {
                             applyPreparedHomeTimelineAdapters(
@@ -7481,6 +7899,7 @@ public class WeiboLiteHook {
 
     private static void scheduleTimelineGapFill(final Object presenter, final String source) {
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) return;
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             final long delayMs;
@@ -7503,7 +7922,7 @@ public class WeiboLiteHook {
                 state.scheduled = true;
                 delayMs = getTimelineGapFillDelayMsLocked(state);
             }
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            HotReloadRuntime.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     requestTimelineGapFill(presenter, source);
@@ -7573,7 +7992,7 @@ public class WeiboLiteHook {
                 + (fallbackAttempts > 0 ? " fallback=" + fallbackAttempts : ""));
             suppressTimelineGapFillShowData();
             XposedHelpers.callMethod(presenter, "loadMore");
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            HotReloadRuntime.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     finishTimelineGapFillWatchdog(presenter, token);
@@ -7697,7 +8116,8 @@ public class WeiboLiteHook {
 
     private static void postTimelineGapFillProgress(final String text, final boolean hideSoon, final String source) {
         try {
-            new Handler(Looper.getMainLooper()).post(new Runnable() {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
+            HotReloadRuntime.post(new Runnable() {
                 @Override
                 public void run() {
                     updateTimelineGapFillProgressView(text, hideSoon, source);
@@ -7724,7 +8144,7 @@ public class WeiboLiteHook {
             }
             if (hideSoon) {
                 final int hideGeneration = generation;
-                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                HotReloadRuntime.postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         if (hideGeneration == sTimelineGapFillProgressGeneration) {
@@ -7883,6 +8303,7 @@ public class WeiboLiteHook {
     }
 
     private static void refreshTimelineShortcutButtons(String source) {
+        if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         boolean showJumpButton = isModuleOptionEnabled(
             ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
             ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
@@ -7912,6 +8333,7 @@ public class WeiboLiteHook {
 
     private static boolean ensureTimelineTimeJumpButton(Object recyclerView, String source) {
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !(recyclerView instanceof View)) return false;
             View anchor = (View) recyclerView;
             FrameLayout parent = findTimelineOverlayParent(anchor);
@@ -8119,28 +8541,14 @@ public class WeiboLiteHook {
 
     private static void removeTimelineTimeJumpButton(String source) {
         try {
-            if (sTimelineTimeJumpButton != null) {
-                if (sTimelineTimeJumpWindowManager != null) {
-                    sTimelineTimeJumpWindowManager.removeViewImmediate(sTimelineTimeJumpButton);
-                } else {
-                    Object parent = sTimelineTimeJumpButton.getParent();
-                    if (parent instanceof ViewGroup) {
-                    ((ViewGroup) parent).removeView(sTimelineTimeJumpButton);
-                    }
-                }
-            }
-            if (sTimelineCacheClearButton != null) {
-                if (sTimelineCacheClearWindowManager != null) {
-                    sTimelineCacheClearWindowManager.removeViewImmediate(sTimelineCacheClearButton);
-                } else {
-                    Object parent = sTimelineCacheClearButton.getParent();
-                    if (parent instanceof ViewGroup) {
-                        ((ViewGroup) parent).removeView(sTimelineCacheClearButton);
-                    }
-                }
-            }
+            removeTimelineShortcutView(sTimelineTimeJumpButton, sTimelineTimeJumpWindowManager);
         } catch (Throwable t) {
-            log("Timeline shortcut buttons remove error source=" + source + ": " + t.getMessage());
+            log("Timeline jump button remove error source=" + source + ": " + t.getMessage());
+        }
+        try {
+            removeTimelineShortcutView(sTimelineCacheClearButton, sTimelineCacheClearWindowManager);
+        } catch (Throwable t) {
+            log("Timeline clear button remove error source=" + source + ": " + t.getMessage());
         } finally {
             sTimelineTimeJumpButton = null;
             sTimelineTimeJumpWindowManager = null;
@@ -8149,6 +8557,18 @@ public class WeiboLiteHook {
             sTimelineTimeJumpActivity = null;
             sTimelineTimeJumpRecyclerView = null;
         }
+    }
+
+    private static void removeTimelineShortcutView(View button, WindowManager windowManager) {
+        if (button == null) return;
+        button.setOnTouchListener(null);
+        button.setOnClickListener(null);
+        if (windowManager != null) {
+            windowManager.removeViewImmediate(button);
+            return;
+        }
+        Object parent = button.getParent();
+        if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(button);
     }
 
     private static void showTimelineTimeJumpDialog(final Object recyclerView) {
@@ -8261,6 +8681,7 @@ public class WeiboLiteHook {
                 }
             });
             dialog.show();
+            HotReloadRuntime.trackDialog(dialog);
             GradientDrawable dialogBackground = new GradientDrawable();
             dialogBackground.setColor(0xFF17181C);
             dialogBackground.setCornerRadius(dpToPx(anchor, 12));
@@ -8478,7 +8899,7 @@ public class WeiboLiteHook {
                         restoreTimelineCumulativeCache(sLastTimelinePresenter, null, source + "-restore");
                         showTimelineToast(targetRecyclerView, "正在恢复缓存后跳转");
                     }
-                    new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                    HotReloadRuntime.postDelayed(new Runnable() {
                         @Override
                         public void run() {
                             jumpTimelineToTime(
@@ -8539,7 +8960,7 @@ public class WeiboLiteHook {
                 + " visible=" + visible + " "
                 + describeTimelineViewport(targetRecyclerView, layoutManager));
             if (!visible && attempt < TIME_JUMP_MAX_ATTEMPTS) {
-                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                HotReloadRuntime.postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         jumpTimelineToTime(
@@ -8806,7 +9227,7 @@ public class WeiboLiteHook {
         try {
             if (!(recyclerView instanceof View) || !hasMeaningfulString(text)) return;
             final Context context = ((View) recyclerView).getContext();
-            new Handler(Looper.getMainLooper()).post(new Runnable() {
+            HotReloadRuntime.post(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -8954,7 +9375,7 @@ public class WeiboLiteHook {
         long[] delays = {0L, 80L, 300L, 900L};
         for (int i = 0; i < delays.length; i++) {
             final int attempt = i;
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            HotReloadRuntime.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     restoreTimelineGapFillViewportAnchor(anchor, source, attempt);
@@ -9048,7 +9469,7 @@ public class WeiboLiteHook {
         final int attempt,
         long delayMs
     ) {
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        HotReloadRuntime.postDelayed(new Runnable() {
             @Override
             public void run() {
                 anchorTimelineRefreshPosition(recyclerView, statusId, generation, source, attempt);
@@ -9277,7 +9698,7 @@ public class WeiboLiteHook {
                 + " attempt=" + attempt + " offset=" + offset + " usedOffset=" + usedOffset + " "
                 + describeTimelineViewport(recyclerView, layoutManager));
             if (!isTimelineTargetVisible(layoutManager, target) && attempt < TOP_BAR_JUMP_MAX_ATTEMPTS) {
-                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                HotReloadRuntime.postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         jumpTimelineToAbsoluteEdge(recyclerView, source, attempt + 1, top);
@@ -9410,7 +9831,7 @@ public class WeiboLiteHook {
             generation = state.generation;
             state.attempts++;
         }
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        HotReloadRuntime.postDelayed(new Runnable() {
             @Override
             public void run() {
                 anchorTimelineTop(recyclerView, source, generation);
@@ -9648,7 +10069,7 @@ public class WeiboLiteHook {
 
     private static void schedulePersistTimelineLastRead(final Object recyclerView, final String source, long delayMs) {
         if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        HotReloadRuntime.postDelayed(new Runnable() {
             @Override
             public void run() {
                 persistTimelineLastRead(recyclerView, source);
@@ -9871,20 +10292,41 @@ public class WeiboLiteHook {
             lp.gravity = Gravity.TOP;
             lp.topMargin = getTimelineTopOffset(recyclerView);
             parent.addView(marker, lp);
+            synchronized (sTimelineLastReadMarkerViews) {
+                sTimelineLastReadMarkerViews.put(marker, Boolean.TRUE);
+            }
             sLastReadMarkerShown = true;
             log("Timeline last-read marker shown");
 
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            HotReloadRuntime.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     try {
                         parent.removeView(marker);
                     } catch (Throwable ignored) {}
+                    synchronized (sTimelineLastReadMarkerViews) {
+                        sTimelineLastReadMarkerViews.remove(marker);
+                    }
                 }
             }, 6000L);
         } catch (Throwable t) {
             log("Timeline last-read marker error: " + t.getMessage());
         }
+    }
+
+    private static void removeTimelineLastReadMarkers() {
+        ArrayList<View> markers;
+        synchronized (sTimelineLastReadMarkerViews) {
+            markers = new ArrayList<>(sTimelineLastReadMarkerViews.keySet());
+            sTimelineLastReadMarkerViews.clear();
+        }
+        for (View marker : markers) {
+            try {
+                Object parent = marker.getParent();
+                if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(marker);
+            } catch (Throwable ignored) {}
+        }
+        sLastReadMarkerShown = false;
     }
 
     private static FrameLayout findTimelineMarkerParent(View view) {
@@ -10070,7 +10512,7 @@ public class WeiboLiteHook {
             generation = ++sPendingTimelineNoMoreGeneration;
         }
         log("Timeline no-more deferred until page applied source=" + source);
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        HotReloadRuntime.postDelayed(new Runnable() {
             @Override
             public void run() {
                 synchronized (WeiboLiteHook.class) {
@@ -10128,6 +10570,7 @@ public class WeiboLiteHook {
     private static void scheduleTimelinePreload(final Object presenter, final String source) {
         if (presenter == null) return;
         try {
+            if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) return;
             if (!"-1".equals(getTimelineGroupId(presenter))) return;
             rememberTimelinePresenter(presenter);
@@ -10174,7 +10617,7 @@ public class WeiboLiteHook {
                 suspendTimelineTopAnchorsForPreload(source);
             }
 
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            HotReloadRuntime.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     requestTimelinePreload(presenter, source);
@@ -10220,7 +10663,7 @@ public class WeiboLiteHook {
 
             log("Timeline preload loadMore page=" + page + " count=" + count + " source=" + source);
             XposedHelpers.callMethod(presenter, "loadMore");
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            HotReloadRuntime.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     finishTimelinePreloadWatchdog(presenter, token);
@@ -10319,6 +10762,7 @@ public class WeiboLiteHook {
     }
 
     private static void scheduleTimelinePreloadRetry(final Object presenter, long delayMs) {
+        if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         final int retryToken;
         synchronized (sPreloadStates) {
             PreloadState state = getPreloadStateLocked(presenter);
@@ -10326,7 +10770,7 @@ public class WeiboLiteHook {
             state.retryScheduled = true;
             retryToken = ++state.retryToken;
         }
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        HotReloadRuntime.postDelayed(new Runnable() {
             @Override
             public void run() {
                 synchronized (sPreloadStates) {
@@ -11276,64 +11720,278 @@ public class WeiboLiteHook {
         } catch (Throwable ignored) {}
     }
 
-    private static void removeTimelineAd(ClassLoader cl) {
-        String[] lambdas = {"queryUveAdRequest$lambda$151", "queryUveAdRequest$lambda$152", "queryUveAdRequest$lambda$153"};
-        try {
-            for (int i = 0; i < lambdas.length; i++) {
-                try {
-                    if (i == 0) {
-                        XposedHelpers.findAndHookMethod("com.weico.international.api.RxApiKt", cl, lambdas[i], java.util.Map.class,
-                            new XC_MethodHook() { @Override protected void beforeHookedMethod(MethodHookParam p) { p.setResult(""); } });
-                    } else {
-                        Class<?> func1 = XposedHelpers.findClass("kotlin.jvm.functions.Function1", cl);
-                        XposedHelpers.findAndHookMethod("com.weico.international.api.RxApiKt", cl, lambdas[i], func1, Object.class,
-                            new XC_MethodHook() { @Override protected void beforeHookedMethod(MethodHookParam p) { p.setResult(""); } });
+    private interface TimelineAdHookInstaller {
+        void install() throws Throwable;
+    }
+
+    private static void removeTimelineAd(final ClassLoader cl) {
+        int hookCount = 0;
+        ArrayList<String> strategies = new ArrayList<>();
+
+        hookCount += installUveAdHelperHook(cl, strategies);
+        hookCount += installLegacyRxApiAdHooks(cl, strategies);
+
+        if (installOptionalTimelineAdHook("status-ad-predicate", strategies, () -> {
+            Class<?> statusClass = XposedHelpers.findClass(
+                "com.weico.international.model.sina.Status",
+                cl
+            );
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.utility.KotlinExtendKt",
+                cl,
+                "isWeiboUVEAd",
+                statusClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        param.setResult(false);
                     }
-                } catch (Throwable ignored) {}
+                }
+            );
+        })) hookCount++;
+
+        if (installOptionalTimelineAdHook("page-ad-filter", strategies, () -> {
+            Class<?> pageInfoClass = XposedHelpers.findClass(
+                "com.weico.international.model.sina.PageInfo",
+                cl
+            );
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.utility.KotlinUtilKt",
+                cl,
+                "findUVEAd",
+                pageInfoClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        param.setResult(null);
+                    }
+                }
+            );
+        })) hookCount++;
+
+        XC_MethodHook adBoolHook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                String key = (String) param.args[0];
+                if ("BOOL_UVE_FEED_AD".equals(key)) param.setResult(false);
+                else if (key != null && key.startsWith("BOOL_AD_ACTIVITY_BLOCK_")) {
+                    param.setResult(true);
+                }
             }
-            try {
-                Class<?> statusClass = XposedHelpers.findClass("com.weico.international.model.sina.Status", cl);
-                XposedHelpers.findAndHookMethod("com.weico.international.utility.KotlinExtendKt", cl, "isWeiboUVEAd", statusClass,
-                    new XC_MethodHook() { @Override protected void beforeHookedMethod(MethodHookParam p) { p.setResult(false); } });
-            } catch (Throwable ignored) {}
-            try {
-                Class<?> pageInfoClass = XposedHelpers.findClass("com.weico.international.model.sina.PageInfo", cl);
-                XposedHelpers.findAndHookMethod("com.weico.international.utility.KotlinUtilKt", cl, "findUVEAd", pageInfoClass,
-                    new XC_MethodHook() { @Override protected void beforeHookedMethod(MethodHookParam p) { p.setResult(null); } });
-            } catch (Throwable ignored) {}
-            XC_MethodHook adBoolHook = new XC_MethodHook() {
+        };
+        if (installOptionalTimelineAdHook("setting-boolean", strategies, () ->
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.activity.v4.Setting",
+                cl,
+                "loadBoolean",
+                String.class,
+                boolean.class,
+                adBoolHook
+            )
+        )) hookCount++;
+
+        XC_MethodHook adIntHook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                String key = (String) param.args[0];
+                if ("ad_interval".equals(key)) param.setResult(Integer.MAX_VALUE);
+                else if ("display_ad".equals(key)) param.setResult(0);
+            }
+        };
+        if (installOptionalTimelineAdHook("setting-int", strategies, () ->
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.activity.v4.Setting",
+                cl,
+                "loadInt",
+                String.class,
+                adIntHook
+            )
+        )) hookCount++;
+        if (installOptionalTimelineAdHook("setting-int-default", strategies, () ->
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.activity.v4.Setting",
+                cl,
+                "loadInt",
+                String.class,
+                int.class,
+                adIntHook
+            )
+        )) hookCount++;
+
+        XC_MethodHook adStringHook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if ("video_ad".equals(param.args[0])) param.setResult("");
+            }
+        };
+        if (installOptionalTimelineAdHook("setting-string", strategies, () ->
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.activity.v4.Setting",
+                cl,
+                "loadString",
+                String.class,
+                adStringHook
+            )
+        )) hookCount++;
+        if (installOptionalTimelineAdHook("setting-string-default", strategies, () ->
+            XposedHelpers.findAndHookMethod(
+                "com.weico.international.activity.v4.Setting",
+                cl,
+                "loadString",
+                String.class,
+                String.class,
+                adStringHook
+            )
+        )) hookCount++;
+
+        recordTimelineAdRegistrationResult(hookCount, joinTimelineAdStrategies(strategies));
+    }
+
+    private static int installUveAdHelperHook(
+            ClassLoader cl,
+            ArrayList<String> strategies
+    ) {
+        Class<?> helperClass = XposedHelpers.findClassIfExists(
+            "com.weico.international.manager.uvead.UveAdHelper",
+            cl
+        );
+        Class<?> observableClass = XposedHelpers.findClassIfExists("io.reactivex.Observable", cl);
+        if (helperClass == null || observableClass == null) return 0;
+        Method queryMethod = findUveAdQueryMethod(helperClass, observableClass);
+        if (queryMethod == null) return 0;
+        try {
+            final Method justMethod = observableClass.getMethod("just", Object.class);
+            XposedBridge.hookMethod(queryMethod, new XC_MethodHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    String key = (String) p.args[0];
-                    if ("BOOL_UVE_FEED_AD".equals(key)) p.setResult(false);
-                    else if (key != null && key.startsWith("BOOL_AD_ACTIVITY_BLOCK_")) p.setResult(true);
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        param.setResult(justMethod.invoke(null, Collections.emptyList()));
+                    } catch (Throwable error) {
+                        Throwable cause = error instanceof java.lang.reflect.InvocationTargetException
+                            && error.getCause() != null ? error.getCause() : error;
+                        param.setThrowable(cause);
+                    }
                 }
-            };
+            });
+            addTimelineAdStrategy(strategies, "uvead-helper-observable");
+            return 1;
+        } catch (Throwable error) {
+            XposedBridge.markCurrentRegistrationGroupIncomplete(
+                "UveAdHelper query hook installation failed",
+                error
+            );
+            log("UveAdHelper query hook error: " + error.getMessage());
+            return 0;
+        }
+    }
+
+    static Method findUveAdQueryMethod(Class<?> helperClass, Class<?> observableClass) {
+        if (helperClass == null || observableClass == null) return null;
+        for (Method method : helperClass.getDeclaredMethods()) {
+            if (!"queryUveAdRequest".equals(method.getName())
+                || Modifier.isStatic(method.getModifiers())
+                || !Modifier.isPublic(method.getModifiers())
+                || !observableClass.isAssignableFrom(method.getReturnType())) continue;
+            Class<?>[] parameters = method.getParameterTypes();
+            if (parameters.length == 4
+                && Map.class.isAssignableFrom(parameters[0])
+                && parameters[1] == String.class
+                && parameters[2] == String.class
+                && List.class.isAssignableFrom(parameters[3])) {
+                method.setAccessible(true);
+                return method;
+            }
+        }
+        return null;
+    }
+
+    private static int installLegacyRxApiAdHooks(
+            ClassLoader cl,
+            ArrayList<String> strategies
+    ) {
+        Class<?> rxApiClass = XposedHelpers.findClassIfExists(
+            "com.weico.international.api.RxApiKt",
+            cl
+        );
+        if (rxApiClass == null) return 0;
+        int installed = 0;
+        for (final Method method : rxApiClass.getDeclaredMethods()) {
+            final String name = method.getName();
+            final boolean mapCandidate = "queryUveAdRequest$lambda$151".equals(name)
+                && method.getParameterCount() == 1
+                && Map.class.isAssignableFrom(method.getParameterTypes()[0]);
+            final boolean listCandidate = (
+                "queryUveAdRequest$lambda$152".equals(name)
+                    || "queryUveAdRequest$lambda$153".equals(name)
+            ) && method.getParameterCount() == 2
+                && "kotlin.jvm.functions.Function1".equals(method.getParameterTypes()[0].getName());
+            if (!mapCandidate && !listCandidate) continue;
             try {
-                XposedHelpers.findAndHookMethod("com.weico.international.activity.v4.Setting", cl, "loadBoolean", String.class, boolean.class, adBoolHook);
-            } catch (Throwable ignored) {}
-            XC_MethodHook adIntHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    String key = (String) p.args[0];
-                    if ("ad_interval".equals(key)) p.setResult(Integer.MAX_VALUE);
-                    else if ("display_ad".equals(key)) p.setResult(0);
-                }
-            };
-            try {
-                XposedHelpers.findAndHookMethod("com.weico.international.activity.v4.Setting", cl, "loadInt", String.class, adIntHook);
-                XposedHelpers.findAndHookMethod("com.weico.international.activity.v4.Setting", cl, "loadInt", String.class, int.class, adIntHook);
-            } catch (Throwable ignored) {}
-            XC_MethodHook adStrHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    if ("video_ad".equals(p.args[0])) p.setResult("");
-                }
-            };
-            try {
-                XposedHelpers.findAndHookMethod("com.weico.international.activity.v4.Setting", cl, "loadString", String.class, adStrHook);
-                XposedHelpers.findAndHookMethod("com.weico.international.activity.v4.Setting", cl, "loadString", String.class, String.class, adStrHook);
-            } catch (Throwable ignored) {}
-        } catch (Throwable ignored) {}
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (listCandidate || List.class.isAssignableFrom(method.getReturnType())) {
+                            param.setResult(Collections.emptyList());
+                        } else {
+                            param.setResult("");
+                        }
+                    }
+                });
+                addTimelineAdStrategy(strategies, "legacy-rxapi-" + name.substring(name.lastIndexOf('$') + 1));
+                installed++;
+            } catch (Throwable error) {
+                log("Legacy RxApi ad hook error method=" + name + ": " + error.getMessage());
+            }
+        }
+        return installed;
+    }
+
+    private static boolean installOptionalTimelineAdHook(
+            String strategy,
+            ArrayList<String> strategies,
+            TimelineAdHookInstaller installer
+    ) {
+        XposedBridge.beginOptionalRegistrationLookup();
+        try {
+            installer.install();
+            addTimelineAdStrategy(strategies, strategy);
+            return true;
+        } catch (Throwable optionalMiss) {
+            log("Optional timeline-ad hook unavailable strategy=" + strategy
+                + ": " + optionalMiss.getMessage());
+            return false;
+        } finally {
+            XposedBridge.endOptionalRegistrationLookup();
+        }
+    }
+
+    static void recordTimelineAdRegistrationResult(int hookCount, String strategy) {
+        sTimelineAdHookCount = Math.max(0, hookCount);
+        sTimelineAdHookStrategy = hookCount > 0 && strategy != null && !strategy.isEmpty()
+            ? strategy : "none";
+        if (hookCount <= 0) {
+            XposedBridge.markCurrentRegistrationGroupIncomplete(
+                "timeline-ad group installed zero effective hooks",
+                null
+            );
+        }
+        log("Timeline ad hooks installed count=" + sTimelineAdHookCount
+            + " strategy=" + sTimelineAdHookStrategy);
+    }
+
+    private static void addTimelineAdStrategy(ArrayList<String> strategies, String strategy) {
+        if (strategy != null && !strategy.isEmpty() && !strategies.contains(strategy)) {
+            strategies.add(strategy);
+        }
+    }
+
+    private static String joinTimelineAdStrategies(ArrayList<String> strategies) {
+        if (strategies == null || strategies.isEmpty()) return "none";
+        StringBuilder result = new StringBuilder();
+        for (String strategy : strategies) {
+            if (result.length() > 0) result.append('+');
+            result.append(strategy);
+        }
+        return result.toString();
     }
 }

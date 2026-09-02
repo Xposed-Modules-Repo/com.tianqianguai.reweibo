@@ -2,9 +2,9 @@ package com.tianqianguai.reweibo;
 
 import android.view.View;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.tianqianguai.reweibo.compat.XC_MethodHook;
+import com.tianqianguai.reweibo.compat.XposedBridge;
+import com.tianqianguai.reweibo.compat.XposedHelpers;
 
 public class PullReverseUtil {
 
