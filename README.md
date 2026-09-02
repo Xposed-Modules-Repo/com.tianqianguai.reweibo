@@ -20,6 +20,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - 按日期清理会优先保留当前已渲染微博，并重新补齐保留微博的正文与媒体字段，避免相邻日期内容变成空白。
 - 在可信缓存恢复后保存并恢复上次阅读位置，并显示“上次读到这里”标记。
 - 在可行时刷新或替换时间线视频的过期缓存地址。
+- 在 ReWeibo 设置中提供终端样式日志页：日志文本可长按自由选择，也可复制当前预览；支持按起止日期时间筛选，并将完整筛选结果流式导出为 TXT，避免把大型日志一次性载入界面。
 
 ## Features
 
@@ -35,6 +36,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 - Date-range clearing prefers currently rendered statuses and rehydrates retained text and media, preventing adjacent retained dates from becoming blank rows.
 - Saves and restores the last-read position after trusted cache restoration, with a visible "上次读到这里" marker.
 - Refreshes or replaces expired cached timeline video URLs when possible.
+- Adds a terminal-style log view to ReWeibo settings. Log text is freely selectable, the current preview can be copied, and complete results can be filtered by start/end date-time and streamed to a TXT export without loading a large file into the UI.
 
 ## 兼容性
 
@@ -60,7 +62,7 @@ ReWeibo is an LSPosed/Xposed module for Weibo Lite (`com.weico.international`).
 
 ## ADB / CLI
 
-设置、状态查询、时间跳转、缓存统计与精确范围清理均可直接通过 `adb shell content call` 调用，不需要仓库脚本、截图或坐标点击。命令清单见 [docs/cli.md](docs/cli.md)。
+设置、状态查询、日志预览/范围导出、时间跳转、缓存统计与精确范围清理均可直接通过 `adb shell content call` 调用，不需要仓库脚本、截图或坐标点击。命令清单见 [docs/cli.md](docs/cli.md)。
 
-Settings, status queries, time jumps, cache statistics, and exact-range cache clearing are available directly through `adb shell content call`, without repository scripts, screenshots, or coordinate taps. See [docs/cli.md](docs/cli.md) for the command list.
+Settings, status queries, log preview/range export, time jumps, cache statistics, and exact-range cache clearing are available directly through `adb shell content call`, without repository scripts, screenshots, or coordinate taps. See [docs/cli.md](docs/cli.md) for the command list.
 

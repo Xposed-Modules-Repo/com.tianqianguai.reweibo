@@ -27,9 +27,15 @@ class ExampleUnitTest {
     @Test
     fun cliContractRoutesWeiboLiteWithoutCoordinates() {
         val weico = CliContract.commandFor("weico.cache.clear")
+        val logStatus = CliContract.commandFor("weico.logs.status")
+        val logRead = CliContract.commandFor("weico.logs.read")
+        val logExport = CliContract.commandFor("weico.logs.export")
 
         assertEquals("com.weico.international", weico.targetPackage)
         assertEquals("cache.clear", weico.localName)
+        assertEquals("logs.status", logStatus.localName)
+        assertEquals("logs.read", logRead.localName)
+        assertEquals("logs.export", logExport.localName)
         assertNull(CliContract.commandFor("weico.unknown"))
     }
 

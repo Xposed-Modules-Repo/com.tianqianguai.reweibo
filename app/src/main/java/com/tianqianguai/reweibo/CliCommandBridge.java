@@ -11,6 +11,7 @@ import android.os.Bundle;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class CliCommandBridge {
     private static BroadcastReceiver sReceiver;
@@ -21,6 +22,18 @@ public final class CliCommandBridge {
 
     public interface Handler {
         Result handle(String command, Bundle args);
+
+        default boolean shouldHandleAsync(String command) {
+            return false;
+        }
+
+        default boolean handleAsync(String command, Bundle args, Completion completion) {
+            return false;
+        }
+    }
+
+    public interface Completion {
+        void complete(Result result);
     }
 
     /**
@@ -59,6 +72,35 @@ public final class CliCommandBridge {
                     args = new Bundle(args);
                     args.remove(CliContract.EXTRA_COMMAND);
                     args.remove(CliContract.EXTRA_FULL_COMMAND);
+                }
+                if (commandHandler.shouldHandleAsync(command)) {
+                    PendingResult pending = goAsync();
+                    AtomicBoolean finished = new AtomicBoolean();
+                    try {
+                        boolean accepted = commandHandler.handleAsync(
+                            command,
+                            args,
+                            result -> finish(pending, result, finished)
+                        );
+                        if (!accepted) {
+                            finish(
+                                pending,
+                                Result.error("cannot schedule command: " + command),
+                                finished
+                            );
+                        }
+                    } catch (Throwable error) {
+                        String message = error.getMessage();
+                        finish(
+                            pending,
+                            Result.error(
+                                error.getClass().getSimpleName()
+                                    + (message == null || message.isEmpty() ? "" : ": " + message)
+                            ),
+                            finished
+                        );
+                    }
+                    return;
                 }
                 try {
                     Result result = commandHandler.handle(command, args);
@@ -116,6 +158,19 @@ public final class CliCommandBridge {
         receiver.setResultCode(result.isError() ? Activity.RESULT_CANCELED : Activity.RESULT_OK);
         receiver.setResultData(result.encode());
         receiver.setResultExtras(result.toBundle());
+    }
+
+    private static void finish(
+            BroadcastReceiver.PendingResult pending,
+            Result result,
+            AtomicBoolean finished
+    ) {
+        if (pending == null || !finished.compareAndSet(false, true)) return;
+        Result safeResult = result == null ? Result.error("handler returned no result") : result;
+        pending.setResultCode(safeResult.isError() ? Activity.RESULT_CANCELED : Activity.RESULT_OK);
+        pending.setResultData(safeResult.encode());
+        pending.setResultExtras(safeResult.toBundle());
+        pending.finish();
     }
 
     public static final class Result {

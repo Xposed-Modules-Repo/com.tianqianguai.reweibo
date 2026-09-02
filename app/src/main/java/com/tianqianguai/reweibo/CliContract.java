@@ -16,6 +16,9 @@ public final class CliContract {
     static {
         LinkedHashMap<String, Command> commands = new LinkedHashMap<>();
         add(commands, "weico.status", PACKAGE_WEICO, "status");
+        add(commands, "weico.logs.status", PACKAGE_WEICO, "logs.status");
+        add(commands, "weico.logs.read", PACKAGE_WEICO, "logs.read");
+        add(commands, "weico.logs.export", PACKAGE_WEICO, "logs.export");
         add(commands, "weico.timeline.top", PACKAGE_WEICO, "timeline.top");
         add(commands, "weico.timeline.bottom", PACKAGE_WEICO, "timeline.bottom");
         add(commands, "weico.timeline.jump", PACKAGE_WEICO, "timeline.jump");

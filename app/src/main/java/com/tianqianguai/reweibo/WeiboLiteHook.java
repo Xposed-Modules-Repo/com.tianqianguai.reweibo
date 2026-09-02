@@ -143,6 +143,7 @@ public class WeiboLiteHook {
     private static final String TIMELINE_VERIFIED_NATURAL_GAPS_PREFIX =
         "reweibo_weico_verified_natural_gaps_";
     private static final String TIMELINE_CLEAR_TIME_PATTERN = "yyyy-MM-dd HH:mm";
+    private static final String WEICO_LOG_FILE_NAME = "reweibo_weico.log";
     private static final Map<Object, PreloadState> sPreloadStates = new WeakHashMap<>();
     private static final Map<Object, TopAnchorState> sTopAnchorStates = new WeakHashMap<>();
     private static final Map<Object, Boolean> sTimelineRecyclerViews = new WeakHashMap<>();
@@ -160,6 +161,7 @@ public class WeiboLiteHook {
     private static final ConcurrentHashMap<Class<?>, ConcurrentHashMap<String, FieldLookup>> sFieldLookups = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Class<?>, ConcurrentHashMap<String, MethodLookup>> sNoArgMethodLookups = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Integer> sModuleIntSettings = new ConcurrentHashMap<>();
+    private static final Object sLogFileLock = new Object();
     private static final Object sTimelineFileLock = new Object();
     private static final Object sTimelinePersistQueueLock = new Object();
     private static final Object sTimelineRestoreLock = new Object();
@@ -170,6 +172,8 @@ public class WeiboLiteHook {
             "ReWeibo-timeline-restore",
             Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1)
         );
+    private static final ExecutorService sLogIoExecutor =
+        HotReloadRuntime.newSingleThreadExecutor("ReWeibo-log-io", Thread.MIN_PRIORITY);
     private static final Map sTimelineCumulativeStatusesById = new LinkedHashMap();
     private static final GapFillState sTimelineGapFillState = new GapFillState();
     private static File sLogFile = null;
@@ -243,6 +247,10 @@ public class WeiboLiteHook {
     private static int sCliLastCacheDatedCount = -1;
     private static long sCliLastCacheNewestMs = 0L;
     private static long sCliLastCacheOldestMs = 0L;
+    private static String sCliLastLogExportPath = "";
+    private static long sCliLastLogExportLines = 0L;
+    private static long sCliLastLogExportBytes = 0L;
+    private static final AtomicInteger sPendingLogIoTasks = new AtomicInteger();
     private static final AtomicInteger sActiveTimelineObservableSubscriptions = new AtomicInteger();
     private static final List<WeakReference<Object>> sLiveTimelineObservableWrappers = new ArrayList<>();
     private static volatile boolean sHotReloadPreparing = false;
@@ -596,23 +604,44 @@ public class WeiboLiteHook {
 
     private static void log(String msg) {
         XposedBridge.log("ReWeibo: " + msg);
-        if (sLogFile != null) {
+        synchronized (sLogFileLock) {
+            if (sLogFile == null) return;
             try {
                 FileWriter fw = new FileWriter(sLogFile, true);
-                String ts = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-                fw.write(ts + " " + msg + "\n");
+                fw.write(LogFileTools.formatLogTimestamp(System.currentTimeMillis())
+                    + " " + msg + "\n");
                 fw.close();
             } catch (Throwable ignored) {}
         }
     }
 
     private static void initLogFile() {
-        try {
-            File dir = new File("/data/data/com.weico.international/files");
-            if (!dir.exists()) dir.mkdirs();
-            sLogFile = new File(dir, "reweibo_weico.log");
-            log("=== Log started ===");
-        } catch (Throwable ignored) {}
+        synchronized (sLogFileLock) {
+            try {
+                File dir = new File("/data/data/com.weico.international/files");
+                if (!dir.exists()) dir.mkdirs();
+                sLogFile = new File(dir, WEICO_LOG_FILE_NAME);
+            } catch (Throwable ignored) {
+                sLogFile = null;
+            }
+        }
+        log("=== Log started ===");
+    }
+
+    private static File getWeicoLogFile() {
+        synchronized (sLogFileLock) {
+            if (sLogFile != null) return sLogFile;
+            return new File(
+                "/data/data/com.weico.international/files",
+                WEICO_LOG_FILE_NAME
+            );
+        }
+    }
+
+    private static LogFileTools.Snapshot snapshotWeicoLogFile() throws java.io.IOException {
+        synchronized (sLogFileLock) {
+            return LogFileTools.snapshot(getWeicoLogFile());
+        }
     }
 
     static void initializeHotReloadRuntime(long generation, boolean restored) {
@@ -669,6 +698,8 @@ public class WeiboLiteHook {
         if (includePreparing && sHotReloadPreparing) return "generation-retiring";
         if (sTimelineCacheClearInFlight) return "cache-clear-active";
         if (sTimelineCacheClearDialogLoading) return "cache-dialog-loading";
+        int pendingLogIo = sPendingLogIoTasks.get();
+        if (pendingLogIo > 0) return "log-io-pending=" + pendingLogIo;
         synchronized (sTimelinePersistQueueLock) {
             String persistBlocker = timelinePersistBlockerForState(
                 sPendingTimelineNativePersist != null,
@@ -897,7 +928,9 @@ public class WeiboLiteHook {
         sTimelineTimeJumpActivity = null;
         sTimelineTimeJumpRecyclerView = null;
         sWeicoContext = null;
-        sLogFile = null;
+        synchronized (sLogFileLock) {
+            sLogFile = null;
+        }
         HotReloadRuntime.clearDialogReferences();
     }
 
@@ -1335,6 +1368,53 @@ public class WeiboLiteHook {
             clearButtonParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 12), 0, 0);
             panel.addView(clearButton, clearButtonParams);
             clearButton.setOnClickListener(v -> showTimelineCacheClearRangeDialog(activity));
+
+            View logDivider = new View(activity);
+            logDivider.setBackgroundColor(0xFF343946);
+            LinearLayout.LayoutParams logDividerParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                Math.max(1, dpToPx(activity.getWindow().getDecorView(), 1))
+            );
+            logDividerParams.setMargins(0, padding, 0, padding / 2);
+            panel.addView(logDivider, logDividerParams);
+
+            TextView logLabel = new TextView(activity);
+            logLabel.setText("运行日志");
+            logLabel.setTextColor(Color.WHITE);
+            logLabel.setTextSize(15f);
+            panel.addView(logLabel);
+
+            TextView logDescription = new TextView(activity);
+            logDescription.setText(
+                "终端样式查看；可长按自由选择文字，并按起止时间复制或导出 TXT。"
+            );
+            logDescription.setTextColor(Color.rgb(160, 169, 184));
+            logDescription.setTextSize(12f);
+            logDescription.setPadding(0, dpToPx(activity.getWindow().getDecorView(), 6), 0, 0);
+            panel.addView(logDescription);
+
+            TextView logButton = new TextView(activity);
+            logButton.setText("打开日志终端");
+            logButton.setContentDescription("打开 ReWeibo 日志终端");
+            logButton.setTextColor(0xFF62E875);
+            logButton.setTypeface(android.graphics.Typeface.MONOSPACE);
+            logButton.setTextSize(14f);
+            logButton.setGravity(Gravity.CENTER);
+            logButton.setClickable(true);
+            logButton.setFocusable(true);
+            logButton.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
+            LinearLayout.LayoutParams logButtonParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(activity.getWindow().getDecorView(), 44)
+            );
+            logButtonParams.setMargins(0, dpToPx(activity.getWindow().getDecorView(), 12), 0, 0);
+            panel.addView(logButton, logButtonParams);
+            logButton.setOnClickListener(v -> LogTerminalDialog.show(
+                activity,
+                getWeicoLogFile(),
+                sLogFileLock,
+                WeiboLiteHook::submitLogIoTask
+            ));
 
             final AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle("ReWeibo 设置")
@@ -2370,6 +2450,22 @@ public class WeiboLiteHook {
                     public CliCommandBridge.Result handle(String command, Bundle args) {
                         return handleWeicoCliCommand(command, args);
                     }
+
+                    @Override
+                    public boolean shouldHandleAsync(String command) {
+                        return "logs.status".equals(command) || "logs.read".equals(command);
+                    }
+
+                    @Override
+                    public boolean handleAsync(
+                            String command,
+                            Bundle args,
+                            CliCommandBridge.Completion completion
+                    ) {
+                        return submitLogIoTask(() -> completion.complete(
+                            handleWeicoCliCommand(command, args)
+                        ));
+                    }
                 }
             );
             if (registered) {
@@ -2387,12 +2483,42 @@ public class WeiboLiteHook {
         int value = 0;
     }
 
+    static boolean submitLogIoTask(Runnable task) {
+        if (task == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
+        sPendingLogIoTasks.incrementAndGet();
+        try {
+            sLogIoExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        task.run();
+                    } finally {
+                        sPendingLogIoTasks.decrementAndGet();
+                    }
+                }
+            });
+            return true;
+        } catch (Throwable error) {
+            sPendingLogIoTasks.decrementAndGet();
+            return false;
+        }
+    }
+
     private static CliCommandBridge.Result handleWeicoCliCommand(String command, Bundle args) {
         if ("status".equals(command)) {
             return buildWeicoCliStatus();
         }
         if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) {
             return CliCommandBridge.Result.error("hot reload is preparing; retry after readiness returns");
+        }
+        if ("logs.status".equals(command)) {
+            return runLogStatusCliCommand();
+        }
+        if ("logs.read".equals(command)) {
+            return runLogReadCliCommand(args);
+        }
+        if ("logs.export".equals(command)) {
+            return runLogExportCliCommand(args);
         }
         if ("timeline.top".equals(command)) {
             return runTimelineEdgeCliCommand(true);
@@ -2430,6 +2556,9 @@ public class WeiboLiteHook {
         int cacheDatedCount;
         long cacheNewestMs;
         long cacheOldestMs;
+        String logExportPath;
+        long logExportLines;
+        long logExportBytes;
         synchronized (sCliOperationLock) {
             operationId = sCliLastOperationId;
             operationCommand = sCliLastOperationCommand;
@@ -2440,6 +2569,9 @@ public class WeiboLiteHook {
             cacheDatedCount = sCliLastCacheDatedCount;
             cacheNewestMs = sCliLastCacheNewestMs;
             cacheOldestMs = sCliLastCacheOldestMs;
+            logExportPath = sCliLastLogExportPath;
+            logExportLines = sCliLastLogExportLines;
+            logExportBytes = sCliLastLogExportBytes;
         }
         CliCommandBridge.Result result = CliCommandBridge.Result.ready("Weibo Lite hook status")
             .with("api", XposedBridge.apiVersion())
@@ -2453,6 +2585,7 @@ public class WeiboLiteHook {
             .with("hot_reload_blocker", hotReloadBlocker())
             .with("hot_reload_active_tasks", HotReloadRuntime.activeTaskCount())
             .with("hot_reload_pending_callbacks", HotReloadRuntime.pendingMainTaskCount())
+            .with("log_io_pending", sPendingLogIoTasks.get())
             .with(
                 "hot_reload_observable_subscriptions",
                 sActiveTimelineObservableSubscriptions.get()
@@ -2483,7 +2616,10 @@ public class WeiboLiteHook {
             .with("last_operation_command", operationCommand)
             .with("last_operation_state", operationState)
             .with("last_operation_message", operationMessage)
-            .with("last_operation_updated_at_ms", operationUpdatedAtMs);
+            .with("last_operation_updated_at_ms", operationUpdatedAtMs)
+            .with("last_log_export_path", logExportPath)
+            .with("last_log_export_lines", logExportLines)
+            .with("last_log_export_bytes", logExportBytes);
         if (cacheCount >= 0) {
             result.with("last_cache_count", cacheCount)
                 .with("last_cache_dated_count", cacheDatedCount)
@@ -2491,6 +2627,131 @@ public class WeiboLiteHook {
                 .with("last_cache_oldest_ms", cacheOldestMs);
         }
         return result;
+    }
+
+    private static CliCommandBridge.Result runLogStatusCliCommand() {
+        try {
+            LogFileTools.Snapshot snapshot = snapshotWeicoLogFile();
+            LogFileTools.Result stats = LogFileTools.inspect(snapshot);
+            return CliCommandBridge.Result.ready("log file status")
+                .with("path", snapshot.file.getAbsolutePath())
+                .with("file_bytes", stats.fileBytes)
+                .with("total_lines", stats.totalLines)
+                .with("legacy_lines", stats.legacyLines)
+                .with("first_timestamp_ms", stats.firstTimestampMs)
+                .with("last_timestamp_ms", stats.lastTimestampMs)
+                .with(
+                    "first_timestamp",
+                    stats.firstTimestampMs > 0L
+                        ? LogFileTools.formatDisplayTimestamp(stats.firstTimestampMs)
+                        : ""
+                )
+                .with(
+                    "last_timestamp",
+                    stats.lastTimestampMs > 0L
+                        ? LogFileTools.formatDisplayTimestamp(stats.lastTimestampMs)
+                        : ""
+                );
+        } catch (Throwable error) {
+            return CliCommandBridge.Result.error("log status failed: " + error.getMessage());
+        }
+    }
+
+    private static CliCommandBridge.Result runLogReadCliCommand(Bundle args) {
+        try {
+            LogFileTools.Range range = parseLogRangeFromCli(args);
+            int maxChars = parseLogPreviewMaxChars(getCliArgument(args, "max_chars"));
+            LogFileTools.Snapshot snapshot = snapshotWeicoLogFile();
+            LogFileTools.Result preview = LogFileTools.readPreview(snapshot, range, maxChars);
+            return CliCommandBridge.Result.ready("log preview")
+                .with("range", range.describe())
+                .with("matched_lines", preview.matchedLines)
+                .with("total_lines", preview.totalLines)
+                .with("legacy_lines", preview.legacyLines)
+                .with("skipped_legacy_lines", preview.skippedLegacyLines)
+                .with("truncated", preview.truncated)
+                .with("text", preview.text);
+        } catch (IllegalArgumentException error) {
+            return CliCommandBridge.Result.error(error.getMessage());
+        } catch (Throwable error) {
+            return CliCommandBridge.Result.error("log read failed: " + error.getMessage());
+        }
+    }
+
+    private static CliCommandBridge.Result runLogExportCliCommand(Bundle args) {
+        final LogFileTools.Range range;
+        try {
+            range = parseLogRangeFromCli(args);
+        } catch (IllegalArgumentException error) {
+            return CliCommandBridge.Result.error(error.getMessage());
+        }
+        final Context context = getWeicoContext();
+        if (context == null) return CliCommandBridge.Result.error("target context is unavailable");
+        final LogFileTools.Snapshot snapshot;
+        try {
+            snapshot = snapshotWeicoLogFile();
+        } catch (Throwable error) {
+            return CliCommandBridge.Result.error("log snapshot failed: " + error.getMessage());
+        }
+        final String operationId = beginCliOperation("logs.export", range.describe());
+        boolean accepted = submitLogIoTask(new Runnable() {
+            @Override
+            public void run() {
+                updateCliOperation(operationId, "running", "exporting log range");
+                try {
+                    LogExportManager.ExportResult exported = LogExportManager.exportForCli(
+                        context,
+                        snapshot,
+                        range
+                    );
+                    updateCliLogExport(operationId, exported);
+                    finishCliOperation(
+                        operationId,
+                        "completed",
+                        "exported " + exported.log.matchedLines + " lines to " + exported.location
+                    );
+                    log("CLI log export completed range=" + range.describe()
+                        + " lines=" + exported.log.matchedLines
+                        + " bytes=" + exported.log.outputBytes
+                        + " path=" + exported.location);
+                } catch (Throwable error) {
+                    finishCliOperation(
+                        operationId,
+                        "error",
+                        error.getClass().getSimpleName() + ": " + error.getMessage()
+                    );
+                }
+            }
+        });
+        if (!accepted) {
+            finishCliOperation(operationId, "error", "cannot schedule log export");
+            return CliCommandBridge.Result.error("cannot schedule log export")
+                .with("operation_id", operationId);
+        }
+        return CliCommandBridge.Result.accepted("log export scheduled")
+            .with("operation_id", operationId)
+            .with("range", range.describe());
+    }
+
+    private static LogFileTools.Range parseLogRangeFromCli(Bundle args) {
+        return LogFileTools.parseRange(
+            getCliArgument(args, "start"),
+            getCliArgument(args, "end")
+        );
+    }
+
+    private static int parseLogPreviewMaxChars(String raw) {
+        if (raw == null || raw.isEmpty()) return 24 * 1024;
+        final int value;
+        try {
+            value = Integer.parseInt(raw);
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException("max_chars must be an integer from 1 to 49152");
+        }
+        if (value < 1 || value > LogFileTools.CLI_PREVIEW_MAX_CHARS) {
+            throw new IllegalArgumentException("max_chars must be from 1 to 49152");
+        }
+        return value;
     }
 
     private static CliCommandBridge.Result runTimelineEdgeCliCommand(boolean top) {
@@ -2726,6 +2987,11 @@ public class WeiboLiteHook {
             sCliLastCacheDatedCount = -1;
             sCliLastCacheNewestMs = 0L;
             sCliLastCacheOldestMs = 0L;
+            if ("logs.export".equals(command)) {
+                sCliLastLogExportPath = "";
+                sCliLastLogExportLines = 0L;
+                sCliLastLogExportBytes = 0L;
+            }
             return sCliLastOperationId;
         }
     }
@@ -2751,6 +3017,19 @@ public class WeiboLiteHook {
             sCliLastCacheDatedCount = stats.datedCount;
             sCliLastCacheNewestMs = stats.newestMs;
             sCliLastCacheOldestMs = stats.oldestMs;
+        }
+    }
+
+    private static void updateCliLogExport(
+            String operationId,
+            LogExportManager.ExportResult exported
+    ) {
+        if (exported == null || exported.log == null) return;
+        synchronized (sCliOperationLock) {
+            if (!sCliLastOperationId.equals(operationId)) return;
+            sCliLastLogExportPath = exported.location;
+            sCliLastLogExportLines = exported.log.matchedLines;
+            sCliLastLogExportBytes = exported.log.outputBytes;
         }
     }
 
