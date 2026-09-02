@@ -74,7 +74,7 @@ class LogFileToolsTest {
     }
 
     @Test
-    fun isoTSeparatorMatchesTheHumanReadableCliRange() {
+    fun adbSafeAndIsoSeparatorsMatchTheHumanReadableRange() {
         val spaced = LogFileTools.parseRange(
             "2026-09-02 09:00:00",
             "2026-09-02 10:00:00"
@@ -83,9 +83,15 @@ class LogFileToolsTest {
             "2026-09-02T09:00:00",
             "2026-09-02T10:00:00"
         )
+        val adbSafe = LogFileTools.parseRange(
+            "2026-09-02_09-00-00",
+            "2026-09-02_10-00-00"
+        )
 
         assertEquals(spaced.startMs, iso.startMs)
         assertEquals(spaced.endMs, iso.endMs)
+        assertEquals(spaced.startMs, adbSafe.startMs)
+        assertEquals(spaced.endMs, adbSafe.endMs)
     }
 
     @Test

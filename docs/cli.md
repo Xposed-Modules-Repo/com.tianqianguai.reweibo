@@ -37,8 +37,8 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.status
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.status
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.read --extra max_chars:i:24000
-adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.read --extra start:s:2026-09-02T09:00:00 --extra end:s:2026-09-02T11:30:00 --extra max_chars:i:48000
-adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.export --extra start:s:2026-09-02T09:00:00 --extra end:s:2026-09-02T11:30:00
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.read --extra start:s:2026-09-02_09-00-00 --extra end:s:2026-09-02_11-30-00 --extra max_chars:i:48000
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.export --extra start:s:2026-09-02_09-00-00 --extra end:s:2026-09-02_11-30-00
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.top
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.bottom
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.jump --extra "value:s:7-11 18:30"
@@ -49,7 +49,7 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.settings.reload
 ```
 
-`logs.export`、`cache.stats` 和 `cache.clear` 返回 `status=accepted` 后，通过重复调用 `weico.status` 读取 `last_operation_state`，直到变为 `completed` 或 `error`。日志导出完成后，`last_log_export_path` 是可直接用于 `adb pull` 的文件路径，并同时返回行数和字节数。日志的 `start`、`end` 可分别省略；直接 ADB 推荐使用无空格格式 `yyyy-MM-ddTHH:mm:ss`，界面输入也兼容 `yyyy-MM-dd HH:mm:ss`。两者都省略表示全部日志。新版日志含完整日期；旧版只有 `HH:mm:ss` 的日志在“全部”模式中保留，但因日期无法可靠恢复，在精确日期范围中会被统计到 `skipped_legacy_lines` 并跳过。
+`logs.export`、`cache.stats` 和 `cache.clear` 返回 `status=accepted` 后，通过重复调用 `weico.status` 读取 `last_operation_state`，直到变为 `completed` 或 `error`。日志导出完成后，`last_log_export_path` 是可直接用于 `adb pull` 的文件路径，并同时返回行数和字节数。日志的 `start`、`end` 可分别省略；Android `content` 的绑定值不能可靠携带空格或冒号，因此直接 ADB 使用 `yyyy-MM-dd_HH-mm-ss`，界面输入仍兼容 `yyyy-MM-dd HH:mm:ss` 与 ISO `T`。两者都省略表示全部日志。新版日志含完整日期；旧版只有 `HH:mm:ss` 的日志在“全部”模式中保留，但因日期无法可靠恢复，在精确日期范围中会被统计到 `skipped_legacy_lines` 并跳过。
 
 例如导出完成后：
 

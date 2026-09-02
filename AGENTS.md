@@ -52,8 +52,8 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 # Runtime status and actions.
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.status
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.status
-adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.read --extra start:s:2026-09-02T09:00:00 --extra end:s:2026-09-02T11:30:00 --extra max_chars:i:48000
-adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.export --extra start:s:2026-09-02T09:00:00 --extra end:s:2026-09-02T11:30:00
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.read --extra start:s:2026-09-02_09-00-00 --extra end:s:2026-09-02_11-30-00 --extra max_chars:i:48000
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.logs.export --extra start:s:2026-09-02_09-00-00 --extra end:s:2026-09-02_11-30-00
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.top
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.bottom
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.jump --extra "value:s:7-11 18:30"
@@ -63,7 +63,7 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.settings.reload
 ```
 
-`weico.logs.export`, `weico.cache.stats`, and `weico.cache.clear` are asynchronous. Poll `weico.status` and read `last_operation_state` until it becomes `completed` or `error`. A completed log export reports a pullable path in `last_log_export_path`.
+`weico.logs.export`, `weico.cache.stats`, and `weico.cache.clear` are asynchronous. Poll `weico.status` and read `last_operation_state` until it becomes `completed` or `error`. A completed log export reports a pullable path in `last_log_export_path`. Use `yyyy-MM-dd_HH-mm-ss` for raw ADB ranges because Android `content` bindings do not reliably preserve spaces or colons; the app UI also accepts the human-readable space and ISO `T` forms.
 
 ## Release notes
 

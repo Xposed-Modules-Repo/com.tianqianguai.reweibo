@@ -26,10 +26,13 @@ public final class LogFileTools {
     private static final String[] DATE_TIME_PATTERNS = new String[] {
         "yyyy-MM-dd HH:mm:ss.SSS",
         "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        "yyyy-MM-dd_HH-mm-ss.SSS",
         "yyyy-MM-dd HH:mm:ss",
         "yyyy-MM-dd'T'HH:mm:ss",
+        "yyyy-MM-dd_HH-mm-ss",
         "yyyy-MM-dd HH:mm",
         "yyyy-MM-dd'T'HH:mm",
+        "yyyy-MM-dd_HH-mm",
         "yyyy-MM-dd"
     };
 
@@ -117,12 +120,12 @@ public final class LogFileTools {
         long endMs = hasEnd ? parseBound(end, true) : Long.MAX_VALUE;
         if (hasStart && startMs < 0L) {
             throw new IllegalArgumentException(
-                "invalid start; use yyyy-MM-dd or yyyy-MM-dd'T'HH:mm[:ss]"
+                "invalid start; use yyyy-MM-dd or yyyy-MM-dd_HH-mm[-ss]"
             );
         }
         if (hasEnd && endMs < 0L) {
             throw new IllegalArgumentException(
-                "invalid end; use yyyy-MM-dd or yyyy-MM-dd'T'HH:mm[:ss]"
+                "invalid end; use yyyy-MM-dd or yyyy-MM-dd_HH-mm[-ss]"
             );
         }
         if (startMs > endMs) {
@@ -309,10 +312,10 @@ public final class LogFileTools {
                 calendar.set(Calendar.MINUTE, end ? 59 : 0);
                 calendar.set(Calendar.SECOND, end ? 59 : 0);
                 calendar.set(Calendar.MILLISECOND, end ? 999 : 0);
-            } else if (pattern.endsWith("HH:mm")) {
+            } else if (pattern.endsWith("HH:mm") || pattern.endsWith("HH-mm")) {
                 calendar.set(Calendar.SECOND, end ? 59 : 0);
                 calendar.set(Calendar.MILLISECOND, end ? 999 : 0);
-            } else if (pattern.endsWith("HH:mm:ss")) {
+            } else if (pattern.endsWith("HH:mm:ss") || pattern.endsWith("HH-mm-ss")) {
                 calendar.set(Calendar.MILLISECOND, end ? 999 : 0);
             }
             return calendar.getTimeInMillis();
