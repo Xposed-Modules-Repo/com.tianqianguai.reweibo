@@ -62,7 +62,7 @@
 - 入口：`META-INF/xposed/java_init.list` -> `com.tianqianguai.reweibo.MainHook`。
 - 启用 `autoHotReload=true`：更新模块后会在不重启微博轻享版进程的情况下原子替换同 ID hook，并恢复当前 Application、时间线 presenter、RecyclerView 与页面 owner。缓存清理、缓存读写、网络订阅或模块对话框仍活动时会拒绝本次热重载，待任务结束后可重试。
 - 模块描述：微博轻享版 LSPosed/Xposed 模块：去广告、反向时间线、阅读位置恢复
-- 微博轻享版 6.9.8：V2/V3 时间线数据顺序 hook 支持 R8 `ExternalSyntheticLambda` 候选，旧版 `doLoadData` lambda 候选仍受支持。
+- 微博轻享版 6.9.9：V2/V3 时间线数据顺序 hook 支持 R8 `ExternalSyntheticLambda` 候选，旧版 `doLoadData` lambda 候选仍受支持。
 
 ## Compatibility
 
@@ -73,7 +73,7 @@
 - Entry point: `META-INF/xposed/java_init.list` -> `com.tianqianguai.reweibo.MainHook`.
 - `autoHotReload=true` is enabled. A module update atomically replaces same-ID hooks without restarting the Weibo Lite process and restores the current Application, timeline presenter, RecyclerView, and page owner. Reload is rejected while cache clearing, cache I/O, network subscriptions, or module dialogs are active; retry after that work finishes.
 - Module description: Weibo Lite LSPosed/Xposed module for ad removal, reversed timeline, and reading-position recovery.
-- Weibo Lite 6.9.8: V2/V3 timeline data-order hooks support R8 `ExternalSyntheticLambda` candidates, while older `doLoadData` lambda candidates remain supported.
+- Weibo Lite 6.9.9: V2/V3 timeline data-order hooks support R8 `ExternalSyntheticLambda` candidates, while older `doLoadData` lambda candidates remain supported.
 
 ## ADB / CLI
 
