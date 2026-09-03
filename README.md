@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/Xposed-Modules-Repo/com.tianqianguai.reweibo/stargazers"><img src="https://img.shields.io/github/stars/Xposed-Modules-Repo/com.tianqianguai.reweibo?style=for-the-badge&logo=github&label=Star" alt="GitHub Stars"></a>
   <a href="https://t.me/reweibo_offical"><img src="https://img.shields.io/badge/Telegram-Official_Group-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Official Group"></a>
-  <a href="https://t.me/zhongjitianqianguai3"><img src="https://img.shields.io/badge/Telegram-Software_Releases-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Software Release Channel"></a>
+  <a href="https://t.me/zhongjitianqianguai3"><img src="https://img.shields.io/badge/Telegram-Release_Channel-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram Release Channel"></a>
 </p>
 
 <p align="center">
