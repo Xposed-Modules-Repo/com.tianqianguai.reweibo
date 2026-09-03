@@ -29,6 +29,8 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.set --arg weico_timeline_cache_days --extra value:i:30
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.set --arg weico_timeline_jump_button --extra value:b:false
 adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.reset --arg weico_timeline_jump_button
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.set --arg weico_reverse_timeline --extra value:b:false
+adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method settings.reset --arg weico_reverse_timeline
 ```
 
 运行时动作：
@@ -74,4 +76,4 @@ adb -s 192.168.6.17:5555 pull /storage/emulated/0/Android/data/com.weico.interna
 | `weico.preload.restart` | 重置并重新调度现有预加载 | 当前首页 presenter 已就绪 |
 | `weico.settings.reload` | 重新读取模块设置并刷新快捷按钮/预加载 | 轻享版已启动 |
 
-设置键仍为 `weico_profile_entry`、`weico_timeline_jump_button`、`weico_timeline_cache_clear_button` 和 `weico_timeline_cache_days`。旧版目标应用本地设置会作为迁移回退保留；Provider 中存在显式值后，以 Provider 为准。
+设置键为 `weico_profile_entry`、`weico_reverse_timeline`、`weico_timeline_jump_button`、`weico_timeline_cache_clear_button` 和 `weico_timeline_cache_days`。`weico_reverse_timeline` 默认开启；设为 `false` 后执行 `weico.settings.reload` 可立即停止后续的强制排序，已创建的时间线视图建议重启微博轻享版以完整恢复原生布局状态。旧版目标应用本地设置会作为迁移回退保留；Provider 中存在显式值后，以 Provider 为准。

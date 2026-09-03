@@ -43,12 +43,16 @@ class ExampleUnitTest {
     fun moduleSettingsRegistryKeepsLegacyKeysAndTypes() {
         val keys = ModuleSettings.allKeys().toSet()
 
-        assertEquals(4, keys.size)
+        assertEquals(5, keys.size)
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_PROFILE_ENTRY))
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON))
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON))
+        assertTrue(keys.contains(ModuleSettings.KEY_WEICO_REVERSE_TIMELINE))
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS))
         assertTrue(ModuleSettings.isBooleanKey(ModuleSettings.KEY_WEICO_PROFILE_ENTRY))
+        assertEquals("weico_reverse_timeline", ModuleSettings.KEY_WEICO_REVERSE_TIMELINE)
+        assertTrue(ModuleSettings.isBooleanKey(ModuleSettings.KEY_WEICO_REVERSE_TIMELINE))
+        assertTrue(ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_REVERSE_TIMELINE))
         assertTrue(ModuleSettings.isIntegerKey(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS))
         assertFalse(ModuleSettings.isKnownKey("unknown"))
     }

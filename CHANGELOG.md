@@ -6,6 +6,7 @@
 
 ### 中文
 
+- 新增默认开启的“新微博优先排序”开关；关闭后不再覆盖原生顺序、Presenter 数据排序、缓存恢复展示顺序或 RecyclerView 方向，同时广告过滤、缓存、跳转/删除、阅读位置、断层回补和预加载保持独立运行。设置重载会立即更新运行时开关，已创建的列表建议重启微博轻享版以完整恢复原生布局状态。
 - 迁移到 Modern libxposed API 102，官方静态作用域仅保留微博轻享版，并通过同 ID Hook 原子替换、状态恢复和忙碌期拒绝机制支持自动热重载。
 - 新增可直接通过 `adb shell content call` 使用的完整管理接口，覆盖设置读写、运行状态、时间线跳转、缓存统计与清理、预加载重启、设置重载以及日志读取和导出。
 - 新增终端样式日志页，支持自由选择、复制当前预览、按起止日期时间筛选和完整 TXT 流式导出；新版日志记录完整日期，旧版 `HH:mm:ss` 日志继续支持无范围导出。
@@ -17,6 +18,7 @@
 
 ### English
 
+- Adds a default-on “newest posts first” toggle. When disabled, native ordering, presenter sorting, cache-restore presentation ordering, and RecyclerView direction are no longer overridden, while ad filtering, cache, jump/delete actions, reading position, gap filling, and preload remain independent. Settings reload updates the runtime gate immediately; restarting Weibo Lite is recommended to fully restore native layout state for existing views.
 - Migrates to Modern libxposed API 102, limits the official static scope to Weibo Lite, and supports automatic hot reload through same-ID atomic hook replacement, state restoration, and safe rejection while runtime work is active.
 - Adds a complete management interface callable through `adb shell content call`, covering settings, runtime status, timeline navigation, cache statistics and clearing, preload restart, settings reload, and log reading/export.
 - Adds a terminal-style log view with free text selection, preview copying, start/end date-time filtering, and full streamed TXT export. New logs include complete dates, while legacy `HH:mm:ss` logs remain available in unbounded exports.
