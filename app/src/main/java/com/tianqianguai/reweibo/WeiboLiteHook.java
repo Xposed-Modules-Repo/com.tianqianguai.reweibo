@@ -179,6 +179,7 @@ public class WeiboLiteHook {
     private static File sLogFile = null;
     private static Context sWeicoContext = null;
     private static volatile boolean sTimelineCacheDaysSettingConfirmed = false;
+    private static volatile boolean sReverseTimelineEnabled = true;
     private static volatile boolean sTimelineCacheClearInFlight = false;
     private static volatile boolean sTimelineCacheClearDialogLoading = false;
     private static TimelineNativePersistRequest sPendingTimelineNativePersist = null;
@@ -435,6 +436,7 @@ public class WeiboLiteHook {
         final Object action;
         final Object builder;
         final ArrayList statuses;
+        final ArrayList presentationStatuses;
         final LinkedHashMap<Long, Object> statusesById;
         final TimelineCacheStats stats;
         final TimelineGapScan gapScan;
@@ -447,6 +449,7 @@ public class WeiboLiteHook {
             Object action,
             Object builder,
             ArrayList statuses,
+            ArrayList presentationStatuses,
             LinkedHashMap<Long, Object> statusesById,
             TimelineCacheStats stats,
             TimelineGapScan gapScan,
@@ -458,6 +461,7 @@ public class WeiboLiteHook {
             this.action = action;
             this.builder = builder;
             this.statuses = statuses;
+            this.presentationStatuses = presentationStatuses;
             this.statusesById = statusesById;
             this.stats = stats;
             this.gapScan = gapScan;
@@ -870,6 +874,7 @@ public class WeiboLiteHook {
         HotReloadRuntime.post(new Runnable() {
             @Override
             public void run() {
+                reloadModuleSettingsFromProvider();
                 refreshTimelineShortcutButtons("hot-reload-restored");
                 if (presenter != null && "-1".equals(getTimelineGroupId(presenter))) {
                     resetPreloadState(presenter, "hot-reload-restored");
@@ -1314,6 +1319,19 @@ public class WeiboLiteHook {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ));
 
+            final Switch reverseTimelineToggle = new Switch(activity);
+            reverseTimelineToggle.setText("新微博优先排序");
+            reverseTimelineToggle.setTextColor(Color.WHITE);
+            reverseTimelineToggle.setTextSize(15f);
+            reverseTimelineToggle.setChecked(isModuleOptionEnabled(
+                ModuleSettings.KEY_WEICO_REVERSE_TIMELINE,
+                true
+            ));
+            panel.addView(reverseTimelineToggle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ));
+
             final Switch clearButtonToggle = new Switch(activity);
             clearButtonToggle.setText("显示首页“删除”按钮");
             clearButtonToggle.setTextColor(Color.WHITE);
@@ -1448,6 +1466,10 @@ public class WeiboLiteHook {
                             ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
                             clearButtonToggle.isChecked()
                         )
+                        .putBoolean(
+                            ModuleSettings.KEY_WEICO_REVERSE_TIMELINE,
+                            reverseTimelineToggle.isChecked()
+                        )
                         .commit();
                     if (!saved) {
                         input.setError("保存失败，请重试");
@@ -1465,10 +1487,15 @@ public class WeiboLiteHook {
                         ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
                         clearButtonToggle.isChecked() ? 1 : 0
                     );
+                    providerSaved &= writeModuleSettingToProvider(
+                        ModuleSettings.KEY_WEICO_REVERSE_TIMELINE,
+                        reverseTimelineToggle.isChecked() ? 1 : 0
+                    );
                     if (!providerSaved) {
                         log("Settings dialog kept target-pref fallback because Provider sync failed");
                     }
                     rememberModuleIntSetting(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days);
+                    sReverseTimelineEnabled = reverseTimelineToggle.isChecked();
                     refreshTimelineShortcutButtons("settings-saved");
                     if (sLastTimelinePresenter != null) {
                         resetPreloadState(sLastTimelinePresenter, "settings-saved");
@@ -2436,7 +2463,11 @@ public class WeiboLiteHook {
             log("Weico application context captured source=" + source);
         }
         registerWeicoCliBridge(context, source);
-        getTimelineCacheDaysSetting();
+        if (recovered) {
+            reloadModuleSettingsFromProvider();
+        } else {
+            getTimelineCacheDaysSetting();
+        }
     }
 
     private static void registerWeicoCliBridge(Context context, String source) {
@@ -2961,6 +2992,10 @@ public class WeiboLiteHook {
                         ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
                         ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
                     )
+                )
+                .with(
+                    "reverse_timeline",
+                    isReverseTimelineEnabled()
                 );
         } catch (Throwable t) {
             finishCliOperation(operationId, "error", t.getClass().getSimpleName() + ": " + t.getMessage());
@@ -3169,7 +3204,8 @@ public class WeiboLiteHook {
         String[] booleanKeys = new String[] {
             ModuleSettings.KEY_WEICO_PROFILE_ENTRY,
             ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
-            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON
+            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+            ModuleSettings.KEY_WEICO_REVERSE_TIMELINE
         };
         for (int i = 0; i < booleanKeys.length; i++) {
             String key = booleanKeys[i];
@@ -3200,7 +3236,18 @@ public class WeiboLiteHook {
             syncTargetIntSetting(key, days);
         }
         rememberModuleIntSetting(key, days);
+        sReverseTimelineEnabled = isModuleOptionEnabled(
+            ModuleSettings.KEY_WEICO_REVERSE_TIMELINE,
+            true
+        );
+        log(sReverseTimelineEnabled
+            ? "Reverse timeline setting enabled=true"
+            : "Reverse timeline setting disabled; preserving native order (restart recommended for existing views)");
         log("Module settings reloaded cacheDays=" + days);
+    }
+
+    private static boolean isReverseTimelineEnabled() {
+        return sReverseTimelineEnabled;
     }
 
     private static boolean rememberModuleIntSetting(String key, int value) {
@@ -3766,6 +3813,7 @@ public class WeiboLiteHook {
 
     private static boolean fixTimelineLayoutDirection(Object recyclerView, Object layoutManager) {
         if (recyclerView == null || layoutManager == null) return false;
+        if (!isReverseTimelineEnabled()) return false;
         try {
             Object adapter = XposedHelpers.callMethod(recyclerView, "getAdapter");
             if (adapter == null) return false;
@@ -4720,6 +4768,7 @@ public class WeiboLiteHook {
     }
 
     private static List ensureNewestFirst(List list, Object action, String source, boolean loadNew) {
+        if (!isReverseTimelineEnabled()) return list;
         if (list == null || list.size() < 2) return list;
 
         String groupId = getTimelineGroupId(action);
@@ -5850,6 +5899,8 @@ public class WeiboLiteHook {
         appendTimelinePreparedStatuses(merged, load.statuses, cutoffMs);
 
         ArrayList<TimelinePreparedStatus> records = new ArrayList<>(merged.values());
+        // Cache cursors and gap detection require one stable, descending canonical order.
+        // Presentation direction remains controlled independently by the native/layout hooks.
         Collections.sort(records, new Comparator<TimelinePreparedStatus>() {
             @Override
             public int compare(TimelinePreparedStatus left, TimelinePreparedStatus right) {
@@ -5859,6 +5910,8 @@ public class WeiboLiteHook {
         });
 
         ArrayList statuses = new ArrayList(records.size());
+        ArrayList presentationStatuses = new ArrayList(merged.size());
+        for (TimelinePreparedStatus record : merged.values()) presentationStatuses.add(record.status);
         LinkedHashMap<Long, Object> statusesById = new LinkedHashMap<>();
         TimelineCacheStats stats = new TimelineCacheStats();
         TimelineGapScan gapScan;
@@ -5882,7 +5935,7 @@ public class WeiboLiteHook {
         long newestId = records.isEmpty() ? 0L : records.get(0).id;
         String maxId = records.isEmpty() ? "0" : String.valueOf(records.get(records.size() - 1).id);
         ArrayList adapterModels = buildTimelineStatusModels(
-            statuses,
+            isReverseTimelineEnabled() ? statuses : presentationStatuses,
             request.presenter,
             "reweibo-cache-background"
         );
@@ -5890,6 +5943,7 @@ public class WeiboLiteHook {
             action,
             builder,
             statuses,
+            presentationStatuses,
             statusesById,
             stats,
             gapScan,
@@ -5982,7 +6036,7 @@ public class WeiboLiteHook {
             try {
                 setPresenterTimelineDataPrepared(
                     request.presenter,
-                    result.statuses,
+                    result.presentationStatuses,
                     result.gapScan.count,
                     "reweibo-cache"
                 );
@@ -11349,6 +11403,7 @@ public class WeiboLiteHook {
     }
 
     private static List sortTimelineNewestFirst(List list, Object owner, String source, boolean loadNew) {
+        if (!isReverseTimelineEnabled()) return list;
         if (list == null || list.size() < 2) return list;
 
         String groupId = getTimelineGroupId(owner);
@@ -11417,6 +11472,7 @@ public class WeiboLiteHook {
     }
 
     private static List sortTimelineOldestFirst(List list, Object owner, String source) {
+        if (!isReverseTimelineEnabled()) return list;
         if (list == null || list.size() < 2) return list;
 
         String groupId = getTimelineGroupId(owner);
@@ -11914,6 +11970,7 @@ public class WeiboLiteHook {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (REVERSE_ORDER_KEY.equals(param.args[0])) {
+                        if (!isReverseTimelineEnabled()) return;
                         param.setResult(true);
                     }
                 }
@@ -11922,22 +11979,12 @@ public class WeiboLiteHook {
             XposedHelpers.findAndHookMethod(settingNativeClass, "loadBoolean", String.class, boolean.class, forceLoad);
             XposedHelpers.findAndHookMethod(settingNativeClass, "loadBoolean", String.class, boolean.class, boolean.class, forceLoad);
 
-            XC_MethodHook forceSave = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (REVERSE_ORDER_KEY.equals(param.args[0])) {
-                        param.args[1] = true;
-                    }
-                }
-            };
-            XposedHelpers.findAndHookMethod(settingNativeClass, "saveBoolean", String.class, boolean.class, forceSave);
-            XposedHelpers.findAndHookMethod(settingNativeClass, "saveBoolean", String.class, boolean.class, boolean.class, forceSave);
-
             Class<?> appClass = XposedHelpers.findClass("com.weico.international.WApplication", cl);
             XC_MethodHook setReverseOrder = new XC_MethodHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    setNativeReverseOrder(cl);
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (!isReverseTimelineEnabled()) return;
+                        setNativeReverseOrder(cl);
                 }
             };
             XposedHelpers.findAndHookMethod(appClass, "basicInit", setReverseOrder);
@@ -11950,6 +11997,7 @@ public class WeiboLiteHook {
                 new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
+                        if (!isReverseTimelineEnabled()) return;
                         try {
                             Object groupId = XposedHelpers.callMethod(param.thisObject, "getGroupId");
                             if ("-1".equals(groupId)) {
@@ -11966,6 +12014,7 @@ public class WeiboLiteHook {
     }
 
     private static void setNativeReverseOrder(ClassLoader cl) {
+        if (!isReverseTimelineEnabled()) return;
         try {
             Class<?> appClass = XposedHelpers.findClass("com.weico.international.WApplication", cl);
             java.lang.reflect.Field field = appClass.getDeclaredField("mReverseOrder");
