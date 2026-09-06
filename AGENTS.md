@@ -65,13 +65,22 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 
 `weico.logs.export`, `weico.cache.stats`, and `weico.cache.clear` are asynchronous. Poll `weico.status` and read `last_operation_state` until it becomes `completed` or `error`. A completed log export reports a pullable path in `last_log_export_path`. Use `yyyy-MM-dd_HH-mm-ss` for raw ADB ranges because Android `content` bindings do not reliably preserve spaces or colons; the app UI also accepts the human-readable space and ISO `T` forms.
 
-## Release notes
+## Release
 
-When preparing a release:
+Start every new version in its own task branch/worktree. Publishing is authorized only when the user explicitly asks for a release.
 
-- Compare the previous release tag with the release commit and cover the complete interval, including any final uncommitted fixes that will ship.
-- Keep `CHANGELOG.md`, `docs/release/<version>.md`, README feature descriptions, and the GitHub Release body consistent.
-- Write release notes in both Chinese and English. The Chinese and English sections must describe the same shipped behavior.
+### Version and source interval
+
+- Bump both `versionCode` and `versionName` in `app/build.gradle.kts`. The normalized Xposed Modules Repo tag is `<versionCode>-<versionName>`.
+- Resolve the previous **source release commit** from the commit that first added its release document, for example: `git log -1 --diff-filter=A --format=%H -- docs/release/<previous-version>.md`.
+- Compare that source release commit with the new release commit and cover the complete interval, including final fixes that will ship.
+- Do not use the normalized Xposed release tag as a source-diff baseline. The official tag bot may replace it with an annotated tag that peels to a synthetic empty commit; that is expected repository infrastructure, not the application source commit.
+
+### Release notes
+
+- Keep `CHANGELOG.md`, `docs/release/<version>.md`, README feature/compatibility descriptions, and the GitHub Release body consistent.
+- Write release notes in both Chinese and English. Both sections must describe the same shipped behavior.
+- Include a short bilingual Star request in the opening summaries unless the user asks to omit it; keep it natural and do not add a separate promotional section.
 - Use the template below. Omit `修复` / `Fixes` only when the release contains no fixes.
 - Do not add `模块元数据` / `Module Metadata`, `验证` / `Verification`, `APK 校验` / `APK Checksum`, or `已知限制` / `Known Limit` sections unless the user explicitly requests them.
 - Use `docs/release/<version>.md` verbatim as the GitHub Release body.
@@ -99,6 +108,26 @@ When preparing a release:
 
 - <English fixes matching the Chinese section>
 ```
+
+### Candidate and signing gates
+
+- Public artifacts must be signed through all four external inputs: `REWEIBO_RELEASE_STORE_FILE`, `REWEIBO_RELEASE_STORE_PASSWORD`, `REWEIBO_RELEASE_KEY_ALIAS`, and `REWEIBO_RELEASE_KEY_PASSWORD`. Never print their values and never upload an unsigned APK.
+- Run one frozen-candidate gate with `./gradlew test assembleRelease` (`.\gradlew.bat test assembleRelease` on Windows). Reuse same-commit results instead of repeating the full suite.
+- Verify `output-metadata.json`, `aapt dump badging`, and `apksigner verify --print-certs`: package id, version code/name, signing certificate, and APK filename must match the intended release.
+- Verify the APK contains `META-INF/xposed/java_init.list`, `module.prop`, and `scope.list`; scope remains only `com.weico.international`, and no `io/github/libxposed/` classes are packaged.
+- If device deployment/regression was explicitly requested, install the exact frozen APK, use raw `adb shell content call` for runtime checks, confirm API 102/Hook readiness/version, and compare the installed APK SHA-256 with the candidate. Do not rebuild after device acceptance unless source or signing inputs change.
+
+### GitHub and Xposed publication
+
+- Push the release commit to `main` before creating the Release. Rename/copy the frozen artifact to `ReWeibo-v<version>.apk` without rebuilding it.
+- Create the GitHub Release with a unique temporary tag such as `release-<version>-<short-release-commit>`, `--target <release-commit>`, title `ReWeibo <version>`, the APK asset, and `--notes-file docs/release/<version>.md`.
+- Do **not** pre-create or push the final `<versionCode>-<versionName>` tag and do not use `--verify-tag` for this flow. Xposed Modules Repo accepts an arbitrary initial tag and its official bot normalizes it after the Release with the valid APK is published.
+- After the bot runs, verify the GitHub Release is Latest, non-draft, non-prerelease, has normalized tag `<versionCode>-<versionName>`, and has exactly the intended APK asset. A bot-owned annotated tag or synthetic empty target commit is normal; never force it back to the source commit.
+- Bot tag rewriting can conflict with a same-named local tag. Prefer `git fetch origin main` plus `git ls-remote --tags origin` for inspection; never force-fetch, delete, or overwrite a tag without explicit authorization.
+- Download the published APK again and verify its SHA-256 and signature against the frozen candidate. Also confirm the remote Release body matches `docs/release/<version>.md` verbatim.
+- Verify the matching `Xposed-Modules-Repo/modules` Tag workflow succeeded. The LSPosed module JSON/index may remain stale during its documented propagation window; check once after the workflow and once after a bounded window of about five minutes. If it is still stale, report `index propagation pending` instead of recreating the Release or rewriting the tag.
+- Editing only an existing APK asset does not trigger the Xposed tag bot. Never replace an existing Release asset unless the user explicitly requests an in-place replacement; when authorized, update the Release content in the same operation and reverify the served APK.
+- Record the release commit, version code/name, normalized tag, GitHub Release ID/URL, asset name/size/digest, signing certificate, device evidence when applicable, and current LSPosed index state.
 
 ## Debugging
 
