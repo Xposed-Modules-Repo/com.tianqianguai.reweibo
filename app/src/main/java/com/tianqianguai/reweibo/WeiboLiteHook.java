@@ -3790,10 +3790,9 @@ public class WeiboLiteHook {
                 cl
             );
             XposedHelpers.findAndHookMethod(presenterClass, "addData", List.class, new XC_MethodHook() {
-                private long startedAt;
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    startedAt = SystemClock.elapsedRealtime();
+                    param.setObjectExtra("reweibo.addData.startedAt", Long.valueOf(SystemClock.elapsedRealtime()));
                     rememberTimelinePresenter(param.thisObject);
                     int incomingCount = param.args != null && param.args.length > 0 && param.args[0] instanceof List
                         ? ((List) param.args[0]).size() : -1;
@@ -3815,6 +3814,8 @@ public class WeiboLiteHook {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    Object started = param.getObjectExtra("reweibo.addData.startedAt");
+                    long startedAt = started instanceof Long ? ((Long) started).longValue() : SystemClock.elapsedRealtime();
                     log("Timeline addData exit source=presenter-addData elapsedMs="
                         + (SystemClock.elapsedRealtime() - startedAt)
                         + " cached=" + getTimelineStatusCount(param.thisObject)
