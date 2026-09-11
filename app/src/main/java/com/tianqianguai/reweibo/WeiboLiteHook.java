@@ -3790,9 +3790,18 @@ public class WeiboLiteHook {
                 cl
             );
             XposedHelpers.findAndHookMethod(presenterClass, "addData", List.class, new XC_MethodHook() {
+                private long startedAt;
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
+                    startedAt = SystemClock.elapsedRealtime();
                     rememberTimelinePresenter(param.thisObject);
+                    int incomingCount = param.args != null && param.args.length > 0 && param.args[0] instanceof List
+                        ? ((List) param.args[0]).size() : -1;
+                    log("Timeline addData enter source=presenter-addData thread="
+                        + Thread.currentThread().getName()
+                        + " incoming=" + incomingCount
+                        + " cached=" + getTimelineStatusCount(param.thisObject)
+                        + " activity=" + describeTimelinePresenterActivity(param.thisObject));
                     if (hasActiveTimelineGapFill()) {
                         captureTimelineGapFillViewportAnchor("presenter-addData-before");
                     }
@@ -3806,6 +3815,10 @@ public class WeiboLiteHook {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    log("Timeline addData exit source=presenter-addData elapsedMs="
+                        + (SystemClock.elapsedRealtime() - startedAt)
+                        + " cached=" + getTimelineStatusCount(param.thisObject)
+                        + " gap=" + describeTimelineGapFillProbeState());
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
                         if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-addData-suppressed")) {
                             finishTimelineTopAnchorForKnownRecyclerViews("presenter-addData-suppressed");
@@ -7601,9 +7614,9 @@ public class WeiboLiteHook {
                 false,
                 source + "-empty-page"
             );
-            if (mergedData != null) {
-                persistTimelineNativeCacheList(presenter, mergedData, source + "-gap-fill-empty", false);
-            }
+            // Empty pages are common while opening notification/detail destinations.
+            // Avoid another full-cache serialization here; the last checkpoint remains
+            // durable and the normal successful-page path persists incrementally.
             if (retryTimelineGapFillWithFallback(presenter, count, source + "-empty-page")) {
                 return true;
             }
@@ -8994,6 +9007,29 @@ public class WeiboLiteHook {
             }
         }
         return null;
+    }
+
+    private static String describeTimelinePresenterActivity(Object presenter) {
+        try {
+            if (presenter == null) return "none";
+            Class<?> type = presenter.getClass();
+            while (type != null) {
+                for (java.lang.reflect.Field field : type.getDeclaredFields()) {
+                    if (!Context.class.isAssignableFrom(field.getType())) continue;
+                    field.setAccessible(true);
+                    Object value = field.get(presenter);
+                    Activity activity = value instanceof Context ? findHostActivity((Context) value) : null;
+                    if (activity != null) {
+                        Intent intent = activity.getIntent();
+                        return activity.getClass().getName() + " action="
+                            + (intent == null ? "" : intent.getAction()) + " data="
+                            + (intent == null || intent.getData() == null ? "" : intent.getData());
+                    }
+                }
+                type = type.getSuperclass();
+            }
+        } catch (Throwable ignored) { }
+        return "unknown";
     }
 
     private static TimelineJumpInput parseTimelineJumpInput(String value) {
