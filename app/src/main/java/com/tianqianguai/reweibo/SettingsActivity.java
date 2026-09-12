@@ -74,6 +74,13 @@ public class SettingsActivity extends Activity {
         );
         addSwitchRow(
                 panel,
+                "新微博优先排序",
+                "强制首页时间线使用反向/新微博在前排序",
+                prefs,
+                ModuleSettings.KEY_WEICO_REVERSE_TIMELINE
+        );
+        addSwitchRow(
+                panel,
                 "显示“跳转”按钮",
                 "在微博轻享版首页显示时间跳转快捷按钮",
                 prefs,

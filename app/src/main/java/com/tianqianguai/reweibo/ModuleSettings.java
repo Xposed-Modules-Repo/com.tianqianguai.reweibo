@@ -9,6 +9,7 @@ public final class ModuleSettings {
     public static final String KEY_WEICO_PROFILE_ENTRY = "weico_profile_entry";
     public static final String KEY_WEICO_TIMELINE_JUMP_BUTTON = "weico_timeline_jump_button";
     public static final String KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON = "weico_timeline_cache_clear_button";
+    public static final String KEY_WEICO_REVERSE_TIMELINE = "weico_reverse_timeline";
     public static final String KEY_WEICO_TIMELINE_CACHE_DAYS = "weico_timeline_cache_days";
     public static final int DEFAULT_WEICO_TIMELINE_CACHE_DAYS = 3;
     public static final int MIN_WEICO_TIMELINE_CACHE_DAYS = 1;
@@ -17,6 +18,7 @@ public final class ModuleSettings {
         KEY_WEICO_PROFILE_ENTRY,
         KEY_WEICO_TIMELINE_JUMP_BUTTON,
         KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
+        KEY_WEICO_REVERSE_TIMELINE,
         KEY_WEICO_TIMELINE_CACHE_DAYS
     };
 
@@ -25,7 +27,8 @@ public final class ModuleSettings {
     public static boolean defaultFor(String key) {
         if (KEY_WEICO_PROFILE_ENTRY.equals(key)
                 || KEY_WEICO_TIMELINE_JUMP_BUTTON.equals(key)
-                || KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key)) {
+                || KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key)
+                || KEY_WEICO_REVERSE_TIMELINE.equals(key)) {
             return true;
         }
         return false;
@@ -59,7 +62,8 @@ public final class ModuleSettings {
     public static boolean isBooleanKey(String key) {
         return KEY_WEICO_PROFILE_ENTRY.equals(key)
             || KEY_WEICO_TIMELINE_JUMP_BUTTON.equals(key)
-            || KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key);
+            || KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key)
+            || KEY_WEICO_REVERSE_TIMELINE.equals(key);
     }
 
     public static boolean isIntegerKey(String key) {
