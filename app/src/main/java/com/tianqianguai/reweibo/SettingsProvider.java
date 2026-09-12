@@ -259,6 +259,13 @@ public class SettingsProvider extends ContentProvider {
         appendCsv(output, CliContract.allCommandNames());
         output.append("\nsettings.set: arg=<key>, extras value=<true|false|1|0|1..30>");
         output.append("\nexec: arg=<full command>, extras=<command arguments>");
+        output.append("\nweico.timeline.status: viewport positions, status IDs and last-read ID; no arguments");
+        output.append("\nweico.preload.status,weico.gap.status: scheduling, in-flight and progress counters; no arguments");
+        output.append("\nweico.timeline.refresh,weico.timeline.load_more: native action; requires idle home timeline; accepted does not mean network completed");
+        output.append("\nweico.timeline.jump: value=<date/time>; raw ADB may use yyyy-MM-dd_HH-mm-ss");
+        output.append("\nweico.cache.clear: day=<date> OR start=<date/time>,end=<date/time>; raw ADB uses yyyy-MM-dd_HH-mm (minute boundaries)");
+        output.append("\nweico.logs.read: optional start,end,max_chars=1..49152; weico.logs.export: optional start,end");
+        output.append("\nasync cache/log operations: poll weico.status last_operation_state; native timeline actions: inspect timeline/preload/gap status and logs");
         return output.toString();
     }
 

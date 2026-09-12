@@ -2511,6 +2511,11 @@ public class WeiboLiteHook {
         if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) {
             return CliCommandBridge.Result.error("hot reload is preparing; retry after readiness returns");
         }
+        if ("timeline.status".equals(command)) return buildTimelineCliStatus();
+        if ("preload.status".equals(command)) return buildPreloadCliStatus();
+        if ("gap.status".equals(command)) return buildGapCliStatus();
+        if ("timeline.refresh".equals(command)) return runTimelineLoadCliCommand(true);
+        if ("timeline.load_more".equals(command)) return runTimelineLoadCliCommand(false);
         if ("logs.status".equals(command)) {
             return runLogStatusCliCommand();
         }
@@ -2627,6 +2632,127 @@ public class WeiboLiteHook {
                 .with("last_cache_oldest_ms", cacheOldestMs);
         }
         return result;
+    }
+
+    private static CliCommandBridge.Result buildGapCliStatus() {
+        synchronized (sTimelineGapFillState) {
+            GapFillState state = sTimelineGapFillState;
+            return CliCommandBridge.Result.ready("timeline gap-fill state")
+                .with("active", state.active)
+                .with("scheduled", state.scheduled)
+                .with("in_flight", state.inFlight)
+                .with("requested_pages", state.requestedPages)
+                .with("last_count", state.lastCount)
+                .with("cursor_id", String.valueOf(state.cursorId))
+                .with("gap_cursor_id", String.valueOf(state.gapCursorId))
+                .with("target_id", String.valueOf(state.targetId))
+                .with("fallback_attempts", state.fallbackAttempts)
+                .with("empty_responses", state.emptyResponses)
+                .with("error_responses", state.errorResponses)
+                .with("checkpoint_page", state.lastCheckpointPage)
+                .with("checkpoint_count", state.lastCheckpointCount);
+        }
+    }
+
+    private static CliCommandBridge.Result buildPreloadCliStatus() {
+        Object presenter = sLastTimelinePresenter;
+        boolean ready = presenter != null && "-1".equals(getTimelineGroupId(presenter));
+        CliCommandBridge.Result result = CliCommandBridge.Result.ready("timeline preload state")
+            .with("presenter_ready", ready)
+            .with("cache_clear_in_flight", sTimelineCacheClearInFlight)
+            .with("cache_restore_in_flight", ready && isTimelineCacheRestoreInFlight(presenter))
+            .with("cache_days", getTimelineCacheDaysSetting());
+        synchronized (sPreloadStates) {
+            PreloadState state = ready ? sPreloadStates.get(presenter) : null;
+            result.with("state_present", state != null)
+                .with("scheduled", state != null && state.scheduled)
+                .with("in_flight", state != null && state.inFlight)
+                .with("stopped", state != null && state.stopped)
+                .with("retry_scheduled", state != null && state.retryScheduled)
+                .with("requested_pages", state == null ? 0 : state.requestedPages)
+                .with("last_count", state == null ? 0 : state.lastCount)
+                .with("stable_rounds", state == null ? 0 : state.stableRounds);
+        }
+        synchronized (sTimelineGapFillState) {
+            result.with("gap_active", sTimelineGapFillState.active)
+                .with("gap_scheduled", sTimelineGapFillState.scheduled)
+                .with("gap_in_flight", sTimelineGapFillState.inFlight);
+        }
+        return result;
+    }
+
+    private static CliCommandBridge.Result buildTimelineCliStatus() {
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        Object presenter = getTimelineCliPresenter(recyclerView);
+        CliCommandBridge.Result result = CliCommandBridge.Result.ready("home timeline viewport")
+            .with("timeline_ready", recyclerView != null)
+            .with("window_focused", recyclerView instanceof View && ((View) recyclerView).hasWindowFocus())
+            .with("presenter_ready", presenter != null && "-1".equals(getTimelineGroupId(presenter)))
+            .with("last_read_id", String.valueOf(getLastReadStatusId()))
+            .with("restored_cache_mode", sTimelineRestoredCacheMode);
+        if (recyclerView == null) return result;
+        Object adapter = callMethodSafe(recyclerView, "getAdapter");
+        Object layout = callMethodSafe(recyclerView, "getLayoutManager");
+        int headers = adapter == null ? 0 : callIntMethodSafe(adapter, "getHeaderCount", 0);
+        int first = layout == null ? -1 : callIntMethodSafe(layout, "findFirstVisibleItemPosition", -1);
+        int last = layout == null ? -1 : callIntMethodSafe(layout, "findLastVisibleItemPosition", -1);
+        return result.with("adapter_count", adapter == null ? -1 : callIntMethodSafe(adapter, "getCount", -1))
+            .with("item_count", adapter == null ? -1 : callIntMethodSafe(adapter, "getItemCount", -1))
+            .with("header_count", headers)
+            .with("first_visible_position", first)
+            .with("last_visible_position", last)
+            .with("first_visible_id", String.valueOf(first < headers || adapter == null
+                ? 0L : getTimelineAdapterDataStatusId(adapter, first - headers)))
+            .with("last_visible_id", String.valueOf(last < headers || adapter == null
+                ? 0L : getTimelineAdapterDataStatusId(adapter, last - headers)));
+    }
+
+    private static Object getTimelineCliPresenter(Object recyclerView) {
+        synchronized (sTopAnchorStates) {
+            TimelineRecyclerOwner owner = sHomeTimelineRecyclerOwners.get(recyclerView);
+            return owner == null ? null : owner.presenter.get();
+        }
+    }
+
+    private static CliCommandBridge.Result runTimelineLoadCliCommand(boolean refresh) {
+        Object recyclerView = getCurrentHomeTimelineRecyclerView();
+        Object presenter = getTimelineCliPresenter(recyclerView);
+        if (presenter == null || !(recyclerView instanceof View)
+            || !((View) recyclerView).hasWindowFocus() || !"-1".equals(getTimelineGroupId(presenter))) {
+            return CliCommandBridge.Result.error("open the Weibo Lite home timeline first");
+        }
+        if (sTimelineCacheClearInFlight || isTimelineCacheRestoreInFlight(presenter)) {
+            return CliCommandBridge.Result.error("cache operation is running; retry after it finishes");
+        }
+        synchronized (sTimelineGapFillState) {
+            if (sTimelineGapFillState.active || sTimelineGapFillState.scheduled || sTimelineGapFillState.inFlight) {
+                return CliCommandBridge.Result.error("gap filling is active; inspect weico.gap.status first");
+            }
+        }
+        synchronized (sPreloadStates) {
+            PreloadState state = sPreloadStates.get(presenter);
+            if (state != null && (state.inFlight || state.scheduled || state.retryScheduled)) {
+                return CliCommandBridge.Result.error("preload is active; inspect weico.preload.status first");
+            }
+        }
+        if (sActiveTimelineObservableSubscriptions.get() > 0) {
+            return CliCommandBridge.Result.error("timeline request is active; retry after it finishes");
+        }
+        String command = refresh ? "timeline.refresh" : "timeline.load_more";
+        try {
+            // Resolve the native method before changing the refresh anchor.
+            Method method = presenter.getClass().getMethod(refresh ? "loadNew" : "loadMore");
+            if (refresh) captureTimelineRefreshAnchorForKnownRecyclerViews(presenter, "cli-refresh");
+            method.invoke(presenter);
+            log("CLI native timeline action command=" + command);
+            return CliCommandBridge.Result.accepted("native timeline action invoked; network completion is not implied")
+                .with("command", command)
+                .with("completion", "not_tracked")
+                .with("poll", "weico.timeline.status,weico.preload.status,weico.gap.status,weico.logs.read");
+        } catch (Throwable error) {
+            log("CLI native timeline action error command=" + command + ": " + error.getClass().getSimpleName());
+            return CliCommandBridge.Result.error("native timeline action failed: " + error.getClass().getSimpleName());
+        }
     }
 
     private static CliCommandBridge.Result runLogStatusCliCommand() {
@@ -2775,7 +2901,7 @@ public class WeiboLiteHook {
     }
 
     private static CliCommandBridge.Result runTimelineJumpCliCommand(Bundle args) {
-        String value = getCliArgument(args, "value");
+        String value = CliContract.normalizeDateTimeArgument(getCliArgument(args, "value"));
         TimelineJumpInput input = parseTimelineJumpInput(value);
         if (input == null || input.targetMs <= 0L) {
             return CliCommandBridge.Result.error(
@@ -2854,8 +2980,8 @@ public class WeiboLiteHook {
 
     private static CliCommandBridge.Result runTimelineCacheClearCliCommand(Bundle args) {
         String day = getCliArgument(args, "day");
-        String start = getCliArgument(args, "start");
-        String end = getCliArgument(args, "end");
+        String start = CliContract.normalizeDateTimeArgument(getCliArgument(args, "start"));
+        String end = CliContract.normalizeDateTimeArgument(getCliArgument(args, "end"));
         boolean hasDay = hasMeaningfulString(day);
         boolean hasStart = hasMeaningfulString(start);
         boolean hasEnd = hasMeaningfulString(end);

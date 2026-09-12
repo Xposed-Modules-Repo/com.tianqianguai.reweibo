@@ -16,6 +16,11 @@ public final class CliContract {
     static {
         LinkedHashMap<String, Command> commands = new LinkedHashMap<>();
         add(commands, "weico.status", PACKAGE_WEICO, "status");
+        add(commands, "weico.timeline.status", PACKAGE_WEICO, "timeline.status");
+        add(commands, "weico.timeline.refresh", PACKAGE_WEICO, "timeline.refresh");
+        add(commands, "weico.timeline.load_more", PACKAGE_WEICO, "timeline.load_more");
+        add(commands, "weico.preload.status", PACKAGE_WEICO, "preload.status");
+        add(commands, "weico.gap.status", PACKAGE_WEICO, "gap.status");
         add(commands, "weico.logs.status", PACKAGE_WEICO, "logs.status");
         add(commands, "weico.logs.read", PACKAGE_WEICO, "logs.read");
         add(commands, "weico.logs.export", PACKAGE_WEICO, "logs.export");
@@ -30,6 +35,15 @@ public final class CliContract {
     }
 
     private CliContract() {}
+
+    /** Convert only the explicit raw-ADB form; leave legacy/user inputs to existing parsers. */
+    static String normalizeDateTimeArgument(String value) {
+        if (value == null) return null;
+        String text = value.trim();
+        if (!text.matches("\\d{4}-\\d{1,2}-\\d{1,2}_\\d{1,2}-\\d{1,2}(-\\d{1,2})?")) return value;
+        int separator = text.indexOf('_');
+        return text.substring(0, separator) + " " + text.substring(separator + 1).replace('-', ':');
+    }
 
     private static void add(
             LinkedHashMap<String, Command> commands,

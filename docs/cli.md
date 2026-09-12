@@ -64,6 +64,11 @@ adb -s 192.168.6.17:5555 pull /storage/emulated/0/Android/data/com.weico.interna
 | 命令 | 作用 | 运行时要求 |
 |---|---|---|
 | `weico.status` | 查询首页、缓存任务和最近命令状态 | 轻享版已启动 |
+| `weico.timeline.status` | 当前首页可见位置、微博 ID、上次阅读 ID、Adapter 条数 | Hook 已加载；无首页时返回 `timeline_ready=false` |
+| `weico.timeline.refresh` | 调用原生 `loadNew()` 刷新，并复用刷新阅读锚点 | 当前首页已捕获，缓存/补齐/网络请求空闲 |
+| `weico.timeline.load_more` | 调用原生 `loadMore()` 加载更多 | 同上；保留原有加载上限和无更多内容判断 |
+| `weico.preload.status` | 查询预加载调度、请求中、停止、重试与页数状态 | Hook 已加载 |
+| `weico.gap.status` | 查询断层补齐游标、目标、页数、空页、错误、fallback 和检查点 | Hook 已加载 |
 | `weico.logs.status` | 查询日志路径、大小、行数及可识别时间边界 | 轻享版 Hook 已加载 |
 | `weico.logs.read` | 返回最多 48 KiB 的可复制终端预览，可指定 `start`、`end`、`max_chars` | 轻享版 Hook 已加载 |
 | `weico.logs.export` | 后台流式导出完整或指定时间范围，并返回可 `adb pull` 的路径 | 轻享版 Hook 已加载 |
@@ -75,3 +80,42 @@ adb -s 192.168.6.17:5555 pull /storage/emulated/0/Android/data/com.weico.interna
 | `weico.settings.reload` | 重新读取模块设置并刷新快捷按钮/预加载 | 轻享版已启动 |
 
 设置键仍为 `weico_profile_entry`、`weico_timeline_jump_button`、`weico_timeline_cache_clear_button` 和 `weico_timeline_cache_days`。旧版目标应用本地设置会作为迁移回退保留；Provider 中存在显式值后，以 Provider 为准。
+
+## 新增命令与 raw ADB 时间参数
+
+以下示例使用设备 `.90`；所有查询均为结构化键值结果，无需 UI dump。
+
+```bash
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.status
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.preload.status
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.gap.status
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.refresh
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.load_more
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.timeline.jump --extra value:s:2026-09-12_08-30-00
+adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.reweibo.settings/settings --method exec --arg weico.cache.clear --extra start:s:2026-09-01_00-00 --extra end:s:2026-09-01_23-59
+```
+
+`timeline.refresh/load_more` 的 `status=accepted` 只表示已调用原生入口，返回 `completion=not_tracked`，不写入 `last_operation_state=completed`，也不提供异步 operation ID。网络可能返回空页、出错或由原生逻辑忽略重复请求；应结合三个状态命令与日志观察结果，不能只凭缓存数量没变化判定失败。正在缓存清理、恢复、补齐、预加载或已有可观察网络请求时拒绝新增 CLI 请求，不修改这些已有任务。
+
+`timeline.status` 中位置是 Adapter 位置（含 header），ID 为字符串，避免大整数精度损失；header/footer 没有微博 ID 时返回 `0`。无当前首页时不返回可见位置字段；`last_read_id=0` 表示没有已保存阅读 ID。`window_focused` 表示首页窗口是否有焦点；新的刷新/加载更多命令只使用该首页绑定的 presenter，并要求窗口有焦点，避免操作被详情页遮挡的旧首页。只读取当前视口，不遍历全部缓存。
+
+`preload.status` 的 `state_present=false` 表示尚无该 presenter 的预加载状态；`stopped` 是内部停止标志，不等于成功完成。`gap.status` 的空页/错误计数是当前断层周期统计，状态重置后归零；`active=false` 不区分已完成、尚未启动或已停止，可结合持久化日志判断。状态查询不启动补齐或重置进度。
+
+时间跳转新增 `yyyy-MM-dd_HH-mm` / `yyyy-MM-dd_HH-mm-ss`；缓存清理新增 `yyyy-MM-dd_HH-mm`，仍按开始分钟的 `00.000` 到结束分钟的 `59.999` 处理，日期仍按整天处理。旧输入继续兼容，格式转换不放宽日期校验。
+
+## 功能覆盖盘点
+
+| 模块能力 | ADB 对应方式 |
+|---|---|
+| 四项设置、恢复单项默认值 | `settings.list/get/set/reset`，运行中再 `weico.settings.reload` |
+| 设置/日志弹窗中的业务操作 | 设置接口与 `logs.status/read/export`；无需为了操作再打开弹窗 |
+| 时间线顶部/底部、日期跳转 | `timeline.top/bottom/jump` |
+| 原生刷新、加载更多 | 新增 `timeline.refresh/load_more` |
+| 当前阅读视口、保存的阅读 ID | 新增 `timeline.status` |
+| 缓存范围与按范围清理 | `cache.stats/clear`，保留原有异步 operation ID |
+| 预加载重启与进度 | `preload.restart` + 新增 `preload.status` |
+| 自动断层补齐诊断 | 新增 `gap.status` + `logs.read/export`；不新增暂停策略 |
+| 广告 Hook、热重载状态 | `weico.status` 现有 `timeline_ad_*`、`hot_reload_*` 字段 |
+| 自动去广告、排序、阅读恢复、过期视频地址处理 | 仍由原有 Hook 自动运行；无需建立重复的手动执行接口 |
+
+The added commands expose native refresh/load-more and structured viewport, preload and gap-fill state. Native actions report acceptance only, not network completion. Existing settings, cache operations, logs, ordering and automatic hooks keep their behavior. Raw ADB timestamps are additionally accepted for timeline jumps and minute-based cache clearing.
