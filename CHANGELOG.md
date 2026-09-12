@@ -2,6 +2,24 @@
 
 # Changelog
 
+## 1.2.1
+
+### 中文
+
+- 增加时间线 addData 入口与回调阶段日志，记录线程、传入及缓存条数、可解析的宿主 Activity/Intent、阶段耗时和回补状态。
+- 基于 7.0.0 APK 的 DEX 核对，确认首页、评论和竖屏视频 UVE 广告请求经过现有 UveAdHelper Hook，保留旧 RxApiKt lambda 候选。
+- README 新增软件发布频道入口。
+- 避免断层回补空页处理路径再次持久化整份缓存，保留正常检查点、回补重试、排序和手动加载。
+- 将 addData 计时起点保存在单次调用上下文中，避免不同调用共享计时状态。
+
+### English
+
+- Adds timeline addData entry and callback-stage logs with thread information, incoming/cached counts, resolvable host Activity/Intent context, stage timing, and gap-fill state.
+- Confirms through DEX inspection of the 7.0.0 APK that home-feed, comment, and vertical-video UVE ad requests pass through the existing UveAdHelper hook, retaining legacy RxApiKt lambda candidates.
+- Adds the software release channel link to the README.
+- Avoids persisting the entire cache again in the empty-page gap-fill handler while preserving normal checkpoints, fallback retries, ordering, and manual loading.
+- Stores the addData timing start in the individual call context so different calls do not share timing state.
+
 ## 1.2.0
 
 ### 中文

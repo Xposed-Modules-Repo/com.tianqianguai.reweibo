@@ -56,6 +56,8 @@
 
 ## 兼容性
 
+- 微博轻享版 7.0.0：DEX 核对确认首页、评论和竖屏视频 UVE 广告请求经过现有 `UveAdHelper` Hook；旧 `RxApiKt` lambda 候选继续保留用于旧版兼容。此项为入口签名与调用链核对，不代表所有广告场景已完成实测。
+
 - 框架 API：Modern libxposed API `102`（`io.github.libxposed:api:102.0.0`）。
 - 最低与目标 Xposed API：`102`。
 - 静态 scope：仅 `com.weico.international`。
@@ -66,6 +68,8 @@
 - 微博轻享版 6.9.9：V2/V3 时间线数据顺序 hook 支持 R8 `ExternalSyntheticLambda` 候选，旧版 `doLoadData` lambda 候选仍受支持。
 
 ## Compatibility
+
+- Weibo Lite 7.0.0: DEX inspection confirms that home-feed, comment, and vertical-video UVE ad requests pass through the existing `UveAdHelper` hook. Legacy `RxApiKt` lambda candidates remain for older versions. This verifies entry signatures and call paths, not a full behavioral test of every ad scenario.
 
 - Framework API: Modern libxposed API `102` (`io.github.libxposed:api:102.0.0`).
 - Minimum and target Xposed API: `102`.
