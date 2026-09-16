@@ -8,12 +8,46 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Reflection helpers limited to the surface used by ReWeibo's migrated hooks. */
 public final class XposedHelpers {
+    private static final ConcurrentHashMap<MethodKey, Method> METHOD_CACHE = new ConcurrentHashMap<>();
+
+    // Class identities (including argument classes) keep separate class loaders isolated.
+    private static final class MethodKey {
+        final Class<?> owner;
+        final String name;
+        final boolean staticOnly;
+        final Class<?>[] arguments;
+
+        MethodKey(Class<?> owner, String name, Object[] args, boolean staticOnly) {
+            this.owner = owner;
+            this.name = name;
+            this.staticOnly = staticOnly;
+            arguments = new Class<?>[args.length];
+            for (int i = 0; i < args.length; i++) {
+                arguments[i] = args[i] == null ? null : args[i].getClass();
+            }
+        }
+
+        @Override public boolean equals(Object other) {
+            if (!(other instanceof MethodKey)) return false;
+            MethodKey key = (MethodKey) other;
+            return owner == key.owner && staticOnly == key.staticOnly
+                && name.equals(key.name) && Arrays.equals(arguments, key.arguments);
+        }
+
+        @Override public int hashCode() {
+            return 31 * (31 * (31 * owner.hashCode() + name.hashCode())
+                + Boolean.hashCode(staticOnly)) + Arrays.hashCode(arguments);
+        }
+    }
+
     private XposedHelpers() {}
 
     public static Class<?> findClass(String name, ClassLoader classLoader) {
@@ -161,6 +195,9 @@ public final class XposedHelpers {
             Object[] args,
             boolean staticOnly
     ) {
+        MethodKey key = new MethodKey(clazz, name, args, staticOnly);
+        Method cached = METHOD_CACHE.get(key);
+        if (cached != null) return cached;
         List<MethodCandidate> candidates = new ArrayList<>();
         Set<String> seenSignatures = new HashSet<>();
         Class<?> current = clazz;
@@ -168,8 +205,9 @@ public final class XposedHelpers {
         while (current != null) {
             Method[] methods = current.getDeclaredMethods();
             for (Method method : methods) {
+                if (!method.getName().equals(name)) continue;
                 String signature = method.getName() + parameterText(method.getParameterTypes());
-                if (!method.getName().equals(name) || !seenSignatures.add(signature)) continue;
+                if (!seenSignatures.add(signature)) continue;
                 if (Modifier.isStatic(method.getModifiers()) != staticOnly) continue;
                 Integer score = conversionScore(method.getParameterTypes(), args);
                 if (score != null) candidates.add(new MethodCandidate(method, score, declaringDepth));
@@ -227,6 +265,7 @@ public final class XposedHelpers {
         }
         Method selected = finalists.get(0).method;
         selected.setAccessible(true);
+        METHOD_CACHE.putIfAbsent(key, selected);
         return selected;
     }
 
