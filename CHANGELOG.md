@@ -2,6 +2,34 @@
 
 # Changelog
 
+## 1.2.2
+
+### 新增与改进
+
+- 新增 ADB 首页时间线状态、原生刷新与加载更多接口，以及预加载和断层补齐状态查询；保留原有忙碌检查、加载上限和无更多内容判断。
+- 时间跳转与缓存范围清理支持适合 raw ADB 传参的日期时间格式，继续兼容原有输入与范围校验。
+- 增加补齐任务排队与后台准备耗时、回退实际调度延迟、提示更新/移除和边界跳转耗时日志，便于真实使用中定位问题。
+
+### Added And Improved
+
+- Adds ADB home-timeline status, native refresh and load-more actions, plus preload and gap-fill status queries, preserving existing busy checks, loading limits, and end-of-feed handling.
+- Supports raw-ADB-friendly date-time formats for timeline jumps and cache-range clearing while retaining existing inputs and range validation.
+- Adds logs for completion queue/preparation time, actual fallback scheduling delays, progress-card updates/removal, and edge-navigation timing to aid diagnosis during real use.
+
+### 修复
+
+- 将服务器空页确认后的断层补齐收尾统计、裁剪与排序移到后台，减少大缓存占用主线程造成的卡顿和 ANR；异步结果应用前检查任务与数据变化，避免旧快照覆盖新缓存或清理结果。
+- 修复补齐超时或到达页数上限后任务停止但提示仍残留的路径；终态及时更新提示，页面不可用时移除残留卡片，并拦截过期调度与提示回调。
+- 优化双击回顶部的边界查找，缓存反射方法解析结果，校正时复用有效目标位置，并取消旧的跳转校正任务，减少大列表重复扫描和连续双击造成的任务叠加。
+- 复用微博日期解析器和解析结果，避免普通日期字符串反复触发数字转换异常；减少重复缓存统计与影子缓存写入请求，保留原有缓存天数、容量和功能。
+
+### Fixes
+
+- Moves statistics, trimming, and sorting for gap-fill completion after confirmed empty server responses into background work, reducing large-cache main-thread stalls and ANRs. Task and data checks prevent stale snapshots from overwriting newer caches or clear results.
+- Fixes paths where an expired or page-limited gap-fill task stops but leaves its progress card visible. Terminal states update promptly, detached cards are removed, and stale scheduling and progress callbacks are ignored.
+- Optimizes double-tap-to-top boundary lookup, caches reflective method resolution, reuses valid positions during correction, and cancels older correction tasks to reduce repeated large-list scans and overlapping work.
+- Reuses status-date parsers and parsed values instead of repeatedly throwing numeric-conversion exceptions for ordinary date strings, and reduces duplicate cache statistics and shadow-cache write requests while preserving cache duration, capacity, and features.
+
 ## 1.2.1
 
 ### 中文

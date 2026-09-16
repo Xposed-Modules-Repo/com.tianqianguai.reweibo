@@ -24,6 +24,9 @@
 
 ## 功能
 
+- 服务器空页确认后的补齐收尾在后台准备，终态清理进度提示；双击回顶部复用反射查找与有效校正位置，减少大缓存下的主线程阻塞。
+
+
 - 跳过微博轻享版启动页广告和时间线广告路径。
 - 强制主页时间线使用更干净的反向/新微博在前排序。
 - 过滤广告样式和无实际内容的时间线条目。
@@ -39,6 +42,9 @@
 - 在 ReWeibo 设置中提供终端样式日志页：日志文本可长按自由选择，也可复制当前预览；支持按起止日期时间筛选，并将完整筛选结果流式导出为 TXT，避免把大型日志一次性载入界面。
 
 ## Features
+
+- Prepares gap-fill completion after confirmed empty server responses in the background and clears terminal progress cards. Double-tap-to-top reuses reflective lookup and valid correction positions to reduce main-thread stalls with large caches.
+
 
 - Skips Weibo Lite splash-ad and timeline-ad paths.
 - Forces a cleaner reverse/newest-first order for the home timeline.
@@ -82,7 +88,7 @@
 
 ## ADB / CLI
 
-设置、状态查询、日志预览/范围导出、时间跳转、缓存统计与精确范围清理均可直接通过 `adb shell content call` 调用，不需要仓库脚本、截图或坐标点击。命令清单见 [docs/cli.md](docs/cli.md)。
+设置、首页/预加载/断层补齐状态查询、原生刷新与加载更多、日志预览/范围导出、时间跳转、缓存统计与精确范围清理均可直接通过 `adb shell content call` 调用，不需要仓库脚本、截图或坐标点击。命令清单见 [docs/cli.md](docs/cli.md)。
 
-Settings, status queries, log preview/range export, time jumps, cache statistics, and exact-range cache clearing are available directly through `adb shell content call`, without repository scripts, screenshots, or coordinate taps. See [docs/cli.md](docs/cli.md) for the command list.
+Settings, home-timeline/preload/gap-fill status queries, native refresh and load-more actions, log preview/range export, time jumps, cache statistics, and exact-range cache clearing are available directly through `adb shell content call`, without repository scripts, screenshots, or coordinate taps. See [docs/cli.md](docs/cli.md) for the command list.
 
