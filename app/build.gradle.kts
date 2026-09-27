@@ -24,8 +24,8 @@ android {
         applicationId = "com.tianqianguai.reweibo"
         minSdk = 28
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.2.2"
+        versionCode = 9
+        versionName = "1.3.0"
     }
 
     signingConfigs {
