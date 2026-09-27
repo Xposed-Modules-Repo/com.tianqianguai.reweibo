@@ -43,7 +43,7 @@ class ExampleUnitTest {
     fun moduleSettingsRegistryKeepsLegacyKeysAndTypes() {
         val keys = ModuleSettings.allKeys().toSet()
 
-        assertEquals(4, keys.size)
+        assertEquals(17, keys.size)
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_PROFILE_ENTRY))
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON))
         assertTrue(keys.contains(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON))

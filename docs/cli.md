@@ -119,3 +119,7 @@ adb -s 192.168.6.90:5555 shell content call --uri content://com.tianqianguai.rew
 | 自动去广告、排序、阅读恢复、过期视频地址处理 | 仍由原有 Hook 自动运行；无需建立重复的手动执行接口 |
 
 The added commands expose native refresh/load-more and structured viewport, preload and gap-fill state. Native actions report acceptance only, not network completion. Existing settings, cache operations, logs, ordering and automatic hooks keep their behavior. Raw ADB timestamps are additionally accepted for timeline jumps and minute-based cache clearing.
+
+## 功能开关与生效时机
+
+所有功能开关可通过现有 `settings.list/get/set/reset` 操作，完整功能列表见 [features.md](features.md)。布尔功能开关在目标进程下次启动时读取；`weico.settings.reload` 同步配置但不会切换当前进程的功能快照，修改开关后需要重启微博轻享版。缓存天数保留原有重载行为。禁用导航或预加载时，对应动作返回禁用原因，不会绕过开关执行。

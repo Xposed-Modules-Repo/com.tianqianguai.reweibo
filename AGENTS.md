@@ -69,6 +69,16 @@ adb -s 192.168.6.17:5555 shell content call --uri content://com.tianqianguai.rew
 
 Start every new version in its own task branch/worktree. Publishing is authorized only when the user explicitly asks for a release.
 
+### 默认发版交付
+
+- 用户说“发版”时，完成发布后默认在最终回复中直接提供可复制的 Telegram 发布文案，无需用户再次索取；文案须与本次实际发布内容一致。
+- Telegram 发布文案与 Release 正文默认按“中文一句，紧接对应英文一句”逐句配对，摘要、更新条目和 Star 邀请均遵循此格式；不再按语言分成两大块。用户明确指定其他语言要求时按其要求执行。
+- Telegram 发布文案与 Release 正文都不写版本比较引导语（如“相比上一版”“从 vX 到 vY”“Compared with the previous release”），直接描述本次发布的功能、改进与修复；内部仍按完整源码发布区间梳理变更。
+- GitHub Release 正文和 Telegram 发布文案均不包含 ADB 相关内容，包括 ADB 接口、命令、操作示例及其新增、改进或修复说明；相关技术记录保留在内部变更梳理或专门文档中，不纳入发布文案。
+- Telegram 发布文案中不放 Release 地址；提供项目主页 `https://github.com/Xposed-Modules-Repo/com.tianqianguai.reweibo`，并自然邀请用户点 Star 支持项目。
+- 在 Telegram 文案之外，单独提供已发布 APK 的下载地址，以及本地安装包所在文件夹的绝对路径；本地交付只给文件夹路径，不给 APK 文件链接。Release 安装包文件名必须包含版本号（例如 `ReWeibo-v1.2.2.apk`），禁止使用 `release.apk`、`app.apk` 等泛名。
+- 提供文案不代表获准代发 Telegram 消息；发送到频道或群组仍需用户明确授权。
+
 ### Version and source interval
 
 - Bump both `versionCode` and `versionName` in `app/build.gradle.kts`. The normalized Xposed Modules Repo tag is `<versionCode>-<versionName>`.
@@ -79,34 +89,29 @@ Start every new version in its own task branch/worktree. Publishing is authorize
 ### Release notes
 
 - Keep `CHANGELOG.md`, `docs/release/<version>.md`, README feature/compatibility descriptions, and the GitHub Release body consistent.
-- Write release notes in both Chinese and English. Both sections must describe the same shipped behavior.
+- Exclude all ADB-related content from the GitHub Release body and Telegram release copy, including interfaces, commands, examples, and ADB additions, improvements, or fixes. Apply this exclusion to `docs/release/<version>.md`, which is published verbatim; retain technical coverage in internal change records or dedicated documentation. Consistency does not require copying ADB details into public release copy.
+- Write release notes as sentence pairs: each Chinese sentence immediately followed by its matching English sentence, including summaries, update bullets, and Star requests. Do not split the body into separate Chinese and English blocks.
+- Do not include version-comparison lead-ins such as “相比上一版”, “从 vX 到 vY”, or “Compared with the previous release”. Describe the shipped changes directly; still use the complete source release interval internally to determine coverage.
 - Include a short bilingual Star request in the opening summaries unless the user asks to omit it; keep it natural and do not add a separate promotional section.
-- Use the template below. Omit `修复` / `Fixes` only when the release contains no fixes.
+- Use the paired bilingual template below. Omit `修复 / Fixes` only when the release contains no fixes.
 - Do not add `模块元数据` / `Module Metadata`, `验证` / `Verification`, `APK 校验` / `APK Checksum`, or `已知限制` / `Known Limit` sections unless the user explicitly requests them.
 - Use `docs/release/<version>.md` verbatim as the GitHub Release body.
 
 ```markdown
 # ReWeibo <version>
 
-<中文版本摘要>
+<中文摘要句。>
+<Matching English summary sentence.>
 
-<English release summary>
+## 新增与改进 / Added And Improved
 
-## 新增与改进
+- <中文更新句。>
+  <Matching English update sentence.>
 
-- <覆盖上个 release tag 至本次版本的中文更新内容>
+## 修复 / Fixes
 
-## Added And Improved
-
-- <English updates covering the same release interval>
-
-## 修复
-
-- <中文修复内容>
-
-## Fixes
-
-- <English fixes matching the Chinese section>
+- <中文修复句。>
+  <Matching English fix sentence.>
 ```
 
 ### Candidate and signing gates
@@ -119,7 +124,7 @@ Start every new version in its own task branch/worktree. Publishing is authorize
 
 ### GitHub and Xposed publication
 
-- Push the release commit to `main` before creating the Release. Rename/copy the frozen artifact to `ReWeibo-v<version>.apk` without rebuilding it.
+- Push the release commit to `main` before creating the Release. Rename/copy the frozen artifact to `ReWeibo-v<version>.apk` without rebuilding it; the Release asset filename must contain the version and must not be a generic name such as `release.apk`.
 - Create the GitHub Release with a unique temporary tag such as `release-<version>-<short-release-commit>`, `--target <release-commit>`, title `ReWeibo <version>`, the APK asset, and `--notes-file docs/release/<version>.md`.
 - Do **not** pre-create or push the final `<versionCode>-<versionName>` tag and do not use `--verify-tag` for this flow. Xposed Modules Repo accepts an arbitrary initial tag and its official bot normalizes it after the Release with the valid APK is published.
 - After the bot runs, verify the GitHub Release is Latest, non-draft, non-prerelease, has normalized tag `<versionCode>-<versionName>`, and has exactly the intended APK asset. A bot-owned annotated tag or synthetic empty target commit is normal; never force it back to the source commit.

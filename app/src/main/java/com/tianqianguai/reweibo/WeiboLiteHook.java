@@ -36,6 +36,8 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.Switch;
+import android.widget.ScrollView;
+import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -629,7 +631,61 @@ public class WeiboLiteHook {
         void onSelected(long timeMs);
     }
 
+    private static volatile ModuleSettings.FeatureSnapshot sFeatures;
+
+    private static boolean feature(String key) {
+        ModuleSettings.FeatureSnapshot snapshot = sFeatures;
+        return snapshot == null ? ModuleSettings.defaultFor(key) : snapshot.isEffective(key);
+    }
+
+    private static boolean anyFeature(String... keys) {
+        for (String key : keys) if (feature(key)) return true;
+        return false;
+    }
+
+    /** All callbacks stay registered, preserving stable hook IDs and native calls when disabled. */
+    private abstract static class FeatureHook extends XC_MethodHook {
+        private final String[] keys;
+        FeatureHook(String... keys) { this.keys = keys; }
+        @Override protected final void beforeHookedMethod(MethodHookParam param) throws Throwable {
+            if (anyFeature(keys)) beforeEnabled(param);
+        }
+        @Override protected final void afterHookedMethod(MethodHookParam param) throws Throwable {
+            if (anyFeature(keys)) afterEnabled(param);
+        }
+        protected void beforeEnabled(MethodHookParam param) throws Throwable {}
+        protected void afterEnabled(MethodHookParam param) throws Throwable {}
+    }
+
+    private static synchronized void loadFeatureSnapshot(Context context) {
+        if (sFeatures != null || context == null) return;
+        Map<String, Object> configured = new LinkedHashMap<>();
+        SharedPreferences prefs = getWeicoSettingsPrefs();
+        if (prefs != null) configured.putAll(prefs.getAll());
+        // Read all switches once per process, never once per status or layout callback.
+        try (Cursor cursor = context.getContentResolver().query(ModuleSettings.allSettingsUri(),
+                null, null, null, null)) {
+            if (cursor != null) {
+                int keyColumn = cursor.getColumnIndexOrThrow("key");
+                int valueColumn = cursor.getColumnIndexOrThrow("value");
+                while (cursor.moveToNext()) {
+                    String key = cursor.getString(keyColumn);
+                    if (ModuleSettings.isBooleanKey(key)) configured.put(key, cursor.getInt(valueColumn) != 0);
+                }
+            }
+        } catch (Throwable ignored) {
+            // The last saved target-side settings keep working when the provider is unavailable.
+        }
+        sFeatures = ModuleSettings.featureSnapshot(configured);
+        if (prefs != null) {
+            SharedPreferences.Editor editor = prefs.edit();
+            for (String key : ModuleSettings.booleanKeys()) editor.putBoolean(key, sFeatures.isEnabled(key));
+            editor.apply();
+        }
+    }
+
     private static void log(String msg) {
+        if (sFeatures == null || !feature(ModuleSettings.KEY_WEICO_PERSISTENT_LOGS)) return;
         XposedBridge.log("ReWeibo: " + msg);
         synchronized (sLogFileLock) {
             if (sLogFile == null) return;
@@ -706,14 +762,14 @@ public class WeiboLiteHook {
         if (activity == null && recyclerView instanceof View) {
             activity = findHostActivity(((View) recyclerView).getContext());
         }
-        return HotReloadState.compose(
+        return HotReloadState.withFeatures(HotReloadState.compose(
             context,
             presenter,
             recyclerView,
             ownerFragment,
             activity,
             sHotReloadGeneration
-        );
+        ), sFeatures == null ? ModuleSettings.featureSnapshot((Map<String, ?>) null).toArray() : sFeatures.toArray());
     }
 
     static String hotReloadBlocker() {
@@ -854,6 +910,8 @@ public class WeiboLiteHook {
             boolean hotReloaded
     ) {
         if (!HotReloadState.isValid(savedState, WeiboLiteHook.class.getClassLoader())) return false;
+        // Legacy generations had all these behaviors enabled. Preserve their behavior until restart.
+        sFeatures = ModuleSettings.featureSnapshot(HotReloadState.features(savedState));
         Context context = HotReloadState.applicationContext(savedState) instanceof Context
             ? (Context) HotReloadState.applicationContext(savedState)
             : null;
@@ -1329,31 +1387,32 @@ public class WeiboLiteHook {
                 dpToPx(activity.getWindow().getDecorView(), 48)
             ));
 
-            final Switch jumpButtonToggle = new Switch(activity);
-            jumpButtonToggle.setText("显示首页“跳转”按钮");
-            jumpButtonToggle.setTextColor(Color.WHITE);
-            jumpButtonToggle.setTextSize(15f);
-            jumpButtonToggle.setChecked(isModuleOptionEnabled(
-                ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
-                ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
-            ));
-            panel.addView(jumpButtonToggle, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ));
-
-            final Switch clearButtonToggle = new Switch(activity);
-            clearButtonToggle.setText("显示首页“删除”按钮");
-            clearButtonToggle.setTextColor(Color.WHITE);
-            clearButtonToggle.setTextSize(15f);
-            clearButtonToggle.setChecked(isModuleOptionEnabled(
-                ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
-                ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON)
-            ));
-            panel.addView(clearButtonToggle, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ));
+            TextView featureNote = new TextView(activity);
+            featureNote.setText("功能开关在重启微博轻享版后生效；关闭模块入口后，可从桌面 ReWeibo 应用图标重新设置。扩展缓存关闭时，预加载、补齐和阅读位置暂不生效，原选择与缓存文件仍保留。");
+            featureNote.setTextColor(Color.LTGRAY);
+            panel.addView(featureNote);
+            final Map<String, Switch> featureToggles = new LinkedHashMap<>();
+            Button onlyAds = new Button(activity);
+            onlyAds.setText("仅去广告");
+            panel.addView(onlyAds);
+            for (String key : ModuleSettings.booleanKeys()) {
+                Switch toggle = new Switch(activity);
+                toggle.setText(ModuleSettings.titleFor(key));
+                toggle.setTextColor(Color.WHITE);
+                toggle.setChecked(readConfiguredBoolean(key, ModuleSettings.defaultFor(key)));
+                featureToggles.put(key, toggle);
+                panel.addView(toggle);
+                TextView description = new TextView(activity);
+                description.setText(ModuleSettings.descriptionFor(key));
+                description.setTextColor(Color.LTGRAY);
+                description.setTextSize(12f);
+                panel.addView(description);
+            }
+            onlyAds.setOnClickListener(v -> {
+                for (Map.Entry<String, Boolean> entry : ModuleSettings.onlyAdsPreset().entrySet()) {
+                    featureToggles.get(entry.getKey()).setChecked(entry.getValue());
+                }
+            });
 
             View divider = new View(activity);
             divider.setBackgroundColor(0xFF343946);
@@ -1370,12 +1429,8 @@ public class WeiboLiteHook {
             clearLabel.setTextSize(15f);
             panel.addView(clearLabel);
 
-            TimelineCacheStats cacheStats = buildBestTimelineCacheStats(sLastTimelinePresenter);
             TextView clearDescription = new TextView(activity);
-            clearDescription.setText(
-                formatTimelineCacheRangeSummary(cacheStats)
-                    + "\n可按微博发布时间选择起止范围；清理后再次浏览仍可能重新缓存。"
-            );
+            clearDescription.setText("选择清理范围时会在后台读取缓存统计；关闭扩展缓存不会删除已有文件。");
             clearDescription.setTextColor(Color.rgb(160, 169, 184));
             clearDescription.setTextSize(12f);
             clearDescription.setPadding(0, dpToPx(activity.getWindow().getDecorView(), 6), 0, 0);
@@ -1444,9 +1499,11 @@ public class WeiboLiteHook {
                 WeiboLiteHook::submitLogIoTask
             ));
 
+            ScrollView settingsScroll = new ScrollView(activity);
+            settingsScroll.addView(panel);
             final AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle("ReWeibo 设置")
-                .setView(panel)
+                .setView(settingsScroll)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", null)
                 .create();
@@ -1466,17 +1523,12 @@ public class WeiboLiteHook {
                         input.setError("请输入 1-30");
                         return;
                     }
-                    boolean saved = prefs.edit()
-                        .putInt(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days)
-                        .putBoolean(
-                            ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
-                            jumpButtonToggle.isChecked()
-                        )
-                        .putBoolean(
-                            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
-                            clearButtonToggle.isChecked()
-                        )
-                        .commit();
+                    SharedPreferences.Editor editor = prefs.edit()
+                        .putInt(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days);
+                    for (Map.Entry<String, Switch> entry : featureToggles.entrySet()) {
+                        editor.putBoolean(entry.getKey(), entry.getValue().isChecked());
+                    }
+                    boolean saved = editor.commit();
                     if (!saved) {
                         input.setError("保存失败，请重试");
                         return;
@@ -1485,24 +1537,20 @@ public class WeiboLiteHook {
                         ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS,
                         days
                     );
-                    providerSaved &= writeModuleSettingToProvider(
-                        ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
-                        jumpButtonToggle.isChecked() ? 1 : 0
-                    );
-                    providerSaved &= writeModuleSettingToProvider(
-                        ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON,
-                        clearButtonToggle.isChecked() ? 1 : 0
-                    );
+                    for (Map.Entry<String, Switch> entry : featureToggles.entrySet()) {
+                        providerSaved &= writeModuleSettingToProvider(entry.getKey(), entry.getValue().isChecked() ? 1 : 0);
+                    }
                     if (!providerSaved) {
-                        log("Settings dialog kept target-pref fallback because Provider sync failed");
+                        Toast.makeText(activity, "部分设置同步失败，请重试保存", Toast.LENGTH_LONG).show();
+                        return;
                     }
                     rememberModuleIntSetting(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, days);
                     refreshTimelineShortcutButtons("settings-saved");
-                    if (sLastTimelinePresenter != null) {
+                    if (days != current && sLastTimelinePresenter != null) {
                         resetPreloadState(sLastTimelinePresenter, "settings-saved");
                         scheduleTimelinePreload(sLastTimelinePresenter, "settings-saved");
                     }
-                    Toast.makeText(activity, "已保存：" + days + " 天", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(activity, "已保存，功能开关在重启微博轻享版后生效", Toast.LENGTH_LONG).show();
                     dialog.dismiss();
                 });
             });
@@ -2461,6 +2509,7 @@ public class WeiboLiteHook {
         if (applicationContext != null) context = applicationContext;
         boolean recovered = sWeicoContext == null;
         sWeicoContext = context;
+        loadFeatureSnapshot(context);
         if (recovered) {
             log("Weico application context captured source=" + source);
         }
@@ -2534,6 +2583,13 @@ public class WeiboLiteHook {
     }
 
     private static CliCommandBridge.Result handleWeicoCliCommand(String command, Bundle args) {
+        if (("timeline.top".equals(command) || "timeline.bottom".equals(command) || "timeline.jump".equals(command))
+            && !feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP)) {
+            return CliCommandBridge.Result.error("timeline navigation is disabled; enable it and restart Weibo Lite");
+        }
+        if ("preload.restart".equals(command) && !feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) {
+            return CliCommandBridge.Result.error("preload is disabled or its cache dependency is disabled");
+        }
         if ("status".equals(command)) {
             return buildWeicoCliStatus();
         }
@@ -3189,6 +3245,10 @@ public class WeiboLiteHook {
     }
 
     private static boolean isModuleOptionEnabled(String key, boolean fallback) {
+        return feature(key);
+    }
+
+    private static boolean readConfiguredBoolean(String key, boolean fallback) {
         ModuleSettingRead provider = readModuleSettingFromProvider(key, "enabled");
         if (provider.available && provider.isSet) {
             boolean value = provider.value != 0;
@@ -3321,11 +3381,7 @@ public class WeiboLiteHook {
 
     private static void reloadModuleSettingsFromProvider() {
         SharedPreferences prefs = getWeicoSettingsPrefs();
-        String[] booleanKeys = new String[] {
-            ModuleSettings.KEY_WEICO_PROFILE_ENTRY,
-            ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
-            ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON
-        };
+        String[] booleanKeys = ModuleSettings.booleanKeys();
         for (int i = 0; i < booleanKeys.length; i++) {
             String key = booleanKeys[i];
             ModuleSettingRead provider = readModuleSettingFromProvider(key, "enabled");
@@ -3411,9 +3467,9 @@ public class WeiboLiteHook {
                 cl,
                 "dispatchTouchEvent",
                 MotionEvent.class,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         Object event = param.args[0];
                         if (event instanceof MotionEvent) {
                             handleHomeTabDoubleTap((MotionEvent) event);
@@ -3429,6 +3485,7 @@ public class WeiboLiteHook {
     }
 
     private static void handleTopBarDoubleTap(MotionEvent event) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return;
         try {
             if (event.getActionMasked() != MotionEvent.ACTION_UP) return;
             int side = getTimelineTopBarTapSide(event);
@@ -3463,6 +3520,7 @@ public class WeiboLiteHook {
     }
 
     private static void handleHomeTabDoubleTap(MotionEvent event) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
         try {
             int action = event.getActionMasked();
             if (action != MotionEvent.ACTION_DOWN && action != MotionEvent.ACTION_UP) return;
@@ -3557,9 +3615,9 @@ public class WeiboLiteHook {
                 Context.class,
                 videoInfoClass,
                 statusClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_VIDEO_REFRESH) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         Object companion = getStaticFieldSafe(activityClass, "INSTANCE");
                         if (redirectStaleVideoOpen(companion, param.args, "SmallVideoActivity.openVideo")) {
                             param.setResult(null);
@@ -3574,9 +3632,9 @@ public class WeiboLiteHook {
                 Context.class,
                 videoInfoClass,
                 statusClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_VIDEO_REFRESH) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         if (redirectStaleVideoOpen(param.thisObject, param.args, "SmallVideoActivity.Companion.openVideo")) {
                             param.setResult(null);
                         }
@@ -3591,6 +3649,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean redirectStaleVideoOpen(Object opener, Object[] args, String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_VIDEO_REFRESH)) return false;
         try {
             if (opener == null || args == null || args.length < 3) return false;
             if (!(args[0] instanceof Context)) return false;
@@ -3720,9 +3779,9 @@ public class WeiboLiteHook {
                 "androidx.swiperefreshlayout.widget.SwipeRefreshLayout",
                 cl,
                 "canChildScrollUp",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_DISABLE_PULL_REFRESH) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         param.setResult(true);
                     }
                 }
@@ -3732,9 +3791,9 @@ public class WeiboLiteHook {
                 cl,
                 "setRefreshing",
                 boolean.class,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_DISABLE_PULL_REFRESH) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         param.args[0] = false;
                     }
                 }
@@ -3770,9 +3829,9 @@ public class WeiboLiteHook {
                 recyclerViewClass,
                 "setLayoutManager",
                 layoutManagerClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void afterHookedMethod(final MethodHookParam param) {
+                    protected void afterEnabled(final MethodHookParam param) {
                         final Object recyclerView = param.thisObject;
                         final Object layoutManager = param.args[0];
                         HotReloadRuntime.postDelayed(new Runnable() {
@@ -3796,9 +3855,9 @@ public class WeiboLiteHook {
                 recyclerViewClass,
                 "setAdapter",
                 adapterClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void afterHookedMethod(final MethodHookParam param) {
+                    protected void afterEnabled(final MethodHookParam param) {
                         final Object recyclerView = param.thisObject;
                         HotReloadRuntime.postDelayed(new Runnable() {
                             @Override
@@ -3826,9 +3885,9 @@ public class WeiboLiteHook {
                 int.class,
                 int.class,
                 int.class,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterEnabled(MethodHookParam param) {
                         Object recyclerView = param.thisObject;
                         if (isTimelineRecyclerView(recyclerView)) {
                             scheduleTimelineTopAnchor(recyclerView, "onLayout", 0L);
@@ -3840,9 +3899,9 @@ public class WeiboLiteHook {
             XposedHelpers.findAndHookMethod(
                 recyclerViewClass,
                 "onDetachedFromWindow",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         if (param.thisObject == sTimelineTimeJumpRecyclerView) {
                             removeTimelineTimeJumpButton("timeline-detached");
                         }
@@ -3852,18 +3911,18 @@ public class WeiboLiteHook {
             XposedHelpers.findAndHookMethod(
                 Activity.class,
                 "onDestroy",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         if (param.thisObject == sTimelineTimeJumpActivity) {
                             removeTimelineTimeJumpButton("activity-destroy");
                         }
                     }
                 }
             );
-            XC_MethodHook redirectInitialScroll = new XC_MethodHook() {
+            XC_MethodHook redirectInitialScroll = new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     Object recyclerView = param.thisObject;
                     if (!shouldAnchorTimelineTop(recyclerView)) return;
                     int target = getTimelineTopAdapterPosition(recyclerView);
@@ -3880,9 +3939,9 @@ public class WeiboLiteHook {
                 recyclerViewClass,
                 "onTouchEvent",
                 MotionEvent.class,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         Object event = param.args[0];
                         if (!(event instanceof MotionEvent)) return;
                         if (!isCurrentHomeTimelineRecyclerView(param.thisObject)) return;
@@ -3902,9 +3961,9 @@ public class WeiboLiteHook {
                 recyclerViewClass,
                 "onScrollStateChanged",
                 int.class,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterEnabled(MethodHookParam param) {
                         Object recyclerView = param.thisObject;
                         int state = ((Integer) param.args[0]).intValue();
                         if (state == 0 && isCurrentHomeTimelineRecyclerView(recyclerView)) {
@@ -3927,8 +3986,10 @@ public class WeiboLiteHook {
             String adapterName = adapter.getClass().getName();
             if (!adapterName.contains("TimelineAdapter")) return false;
 
-            XposedHelpers.callMethod(layoutManager, "setReverseLayout", true);
-            XposedHelpers.callMethod(layoutManager, "setStackFromEnd", false);
+            if (feature(ModuleSettings.KEY_WEICO_FEED_REVERSE)) {
+                XposedHelpers.callMethod(layoutManager, "setReverseLayout", true);
+                XposedHelpers.callMethod(layoutManager, "setStackFromEnd", false);
+            }
             rememberTimelineRecyclerView(recyclerView);
             log("Timeline layout fixed reverse adapter=" + adapterName);
             return true;
@@ -3944,11 +4005,15 @@ public class WeiboLiteHook {
                 "com.weico.international.ui.indexv2.IndexV2Presenter",
                 cl
             );
-            XposedHelpers.findAndHookMethod(presenterClass, "addData", List.class, new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(presenterClass, "addData", List.class, new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     param.setObjectExtra("reweibo.addData.startedAt", Long.valueOf(SystemClock.elapsedRealtime()));
                     rememberTimelinePresenter(param.thisObject);
+                    if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) {
+                        normalizePresenterTimeline(param.thisObject, "features-without-cache");
+                        return;
+                    }
                     int incomingCount = param.args != null && param.args.length > 0 && param.args[0] instanceof List
                         ? ((List) param.args[0]).size() : -1;
                     log("Timeline addData enter source=presenter-addData thread="
@@ -3967,8 +4032,12 @@ public class WeiboLiteHook {
                 }
 
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) {
+                        normalizePresenterTimeline(param.thisObject, "features-without-cache");
+                        return;
+                    }
                     Object started = param.getObjectExtra("reweibo.addData.startedAt");
                     long startedAt = started instanceof Long ? ((Long) started).longValue() : SystemClock.elapsedRealtime();
                     log("Timeline addData exit source=presenter-addData elapsedMs="
@@ -4041,16 +4110,24 @@ public class WeiboLiteHook {
                     }
                 }
             });
-            XposedHelpers.findAndHookMethod(presenterClass, "setData", List.class, new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(presenterClass, "setData", List.class, new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) {
+                        normalizePresenterTimeline(param.thisObject, "features-without-cache");
+                        return;
+                    }
                     captureTimelineRefreshAnchorIfNeeded(param.thisObject, "presenter-setData-before");
                 }
 
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) {
+                        normalizePresenterTimeline(param.thisObject, "features-without-cache");
+                        return;
+                    }
                     if (isTimelineCacheRestoring(param.thisObject)) {
                         log("Timeline setData observed prepared cache apply");
                         return;
@@ -4076,10 +4153,14 @@ public class WeiboLiteHook {
                     scheduleTimelinePreload(param.thisObject, "presenter-setData");
                 }
             });
-            XposedHelpers.findAndHookMethod(presenterClass, "distinct", new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(presenterClass, "distinct", new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) {
+                        normalizePresenterTimeline(param.thisObject, "features-without-cache");
+                        return;
+                    }
                     if (hasActiveTimelineGapFill()) {
                         return;
                     }
@@ -4104,10 +4185,14 @@ public class WeiboLiteHook {
                     scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-distinct");
                 }
             });
-            XposedHelpers.findAndHookMethod(presenterClass, "loadMore", new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(presenterClass, "loadMore", new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     rememberTimelinePresenter(param.thisObject);
+                    if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) {
+                        normalizePresenterTimeline(param.thisObject, "features-without-cache");
+                        return;
+                    }
                     if (shouldSuppressTimelineLoadMore(param.thisObject)) {
                         log("Timeline loadMore suppressed warmed");
                         param.setResult(null);
@@ -4123,43 +4208,43 @@ public class WeiboLiteHook {
                 "com.weico.international.flux.Events$CommonLoadEvent",
                 cl
             );
-            XposedHelpers.findAndHookMethod(fragmentClass, "initData", new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(fragmentClass, "initData", new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     rememberHomeTimelineFragment(param.thisObject, "fragment-initData");
                 }
             });
             XposedHelpers.findAndHookMethod(fragmentClass, "showData", commonLoadEventClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         rememberHomeTimelineFragment(param.thisObject, "showData-before");
                         normalizeShowDataEvent(param.thisObject, param.args[0]);
                     }
 
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterEnabled(MethodHookParam param) {
                         rememberHomeTimelineFragment(param.thisObject, "showData-after");
                         scheduleHomeTimelineAdapterSelfHeal(param.thisObject, "showData-after");
                     }
                 }
             );
-            XposedHelpers.findAndHookMethod(fragmentClass, "onResume", new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(fragmentClass, "onResume", new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     rememberHomeTimelineFragment(param.thisObject, "fragment-resume");
                     scheduleHomeTimelineAdapterSelfHeal(param.thisObject, "fragment-resume");
                 }
             });
-            XposedHelpers.findAndHookMethod(fragmentClass, "onPause", new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(fragmentClass, "onPause", new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     markHomeTimelineFragmentPaused(param.thisObject);
                 }
             });
-            XposedHelpers.findAndHookMethod(fragmentClass, "onDetach", new XC_MethodHook() {
+            XposedHelpers.findAndHookMethod(fragmentClass, "onDetach", new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     forgetHomeTimelineFragment(param.thisObject);
                 }
             });
@@ -4200,9 +4285,9 @@ public class WeiboLiteHook {
                 "com.weico.international.ui.indexv2.IndexV2Action",
                 cl
             );
-            XC_MethodHook networkHook = new XC_MethodHook() {
+            XC_MethodHook networkHook = new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     Object action = getOuterAction(param.thisObject);
                     boolean loadNew = getTimelineLambdaLoadNew(param.thisObject);
                     if (loadNew) {
@@ -4240,9 +4325,9 @@ public class WeiboLiteHook {
             }
 
             XposedHelpers.findAndHookMethod(actionClass, "doLoadCache",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION) {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterEnabled(MethodHookParam param) {
                         Object result = param.getResult();
                         if (result instanceof List) {
                             hydrateTimelineStatusText((List) result, "v2-cache");
@@ -4277,9 +4362,9 @@ public class WeiboLiteHook {
             try {
                 XposedHelpers.findAndHookMethod(actionClass, "loadHomeTimeline",
                     long.class, long.class, long.class, boolean.class,
-                    new XC_MethodHook() {
+                    new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_PERSISTENT_LOGS) {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
+                        protected void beforeEnabled(MethodHookParam param) {
                             if (!shouldLogTimelineNetworkProbe(param.thisObject)) return;
                             boolean loadNew = param.args[3] instanceof Boolean && (Boolean) param.args[3];
                             log("Timeline v3 loadHomeTimeline request"
@@ -4291,7 +4376,7 @@ public class WeiboLiteHook {
                         }
 
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void afterEnabled(MethodHookParam param) {
                             if (!shouldLogTimelineNetworkProbe(param.thisObject)) return;
                             boolean loadNew = param.args[3] instanceof Boolean && (Boolean) param.args[3];
                             Throwable throwable = getHookThrowableSafe(param);
@@ -4317,9 +4402,9 @@ public class WeiboLiteHook {
 
             try {
                 XposedHelpers.findAndHookMethod(actionClass, "doLoadData", boolean.class,
-                    new XC_MethodHook() {
+                    new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_PERSISTENT_LOGS) {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
+                        protected void beforeEnabled(MethodHookParam param) {
                             if (!shouldLogTimelineNetworkProbe(param.thisObject)) return;
                             boolean loadNew = param.args[0] instanceof Boolean && (Boolean) param.args[0];
                             log("Timeline v3 doLoadData request"
@@ -4328,7 +4413,7 @@ public class WeiboLiteHook {
                         }
 
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void afterEnabled(MethodHookParam param) {
                             if (!shouldLogTimelineNetworkProbe(param.thisObject)) return;
                             boolean loadNew = param.args[0] instanceof Boolean && (Boolean) param.args[0];
                             Throwable throwable = getHookThrowableSafe(param);
@@ -4352,9 +4437,9 @@ public class WeiboLiteHook {
                 log("V3 timeline doLoadData probe hook error: " + t.getMessage());
             }
 
-            XC_MethodHook networkHook = new XC_MethodHook() {
+            XC_MethodHook networkHook = new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_PERSISTENT_LOGS) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     Object result = param.getResult();
                     Object action = getOuterAction(param.thisObject);
                     boolean loadNew = getTimelineLambdaLoadNew(param.thisObject);
@@ -4387,9 +4472,9 @@ public class WeiboLiteHook {
             }
 
             XposedHelpers.findAndHookMethod(actionClass, "doLoadCache",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_PERSISTENT_LOGS) {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterEnabled(MethodHookParam param) {
                         Object result = param.getResult();
                         if (result instanceof List) {
                             hydrateTimelineStatusText((List) result, "v3-cache");
@@ -4569,6 +4654,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean shouldLogTimelineNetworkProbe(Object owner) {
+        if (!(feature(ModuleSettings.KEY_WEICO_PERSISTENT_LOGS) || feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL) || feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD))) return false;
         try {
             String groupId = getTimelineGroupId(owner);
             return "-1".equals(groupId) || hasActiveTimelineGapFill();
@@ -4781,6 +4867,7 @@ public class WeiboLiteHook {
     }
 
     private static void recordTimelineGapFillEmptyResponse(String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
         synchronized (sTimelineGapFillState) {
             GapFillState state = sTimelineGapFillState;
             if (!state.active || !state.inFlight) return;
@@ -4804,6 +4891,7 @@ public class WeiboLiteHook {
     }
 
     private static void recordTimelineGapFillErrorResponse(String source, Throwable throwable) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
         synchronized (sTimelineGapFillState) {
             GapFillState state = sTimelineGapFillState;
             if (!state.active || !state.inFlight) return;
@@ -4889,6 +4977,7 @@ public class WeiboLiteHook {
     }
 
     private static List ensureNewestFirst(List list, Object action, String source, boolean loadNew) {
+        if (!(feature(ModuleSettings.KEY_WEICO_FEED_REVERSE))) return list;
         if (list == null || list.size() < 2) return list;
 
         String groupId = getTimelineGroupId(action);
@@ -4928,6 +5017,7 @@ public class WeiboLiteHook {
     }
 
     private static void normalizePresenterTimeline(Object presenter, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE) || feature(ModuleSettings.KEY_WEICO_FEED_REVERSE) || feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return;
         try {
             Object statusList = XposedHelpers.callMethod(presenter, "getStatusList");
             if (statusList instanceof List) {
@@ -4952,6 +5042,7 @@ public class WeiboLiteHook {
     }
 
     private static void normalizeShowDataEvent(Object fragment, Object event) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE) || feature(ModuleSettings.KEY_WEICO_FEED_REVERSE) || feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return;
         try {
             Object presenter = XposedHelpers.callMethod(fragment, "getPresenter");
             Object loadEvent = getFieldValue(event, "loadEvent");
@@ -4992,6 +5083,7 @@ public class WeiboLiteHook {
     }
 
     private static void persistTimelineNativeCache(Object presenter, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) {
@@ -5025,6 +5117,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean persistTimelineNativeCacheList(Object presenter, List list, String source, boolean force) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return false;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (sTimelineCacheClearInFlight) {
@@ -5094,6 +5187,7 @@ public class WeiboLiteHook {
     }
 
     private static void persistTimelineShadowCache(String source, int count, String maxId, boolean force) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         persistTimelineShadowCache(
             source,
@@ -5111,6 +5205,7 @@ public class WeiboLiteHook {
         boolean force,
         TimelineCacheStats candidateStats
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (sTimelineCacheClearInFlight) {
             log("Timeline shadow cache persist skipped during manual clear source=" + source);
             return;
@@ -5215,6 +5310,7 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineNativeCachePersist(TimelineNativePersistRequest request) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (request == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         if (sTimelineCacheClearInFlight) {
             log("Timeline native cache enqueue skipped during manual clear source=" + request.source);
@@ -5239,6 +5335,7 @@ public class WeiboLiteHook {
     }
 
     private static void enqueueTimelineShadowCachePersist(TimelineShadowPersistRequest request) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (request == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         if (sTimelineCacheClearInFlight) {
             log("Timeline shadow cache enqueue skipped during manual clear source=" + request.source);
@@ -5426,6 +5523,7 @@ public class WeiboLiteHook {
     }
 
     private static Object restoreTimelineShadowCache(Object cache, Object builder, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return cache;
         File backup = null;
         try {
             File shadow = getTimelineShadowCacheFile();
@@ -5755,6 +5853,7 @@ public class WeiboLiteHook {
         final String source,
         boolean preferCumulative
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return false;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (sTimelineCacheClearInFlight) {
@@ -6022,7 +6121,7 @@ public class WeiboLiteHook {
         appendTimelinePreparedStatuses(merged, load.statuses, cutoffMs);
 
         ArrayList<TimelinePreparedStatus> records = new ArrayList<>(merged.values());
-        Collections.sort(records, new Comparator<TimelinePreparedStatus>() {
+        if (feature(ModuleSettings.KEY_WEICO_FEED_REVERSE)) Collections.sort(records, new Comparator<TimelinePreparedStatus>() {
             @Override
             public int compare(TimelinePreparedStatus left, TimelinePreparedStatus right) {
                 if (left.id == right.id) return 0;
@@ -6051,8 +6150,8 @@ public class WeiboLiteHook {
             getTimelineVerifiedNaturalGapKeys(request.presenter)
         );
         hydrateTimelineStatusText(statuses, "reweibo-cache-background");
-        long newestId = records.isEmpty() ? 0L : records.get(0).id;
-        String maxId = records.isEmpty() ? "0" : String.valueOf(records.get(records.size() - 1).id);
+        long newestId = getNewestTimelineStatusId(statuses);
+        String maxId = getTimelineCacheMaxId(action, statuses);
         ArrayList adapterModels = buildTimelineStatusModels(
             statuses,
             request.presenter,
@@ -6083,7 +6182,7 @@ public class WeiboLiteHook {
             if (status == null) continue;
             long id = getStatusId(status);
             if (id <= 0L || isLoadMoreStatus(status) || isTimelineAdStatus(status)) continue;
-            if (!hasTimelineRenderableContent(status)) continue;
+            if (isTimelineContentlessStatus(status)) continue;
             Long key = Long.valueOf(id);
             if (target.containsKey(key)) continue;
             long createdMs = getStatusCreatedAtMillis(status);
@@ -6325,6 +6424,7 @@ public class WeiboLiteHook {
     }
 
     private static void scheduleHomeTimelineAdapterSelfHeal(Object fragment, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (fragment == null || sTimelineCacheClearInFlight) return;
@@ -6820,6 +6920,7 @@ public class WeiboLiteHook {
     }
 
     private static void mergeTimelineCumulativeStatusesIncremental(List list, Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (list == null || !"-1".equals(getTimelineGroupId(owner))) return;
         synchronized (sTimelineCumulativeStatusesById) {
             sTimelineDataGeneration.incrementAndGet();
@@ -6886,6 +6987,7 @@ public class WeiboLiteHook {
     }
 
     private static void replaceTimelineCumulativeStatuses(List list, Object owner, String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return;
         if (!"-1".equals(getTimelineGroupId(owner))) return;
         synchronized (sTimelineCumulativeStatusesById) {
             replaceTimelineCumulativeStatusesLocked(list);
@@ -6964,6 +7066,7 @@ public class WeiboLiteHook {
     }
 
     private static List trimTimelineStatusesToCacheDays(List list, Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return list;
         if (list == null || list.isEmpty()) return list;
         if (!"-1".equals(getTimelineGroupId(owner))) return list;
 
@@ -7129,6 +7232,7 @@ public class WeiboLiteHook {
     }
 
     private static List filterTimelineAds(List list, Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL))) return list;
         if (list == null || list.isEmpty()) return list;
 
         String groupId = getTimelineGroupId(owner);
@@ -7210,6 +7314,7 @@ public class WeiboLiteHook {
     }
 
     private static List filterTimelineContentless(List list, Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER))) return list;
         if (list == null || list.isEmpty()) return list;
 
         String groupId = getTimelineGroupId(owner);
@@ -7244,6 +7349,7 @@ public class WeiboLiteHook {
     }
 
     private static int hydrateTimelineStatusText(List list, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return 0;
         if (list == null || list.isEmpty()) return 0;
         int changed = 0;
         for (int i = 0; i < list.size(); i++) {
@@ -7256,6 +7362,7 @@ public class WeiboLiteHook {
     }
 
     private static int hydrateStatusText(Object status, int depth) {
+        if (!(feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return 0;
         if (status == null || depth > 2) return 0;
         int changed = 0;
         try {
@@ -7281,6 +7388,7 @@ public class WeiboLiteHook {
     }
 
     private static int hydrateTimelineStatusMedia(List list, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return 0;
         if (list == null || list.isEmpty()) return 0;
         int changed = 0;
         for (int i = 0; i < list.size(); i++) {
@@ -7293,6 +7401,7 @@ public class WeiboLiteHook {
     }
 
     private static int hydrateStatusMedia(Object status, int depth) {
+        if (!feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION)) return 0;
         if (status == null || depth > 2) return 0;
         if (!hasTimelinePicSource(status, depth)) return 0;
 
@@ -7348,6 +7457,7 @@ public class WeiboLiteHook {
     }
 
     private static void resetTimelineStatusViewType(Object status, int depth) {
+        if (!(feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return;
         if (status == null || depth > 2) return;
         try {
             setFieldValue(status, "viewType", Integer.valueOf(0));
@@ -7635,6 +7745,7 @@ public class WeiboLiteHook {
     }
 
     private static void captureTimelineRefreshAnchorIfNeeded(Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
         if (getActiveTimelineRefreshAnchorStatusId() > 0L) return;
         if (owner == null || !"-1".equals(getTimelineGroupId(owner))) return;
         if (!sTimelineRestoredCacheMode && !isTimelinePreloadDone()) return;
@@ -7644,6 +7755,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean captureTimelineRefreshAnchorForKnownRecyclerViews(Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return false;
         if (getActiveTimelineRefreshAnchorStatusId() > 0L) return true;
         if (owner == null || !"-1".equals(getTimelineGroupId(owner))) return false;
         if (captureTimelineRefreshAnchorFromPendingHomeTab(source)) return true;
@@ -7665,6 +7777,7 @@ public class WeiboLiteHook {
     }
 
     private static void captureHomeTabPendingRefreshAnchor(long now) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
         try {
             if (sHomeTabPendingAnchorStatusId > 0L
                 && now <= sHomeTabPendingAnchorUntilMs
@@ -7689,6 +7802,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean captureTimelineRefreshAnchorFromPendingHomeTab(String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return false;
         long now = SystemClock.elapsedRealtime();
         long statusId = sHomeTabPendingAnchorStatusId;
         if (statusId <= 0L || now > sHomeTabPendingAnchorUntilMs) return false;
@@ -7710,6 +7824,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean setTimelineRefreshAnchor(long statusId, String source, int position, int first, int last) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return false;
         if (statusId <= 0L) return false;
         if (getActiveTimelineRefreshAnchorStatusId() > 0L) return true;
         sTimelineRefreshAnchorStatusId = statusId;
@@ -7725,6 +7840,7 @@ public class WeiboLiteHook {
     }
 
     private static void maybeAdvanceRefreshAnchorToIncoming(List incomingData, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
         try {
             long activeId = getActiveTimelineRefreshAnchorStatusId();
             if (activeId <= 0L || incomingData == null || sTimelineRefreshAnchorPosition > 3) return;
@@ -7841,6 +7957,7 @@ public class WeiboLiteHook {
     private static void scheduleTimelineCompletion(
         final Object presenter, final String source, final int pages, final int count
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting() || sTimelineCacheClearInFlight) return;
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
@@ -7882,7 +7999,7 @@ public class WeiboLiteHook {
                             if (canTrim && created > 0L && created < cutoff) expired.add(getStatusId(status));
                             else retained.add(status);
                         }
-                        Collections.sort(retained, new Comparator() {
+                        if (feature(ModuleSettings.KEY_WEICO_FEED_REVERSE)) Collections.sort(retained, new Comparator() {
                             @Override public int compare(Object left, Object right) {
                                 return Long.compare(getStatusId(right), getStatusId(left));
                             }
@@ -8037,6 +8154,7 @@ public class WeiboLiteHook {
     }
 
     private static void continueTimelineGapFill(Object presenter, List mergedData, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
         if (!hasActiveTimelineGapFill()) return;
         try {
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
@@ -8106,6 +8224,7 @@ public class WeiboLiteHook {
         boolean allowStart,
         boolean responseArrived
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return null;
         try {
             if (presenter == null || sorted == null || !"-1".equals(getTimelineGroupId(presenter))) return null;
             return updateTimelineGapFill(
@@ -8128,6 +8247,7 @@ public class WeiboLiteHook {
         boolean responseArrived,
         TimelineGapScan scan
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return null;
         try {
             if (presenter == null || scan == null || !"-1".equals(getTimelineGroupId(presenter))) return null;
             TimelineGap gap = scan.gap;
@@ -8246,8 +8366,9 @@ public class WeiboLiteHook {
     }
 
     private static TimelineGapScan scanTimelineGap(List list, Map<String, Boolean> verifiedGaps) {
-        ArrayList statuses = collectTimelineStatuses(list);
         TimelineGapScan scan = new TimelineGapScan();
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL)) return scan;
+        ArrayList statuses = collectTimelineStatuses(list);
         scan.count = statuses.size();
         if (statuses.size() < 2) return scan;
 
@@ -8255,6 +8376,12 @@ public class WeiboLiteHook {
         for (int i = 0; i < statuses.size(); i++) {
             Object status = unwrapStatus(statuses.get(i));
             orderedIds[i] = getStatusId(status);
+        }
+        if (!feature(ModuleSettings.KEY_WEICO_FEED_REVERSE)) {
+            java.util.Arrays.sort(orderedIds);
+            for (int i = 0, j = orderedIds.length - 1; i < j; i++, j--) {
+                long id = orderedIds[i]; orderedIds[i] = orderedIds[j]; orderedIds[j] = id;
+            }
         }
         long[] candidate = findTimelineGapCandidate(orderedIds, verifiedGaps);
         if (candidate != null) {
@@ -8315,6 +8442,7 @@ public class WeiboLiteHook {
         List incomingData,
         String source
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
         if (presenter == null || incomingData == null) return;
         long gapCursorId;
         long targetId;
@@ -8463,6 +8591,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean hasActiveTimelineGapFill() {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return false;
         synchronized (sTimelineGapFillState) {
             GapFillState state = sTimelineGapFillState;
             if (!state.active) return false;
@@ -8476,6 +8605,7 @@ public class WeiboLiteHook {
     }
 
     private static void scheduleTimelineGapFill(final Object presenter, final String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) return;
@@ -8529,6 +8659,7 @@ public class WeiboLiteHook {
     }
 
     private static void requestTimelineGapFill(final Object presenter, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
         final int token;
         long cursorId;
         long targetId;
@@ -8906,7 +9037,7 @@ public class WeiboLiteHook {
 
     private static void refreshTimelineShortcutButtons(String source) {
         if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
-        boolean showJumpButton = isModuleOptionEnabled(
+        boolean showJumpButton = feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP) && isModuleOptionEnabled(
             ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
             ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
         );
@@ -8941,7 +9072,7 @@ public class WeiboLiteHook {
             FrameLayout parent = findTimelineOverlayParent(anchor);
             if (parent == null) return false;
             Activity activity = findHostActivity(anchor.getContext());
-            boolean showJumpButton = isModuleOptionEnabled(
+            boolean showJumpButton = feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP) && isModuleOptionEnabled(
                 ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
                 ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
             );
@@ -9174,6 +9305,7 @@ public class WeiboLiteHook {
     }
 
     private static void showTimelineTimeJumpDialog(final Object recyclerView) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return;
         try {
             if (!isTimelineRecyclerView(recyclerView) || !(recyclerView instanceof View)) return;
             View anchor = (View) recyclerView;
@@ -9487,6 +9619,7 @@ public class WeiboLiteHook {
         final String source,
         final int attempt
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return false;
         try {
             if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return false;
             final TimelineTimeJumpTarget target = findTimelineTimeJumpTarget(
@@ -10067,6 +10200,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean scheduleTimelineRefreshAnchorForKnownRecyclerViews(String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return false;
         long statusId = getActiveTimelineRefreshAnchorStatusId();
         if (statusId <= 0L) return false;
 
@@ -10094,6 +10228,7 @@ public class WeiboLiteHook {
         final int attempt,
         long delayMs
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
         HotReloadRuntime.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -10109,6 +10244,7 @@ public class WeiboLiteHook {
         final String source,
         final int attempt
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
         try {
             if (statusId <= 0L || statusId != getActiveTimelineRefreshAnchorStatusId()) return;
             if (generation != sTimelineRefreshAnchorGeneration) return;
@@ -10202,6 +10338,7 @@ public class WeiboLiteHook {
     }
 
     private static long getActiveTimelineRefreshAnchorStatusId() {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return 0L;
         if (sTimelineRefreshAnchorStatusId <= 0L) return 0L;
         if (SystemClock.elapsedRealtime() <= sTimelineRefreshAnchorUntilMs) {
             return sTimelineRefreshAnchorStatusId;
@@ -10290,6 +10427,7 @@ public class WeiboLiteHook {
         final int attempt,
         final boolean top
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return false;
         int generation = ++sTimelineEdgeJumpGeneration;
         HotReloadRuntime.removeCallbacks(sTimelineEdgeJumpRetry);
         sTimelineEdgeJumpRetry = null;
@@ -10300,6 +10438,7 @@ public class WeiboLiteHook {
         final Object recyclerView, final String source, final int attempt, final boolean top,
         final int generation, final int previousTarget, final long previousId
     ) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return false;
         try {
             if (generation != sTimelineEdgeJumpGeneration) return false;
             if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return false;
@@ -10373,6 +10512,11 @@ public class WeiboLiteHook {
 
             int dataCount = callIntMethodSafe(adapter, "getCount", -1);
             int headerCount = callIntMethodSafe(adapter, "getHeaderCount", 0);
+            if (!feature(ModuleSettings.KEY_WEICO_FEED_REVERSE) && dataCount > 0) {
+                Object manager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
+                boolean reversed = callBooleanMethodSafe(manager, "getReverseLayout");
+                return Math.max(0, headerCount) + (reversed ? dataCount - 1 : 0);
+            }
             if (dataCount >= TIMELINE_CACHE_MIN_ITEMS) {
                 long canonicalOldestId = getTimelineCumulativeEdgeStatusId(true);
                 int canonicalPosition = getTimelineStatusAdapterPosition(
@@ -10412,6 +10556,11 @@ public class WeiboLiteHook {
 
             int dataCount = callIntMethodSafe(adapter, "getCount", -1);
             int headerCount = callIntMethodSafe(adapter, "getHeaderCount", 0);
+            if (!feature(ModuleSettings.KEY_WEICO_FEED_REVERSE) && dataCount > 0) {
+                Object manager = XposedHelpers.callMethod(recyclerView, "getLayoutManager");
+                boolean reversed = callBooleanMethodSafe(manager, "getReverseLayout");
+                return Math.max(0, headerCount) + (!reversed ? dataCount - 1 : 0);
+            }
             if (dataCount >= TIMELINE_CACHE_MIN_ITEMS) {
                 if (sTimelineOldestFirstMode) return Math.max(0, headerCount) + dataCount - 1;
                 return Math.max(0, headerCount);
@@ -10421,6 +10570,7 @@ public class WeiboLiteHook {
     }
 
     private static void beginTimelineTopAnchor(Object recyclerView, String source, boolean resetUserTouch) {
+        if (!anyFeature(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         if (!isTimelineRecyclerView(recyclerView)) return;
         synchronized (sTopAnchorStates) {
             TopAnchorState state = getTopAnchorStateLocked(recyclerView);
@@ -10460,6 +10610,7 @@ public class WeiboLiteHook {
     }
 
     private static void finishTimelineTopAnchor(Object recyclerView, String source) {
+        if (!anyFeature(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         if (!isTimelineRecyclerView(recyclerView)) return;
         synchronized (sTopAnchorStates) {
             TopAnchorState state = getTopAnchorStateLocked(recyclerView);
@@ -10476,6 +10627,7 @@ public class WeiboLiteHook {
     }
 
     private static void scheduleTimelineTopAnchor(final Object recyclerView, final String source, long delayMs) {
+        if (!anyFeature(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         final int generation;
         synchronized (sTopAnchorStates) {
             TopAnchorState state = sTopAnchorStates.get(recyclerView);
@@ -10494,6 +10646,7 @@ public class WeiboLiteHook {
     }
 
     private static void anchorTimelineTop(Object recyclerView, String source, int generation) {
+        if (!anyFeature(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         try {
             synchronized (sTopAnchorStates) {
                 TopAnchorState state = sTopAnchorStates.get(recyclerView);
@@ -10586,6 +10739,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean shouldAnchorTimelineTop(Object recyclerView) {
+        if (!anyFeature(ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return false;
         if (!isTimelineRecyclerView(recyclerView)) return false;
         synchronized (sTopAnchorStates) {
             TopAnchorState state = sTopAnchorStates.get(recyclerView);
@@ -10608,10 +10762,12 @@ public class WeiboLiteHook {
                 int headerCount = callIntMethodSafe(adapter, "getHeaderCount", 0);
                 int lastReadPosition = getTimelineLastReadAdapterPosition(adapter, headerCount);
                 if (lastReadPosition >= 0) return lastReadPosition;
+                if (!feature(ModuleSettings.KEY_WEICO_FEED_REVERSE)) return -1;
                 if (sTimelineOldestFirstMode) return Math.max(0, headerCount);
                 return headerCount + dataCount - 1;
             }
 
+            if (!feature(ModuleSettings.KEY_WEICO_FEED_REVERSE)) return -1;
             int itemCount = callIntMethodSafe(adapter, "getItemCount", -1);
             if (sTimelineOldestFirstMode) return 0;
             return itemCount >= 10 ? itemCount - 1 : -1;
@@ -10621,6 +10777,7 @@ public class WeiboLiteHook {
     }
 
     private static int getTimelineLastReadAdapterPosition(Object adapter, int headerCount) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return -1;
         try {
             if (!shouldUseTimelineLastRead(sTimelineRestoredCacheMode, isTimelinePreloadDone())) return -1;
             if (adapter == null) return -1;
@@ -10722,6 +10879,7 @@ public class WeiboLiteHook {
     }
 
     private static void schedulePersistTimelineLastRead(final Object recyclerView, final String source, long delayMs) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
         HotReloadRuntime.postDelayed(new Runnable() {
             @Override
@@ -10732,6 +10890,7 @@ public class WeiboLiteHook {
     }
 
     private static void persistTimelineLastRead(Object recyclerView, String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         try {
             if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
             if (!shouldUseTimelineLastRead(sTimelineRestoredCacheMode, isTimelinePreloadDone())) return;
@@ -10796,6 +10955,7 @@ public class WeiboLiteHook {
     }
 
     private static long getLastReadStatusId() {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return 0L;
         if (sLastReadStatusId != null) return sLastReadStatusId.longValue();
         File file = getLastReadFile();
         if (file == null || !file.exists()) {
@@ -10837,6 +10997,7 @@ public class WeiboLiteHook {
     }
 
     private static List<Long> getTimelineLastReadStatusCandidates() {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return Collections.emptyList();
         ArrayList<Long> candidates = new ArrayList<>();
         long current = getLastReadStatusId();
         if (current > 0L) candidates.add(Long.valueOf(current));
@@ -10866,6 +11027,7 @@ public class WeiboLiteHook {
     }
 
     private static void appendTimelineLastReadHistory(long statusId) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         if (statusId <= 0L) return;
         File history = getLastReadHistoryFile();
         ArrayList<String> lines = new ArrayList<>();
@@ -10922,6 +11084,7 @@ public class WeiboLiteHook {
     }
 
     private static void showTimelineLastReadMarker(Object recyclerView) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         if (sLastReadMarkerShown) return;
         try {
             if (!(recyclerView instanceof View)) return;
@@ -11117,6 +11280,7 @@ public class WeiboLiteHook {
     }
 
     private static void markTimelineNoMoreContent(String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return;
         try {
             Object presenter = sLastTimelinePresenter;
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
@@ -11160,6 +11324,7 @@ public class WeiboLiteHook {
     }
 
     private static void deferTimelineNoMoreContent(final String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return;
         final int generation;
         synchronized (WeiboLiteHook.class) {
             sPendingTimelineNoMoreSource = source;
@@ -11181,6 +11346,7 @@ public class WeiboLiteHook {
     }
 
     private static void consumePendingTimelineNoMoreContent(String appliedBy) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return;
         String source;
         synchronized (WeiboLiteHook.class) {
             source = sPendingTimelineNoMoreSource;
@@ -11192,6 +11358,7 @@ public class WeiboLiteHook {
     }
 
     private static void markTimelineNoMoreIfEmptyPage(Object presenter, List incomingData, String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return;
         try {
             if (presenter == null || incomingData == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             int incoming = countTimelineStatuses(incomingData);
@@ -11222,6 +11389,7 @@ public class WeiboLiteHook {
     }
 
     private static void scheduleTimelinePreload(final Object presenter, final String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD))) return;
         if (presenter == null) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
@@ -11283,6 +11451,7 @@ public class WeiboLiteHook {
     }
 
     private static void requestTimelinePreload(final Object presenter, String source) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) return;
         final int token;
         int count;
         int page;
@@ -11335,6 +11504,7 @@ public class WeiboLiteHook {
     }
 
     private static void finishTimelinePreloadWatchdog(Object presenter, int token) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) return;
         try {
             if (!"-1".equals(getTimelineGroupId(presenter))) return;
             rememberTimelinePresenter(presenter);
@@ -11416,6 +11586,7 @@ public class WeiboLiteHook {
     }
 
     private static void scheduleTimelinePreloadRetry(final Object presenter, long delayMs) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) return;
         if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         final int retryToken;
         synchronized (sPreloadStates) {
@@ -11451,6 +11622,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean shouldFreezeTimelineNetworkMutation(Object presenter) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) return false;
         try {
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
             if (hasActiveTimelineGapFill()) return false;
@@ -11461,6 +11633,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean shouldSuppressTimelineLoadMore(Object presenter) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) return false;
         try {
             if (hasActiveTimelineGapFill()) return false;
             return presenter != null && "-1".equals(getTimelineGroupId(presenter))
@@ -11505,6 +11678,7 @@ public class WeiboLiteHook {
     }
 
     private static boolean isTimelinePreloadDone() {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return false;
         int cacheDays = getTimelineCacheDaysSetting();
         if (!sTimelineCacheDaysSettingConfirmed) {
             return false;
@@ -11727,6 +11901,7 @@ public class WeiboLiteHook {
     }
 
     private static List sortTimelineNewestFirst(List list, Object owner, String source, boolean loadNew) {
+        if (!(feature(ModuleSettings.KEY_WEICO_FEED_REVERSE))) return list;
         if (list == null || list.size() < 2) return list;
 
         String groupId = getTimelineGroupId(owner);
@@ -11795,6 +11970,7 @@ public class WeiboLiteHook {
     }
 
     private static List sortTimelineOldestFirst(List list, Object owner, String source) {
+        if (!(feature(ModuleSettings.KEY_WEICO_FEED_REVERSE))) return list;
         if (list == null || list.size() < 2) return list;
 
         String groupId = getTimelineGroupId(owner);
@@ -11846,6 +12022,11 @@ public class WeiboLiteHook {
     }
 
     private static boolean isTimelineAdStatus(Object status) {
+        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL))) return false;
+        return isTimelineAdStatusRaw(status);
+    }
+
+    private static boolean isTimelineAdStatusRaw(Object status) {
         if (status == null || isLoadMoreStatus(status)) return false;
         try {
             if (getBooleanFieldSafe(status, "isUVEAd", false)) return true;
@@ -11876,7 +12057,8 @@ public class WeiboLiteHook {
     }
 
     private static boolean isTimelineContentlessStatus(Object status) {
-        if (status == null || isLoadMoreStatus(status) || isTimelineAdStatus(status)) return false;
+        if (!(feature(ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER))) return false;
+        if (status == null || isLoadMoreStatus(status) || isTimelineAdStatusRaw(status)) return false;
         if (getStatusId(status) <= 0) return false;
         return !hasTimelineRenderableContent(status);
     }
@@ -12299,9 +12481,9 @@ public class WeiboLiteHook {
                 "com.weico.international.activity.v4.SettingNative",
                 cl
             );
-            XC_MethodHook forceLoad = new XC_MethodHook() {
+            XC_MethodHook forceLoad = new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     if (REVERSE_ORDER_KEY.equals(param.args[0])) {
                         param.setResult(true);
                     }
@@ -12311,9 +12493,9 @@ public class WeiboLiteHook {
             XposedHelpers.findAndHookMethod(settingNativeClass, "loadBoolean", String.class, boolean.class, forceLoad);
             XposedHelpers.findAndHookMethod(settingNativeClass, "loadBoolean", String.class, boolean.class, boolean.class, forceLoad);
 
-            XC_MethodHook forceSave = new XC_MethodHook() {
+            XC_MethodHook forceSave = new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     if (REVERSE_ORDER_KEY.equals(param.args[0])) {
                         param.args[1] = true;
                     }
@@ -12323,9 +12505,9 @@ public class WeiboLiteHook {
             XposedHelpers.findAndHookMethod(settingNativeClass, "saveBoolean", String.class, boolean.class, boolean.class, forceSave);
 
             Class<?> appClass = XposedHelpers.findClass("com.weico.international.WApplication", cl);
-            XC_MethodHook setReverseOrder = new XC_MethodHook() {
+            XC_MethodHook setReverseOrder = new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE) {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterEnabled(MethodHookParam param) {
                     setNativeReverseOrder(cl);
                 }
             };
@@ -12336,9 +12518,9 @@ public class WeiboLiteHook {
                 "com.weico.international.ui.indexv2.IndexV2Presenter",
                 cl,
                 "isReverseOrder",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_FEED_REVERSE) {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterEnabled(MethodHookParam param) {
                         try {
                             Object groupId = XposedHelpers.callMethod(param.thisObject, "getGroupId");
                             if ("-1".equals(groupId)) {
@@ -12355,6 +12537,7 @@ public class WeiboLiteHook {
     }
 
     private static void setNativeReverseOrder(ClassLoader cl) {
+        if (!(feature(ModuleSettings.KEY_WEICO_FEED_REVERSE))) return;
         try {
             Class<?> appClass = XposedHelpers.findClass("com.weico.international.WApplication", cl);
             java.lang.reflect.Field field = appClass.getDeclaredField("mReverseOrder");
@@ -12369,21 +12552,21 @@ public class WeiboLiteHook {
     private static void removeSplashAd(ClassLoader cl) {
         try {
             XposedHelpers.findAndHookMethod("com.weico.international.activity.LogoActivity", cl, "doWhatNext",
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         param.setResult("main");
                     }
                 });
             XposedHelpers.findAndHookMethod("com.weico.international.activity.LogoActivity", cl, "triggerPermission", boolean.class,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) { param.args[0] = true; }
+                    protected void beforeEnabled(MethodHookParam param) { param.args[0] = true; }
                 });
             XposedHelpers.findAndHookMethod("com.weico.international.manager.ProcessMonitor", cl, "attach", Application.class,
-                new XC_MethodReplacement() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
                     @Override
-                    protected Object replaceHookedMethod(MethodHookParam param) { return null; }
+                    protected void beforeEnabled(MethodHookParam param) { param.setResult(null); }
                 });
         } catch (Throwable ignored) {}
     }
@@ -12409,9 +12592,9 @@ public class WeiboLiteHook {
                 cl,
                 "isWeiboUVEAd",
                 statusClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         param.setResult(false);
                     }
                 }
@@ -12428,18 +12611,18 @@ public class WeiboLiteHook {
                 cl,
                 "findUVEAd",
                 pageInfoClass,
-                new XC_MethodHook() {
+                new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         param.setResult(null);
                     }
                 }
             );
         })) hookCount++;
 
-        XC_MethodHook adBoolHook = new XC_MethodHook() {
+        XC_MethodHook adBoolHook = new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
+            protected void beforeEnabled(MethodHookParam param) {
                 String key = (String) param.args[0];
                 if ("BOOL_UVE_FEED_AD".equals(key)) param.setResult(false);
                 else if (key != null && key.startsWith("BOOL_AD_ACTIVITY_BLOCK_")) {
@@ -12458,9 +12641,9 @@ public class WeiboLiteHook {
             )
         )) hookCount++;
 
-        XC_MethodHook adIntHook = new XC_MethodHook() {
+        XC_MethodHook adIntHook = new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
+            protected void beforeEnabled(MethodHookParam param) {
                 String key = (String) param.args[0];
                 if ("ad_interval".equals(key)) param.setResult(Integer.MAX_VALUE);
                 else if ("display_ad".equals(key)) param.setResult(0);
@@ -12486,9 +12669,9 @@ public class WeiboLiteHook {
             )
         )) hookCount++;
 
-        XC_MethodHook adStringHook = new XC_MethodHook() {
+        XC_MethodHook adStringHook = new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
+            protected void beforeEnabled(MethodHookParam param) {
                 if ("video_ad".equals(param.args[0])) param.setResult("");
             }
         };
@@ -12529,9 +12712,9 @@ public class WeiboLiteHook {
         if (queryMethod == null) return 0;
         try {
             final Method justMethod = observableClass.getMethod("just", Object.class);
-            XposedBridge.hookMethod(queryMethod, new XC_MethodHook() {
+            XposedBridge.hookMethod(queryMethod, new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeEnabled(MethodHookParam param) {
                     try {
                         param.setResult(justMethod.invoke(null, Collections.emptyList()));
                     } catch (Throwable error) {
@@ -12595,9 +12778,9 @@ public class WeiboLiteHook {
                 && "kotlin.jvm.functions.Function1".equals(method.getParameterTypes()[0].getName());
             if (!mapCandidate && !listCandidate) continue;
             try {
-                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                XposedBridge.hookMethod(method, new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL) {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeEnabled(MethodHookParam param) {
                         if (listCandidate || List.class.isAssignableFrom(method.getReturnType())) {
                             param.setResult(Collections.emptyList());
                         } else {

@@ -24,6 +24,9 @@
 
 ## 功能
 
+- 提供 16 个独立功能与入口开关，并支持“一键仅去广告”：只保留启动页和信息流去广告，关闭其余模块行为与入口。功能开关在重启微博轻享版后生效；新安装及未配置的开关默认保持原有行为。
+- 可从桌面 ReWeibo 图标或微博内 ReWeibo 设置调整。关闭扩展缓存会暂时停用依赖它的预加载、断层补齐和阅读位置恢复，但不删除缓存文件或这些开关的选择；手动跳转可独立使用。完整清单见 [功能开关](docs/features.md)。
+
 - 服务器空页确认后的补齐收尾在后台准备，终态清理进度提示；双击回顶部复用反射查找与有效校正位置，减少大缓存下的主线程阻塞。
 
 
@@ -42,6 +45,9 @@
 - 在 ReWeibo 设置中提供终端样式日志页：日志文本可长按自由选择，也可复制当前预览；支持按起止日期时间筛选，并将完整筛选结果流式导出为 TXT，避免把大型日志一次性载入界面。
 
 ## Features
+
+- Provides 16 independent feature and entry-point switches plus an “Ads only” preset that retains splash and feed ad removal while disabling other module behavior and entry points. Feature switches apply after restarting Weibo Lite; unset switches preserve existing behavior.
+- Configure features from the ReWeibo launcher icon or its in-app settings. Disabling extended caching suspends dependent preloading, gap filling, and reading-position restoration without deleting cached files or saved preferences. Manual navigation works independently. See the [feature switch guide](docs/features.md).
 
 - Prepares gap-fill completion after confirmed empty server responses in the background and clears terminal progress cards. Double-tap-to-top reuses reflective lookup and valid correction positions to reduce main-thread stalls with large caches.
 

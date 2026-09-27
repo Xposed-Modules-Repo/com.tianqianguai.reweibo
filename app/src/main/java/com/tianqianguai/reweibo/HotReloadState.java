@@ -39,7 +39,7 @@ public final class HotReloadState {
     public static boolean isValid(Object state, ClassLoader moduleClassLoader) {
         if (!(state instanceof Object[])) return false;
         Object[] values = (Object[]) state;
-        if (values.length != SIZE || !MAGIC.equals(values[0])) return false;
+        if ((values.length != SIZE && values.length != SIZE + 1) || !MAGIC.equals(values[0])) return false;
         return isClassLoaderNeutral(state, moduleClassLoader);
     }
 
@@ -67,6 +67,17 @@ public final class HotReloadState {
 
     public static Object applicationContext(Object state) {
         return value(state, CONTEXT);
+    }
+
+    public static Object withFeatures(Object state, boolean[] features) {
+        Object[] copy = java.util.Arrays.copyOf((Object[]) state, SIZE + 1);
+        copy[SIZE] = features.clone();
+        return copy;
+    }
+
+    public static boolean[] features(Object state) {
+        Object stored = value(state, SIZE);
+        return stored instanceof boolean[] ? ((boolean[]) stored).clone() : null;
     }
 
     public static Object presenter(Object state) {
