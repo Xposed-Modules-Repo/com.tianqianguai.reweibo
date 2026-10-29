@@ -57,6 +57,7 @@ public class SettingsProvider extends ContentProvider {
             String[] selectionArgs,
             String sortOrder
     ) {
+        IpcAccess.enforce(getContext());
         if (isAllSettingsUri(uri)) {
             MatrixCursor cursor = new MatrixCursor(ALL_COLUMNS);
             for (String key : ModuleSettings.allKeys()) {
@@ -78,25 +79,27 @@ public class SettingsProvider extends ContentProvider {
 
     @Override
     public String getType(Uri uri) {
+        IpcAccess.enforce(getContext());
         return null;
     }
 
     @Override
     public Uri insert(Uri uri, ContentValues values) {
+        IpcAccess.enforce(getContext());
         return null;
     }
 
     @Override
     public int delete(Uri uri, String selection, String[] selectionArgs) {
+        IpcAccess.enforce(getContext());
         String key = requireExactSettingKey(uri);
-        boolean committed = getPrefs().edit().remove(key).commit();
-        if (!committed) throw new IllegalStateException("failed to reset setting: " + key);
-        notifySettingChanged(key);
+        resetSetting(key);
         return 1;
     }
 
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
+        IpcAccess.enforce(getContext());
         String key = requireExactSettingKey(uri);
         if (values == null) throw new IllegalArgumentException("missing values for setting: " + key);
         Object rawValue = values.containsKey(COLUMN_VALUE)
@@ -108,6 +111,7 @@ public class SettingsProvider extends ContentProvider {
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
+        IpcAccess.enforce(getContext());
         try {
             if ("help".equals(method)) {
                 return success("help", "CLI contract", buildHelp());
@@ -131,9 +135,7 @@ public class SettingsProvider extends ContentProvider {
             }
             if ("settings.reset".equals(method)) {
                 String key = requireKnownKey(arg);
-                boolean committed = getPrefs().edit().remove(key).commit();
-                if (!committed) throw new IllegalStateException("failed to reset setting: " + key);
-                notifySettingChanged(key);
+                resetSetting(key);
                 return success(
                     "settings.reset",
                     "setting reset; use weico.settings.reload to refresh a running target",
@@ -154,6 +156,20 @@ public class SettingsProvider extends ContentProvider {
                     + (message == null || message.isEmpty() ? "" : ": " + message)
             );
         }
+    }
+
+    private void resetSetting(String key) {
+        // An explicit default must remain distinguishable from a never-migrated preference.
+        resetPreference(getPrefs(), key);
+        notifySettingChanged(key);
+    }
+
+    static void resetPreference(SharedPreferences prefs, String key) {
+        if (!ModuleSettings.isKnownKey(key)) throw new IllegalArgumentException("unknown setting");
+        SharedPreferences.Editor editor = prefs.edit();
+        if (ModuleSettings.isIntegerKey(key)) editor.putInt(key, ModuleSettings.defaultIntFor(key));
+        else editor.putBoolean(key, ModuleSettings.defaultFor(key));
+        if (!editor.commit()) throw new IllegalStateException("failed to reset setting: " + key);
     }
 
     private Bundle executeCommand(String fullName, Bundle extras) throws InterruptedException {
@@ -184,6 +200,8 @@ public class SettingsProvider extends ContentProvider {
             }
         };
 
+        long callingIdentity = android.os.Binder.clearCallingIdentity();
+        try {
         context.sendOrderedBroadcast(
             intent,
             null,
@@ -193,6 +211,9 @@ public class SettingsProvider extends ContentProvider {
             NO_RECEIVER_RESULT,
             null
         );
+        } finally {
+            android.os.Binder.restoreCallingIdentity(callingIdentity);
+        }
         if (!completed.await(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
             return failure("timeout", "target did not answer within " + COMMAND_TIMEOUT_SECONDS + " seconds");
         }
@@ -265,6 +286,7 @@ public class SettingsProvider extends ContentProvider {
         output.append("\nweico.timeline.jump: value=<date/time>; raw ADB may use yyyy-MM-dd_HH-mm-ss");
         output.append("\nweico.cache.clear: day=<date> OR start=<date/time>,end=<date/time>; raw ADB uses yyyy-MM-dd_HH-mm (minute boundaries)");
         output.append("\nweico.logs.read: optional start,end,max_chars=1..49152; weico.logs.export: optional start,end");
+        output.append("\nweico.diagnostics.status/start/stop: logging health; enable detailed recording for 10 minutes; stop detailed recording");
         output.append("\nasync cache/log operations: poll weico.status last_operation_state; native timeline actions: inspect timeline/preload/gap status and logs");
         return output.toString();
     }

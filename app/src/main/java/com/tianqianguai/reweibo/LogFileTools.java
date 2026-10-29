@@ -10,12 +10,20 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Collections;
+import java.io.SequenceInputStream;
+import java.io.Closeable;
 
 /** Streaming log inspection, filtering, preview, and export shared by UI and ADB CLI. */
 public final class LogFileTools {
@@ -64,13 +72,31 @@ public final class LogFileTools {
     }
 
     /** Immutable byte boundary captured between complete synchronized log appends. */
-    public static final class Snapshot {
+    public static final class Snapshot implements Closeable {
         public final File file;
         public final long length;
+        private final List<InputStream> streams;
+        private boolean consumed;
 
-        private Snapshot(File file, long length) {
+        private Snapshot(File file, long length, List<InputStream> streams) {
             this.file = file;
             this.length = length;
+            this.streams = streams;
+        }
+
+        private synchronized InputStream consume() throws IOException {
+            if (consumed) throw new IOException("log snapshot already consumed");
+            consumed = true;
+            return new SequenceInputStream(Collections.enumeration(streams));
+        }
+
+        @Override public synchronized void close() throws IOException {
+            IOException failure = null;
+            for (InputStream stream : streams) {
+                try { stream.close(); } catch (IOException error) { failure = error; }
+            }
+            consumed = true;
+            if (failure != null) throw failure;
         }
     }
 
@@ -147,7 +173,7 @@ public final class LogFileTools {
     }
 
     public static Result inspect(Snapshot snapshot) throws IOException {
-        return scan(snapshot, parseRange(null, null), 0, null);
+        try (Snapshot owned = snapshot) { return scan(requireSnapshot(owned), parseRange(null, null), 0, null); }
     }
 
     public static Result readPreview(File file, Range range, int maxChars) throws IOException {
@@ -156,8 +182,10 @@ public final class LogFileTools {
 
     public static Result readPreview(Snapshot snapshot, Range range, int maxChars)
             throws IOException {
-        if (maxChars <= 0) throw new IllegalArgumentException("maxChars must be positive");
-        return scan(requireSnapshot(snapshot), requireRange(range), maxChars, null);
+        try (Snapshot owned = snapshot) {
+            if (maxChars <= 0) throw new IllegalArgumentException("maxChars must be positive");
+            return scan(requireSnapshot(owned), requireRange(range), maxChars, null);
+        }
     }
 
     public static Result writeFiltered(File file, Range range, OutputStream output)
@@ -170,19 +198,49 @@ public final class LogFileTools {
             Range range,
             OutputStream output
     ) throws IOException {
-        if (output == null) throw new NullPointerException("output");
-        return scan(requireSnapshot(snapshot), requireRange(range), 0, output);
+        try (Snapshot owned = snapshot) {
+            if (output == null) throw new NullPointerException("output");
+            return scan(requireSnapshot(owned), requireRange(range), 0, output);
+        }
     }
 
     public static Snapshot snapshot(File file) throws IOException {
-        File source = requireReadableFile(file);
-        return new Snapshot(source, source.length());
+        if (file == null) throw new IOException("log file is unavailable");
+        ArrayList<File> files = new ArrayList<>();
+        File parent = file.getParentFile();
+        File[] legacy = parent == null ? null : parent.listFiles((dir, name) -> name.startsWith(file.getName() + ".legacy-"));
+        if (legacy != null) {
+            Arrays.sort(legacy, Comparator.comparing(File::getName));
+            files.addAll(Arrays.asList(legacy));
+        }
+        for (int i = AsyncDiagnosticWriter.ARCHIVES; i >= 1; i--) {
+            File segment = new File(file.getPath() + "." + i);
+            if (segment.isFile()) files.add(segment);
+        }
+        if (file.isFile()) files.add(file);
+        if (files.isEmpty()) throw new IOException("log file does not exist: " + file.getAbsolutePath());
+        ArrayList<InputStream> streams = new ArrayList<>();
+        long length = 0;
+        try {
+            for (File segment : files) {
+                File source = requireReadableFile(segment);
+                InputStream input = Files.newInputStream(source.toPath());
+                long size;
+                try { size = Files.size(source.toPath()); }
+                catch (IOException error) { input.close(); throw error; }
+                streams.add(new BoundedInputStream(input, size));
+                length += size;
+            }
+            return new Snapshot(file, length, streams);
+        } catch (IOException error) {
+            for (InputStream stream : streams) try { stream.close(); } catch (IOException ignored) {}
+            throw error;
+        }
     }
 
     private static Result scan(Snapshot snapshot, Range range, int maxChars, OutputStream output)
             throws IOException {
-        File source = requireReadableFile(snapshot.file);
-        long snapshotLength = Math.min(snapshot.length, source.length());
+        long snapshotLength = snapshot.length;
         ArrayDeque<String> preview = maxChars > 0 ? new ArrayDeque<>() : null;
         int previewChars = 0;
         boolean truncated = false;
@@ -198,7 +256,7 @@ public final class LogFileTools {
         try (
             BufferedReader reader = new BufferedReader(
                 new InputStreamReader(
-                    new BoundedInputStream(new FileInputStream(source), snapshotLength),
+                    snapshot.consume(),
                     StandardCharsets.UTF_8
                 ),
                 64 * 1024
@@ -295,7 +353,7 @@ public final class LogFileTools {
         if (line.length() >= 8
                 && line.charAt(2) == ':'
                 && line.charAt(5) == ':'
-                && parseExact(line.substring(0, 8), "HH:mm:ss") >= 0L) {
+                && parsesExactly(line.substring(0, 8), "HH:mm:ss")) {
             return LEGACY_TIMESTAMP;
         }
         return NO_TIMESTAMP;
@@ -331,6 +389,14 @@ public final class LogFileTools {
         return parsed != null && position.getIndex() == value.length()
             ? parsed.getTime()
             : -1L;
+    }
+
+    private static boolean parsesExactly(String value, String pattern) {
+        SimpleDateFormat format = formatter(pattern);
+        format.setLenient(false);
+        ParsePosition position = new ParsePosition(0);
+        Date parsed = format.parse(value, position);
+        return parsed != null && position.getIndex() == value.length();
     }
 
     private static SimpleDateFormat formatter(String pattern) {

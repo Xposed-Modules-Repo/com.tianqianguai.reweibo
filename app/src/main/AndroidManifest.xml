@@ -2,6 +2,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <permission android:name="com.tianqianguai.reweibo.permission.COMMAND"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.tianqianguai.reweibo.permission.COMMAND" />
+    <queries>
+        <package android:name="com.weico.international" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

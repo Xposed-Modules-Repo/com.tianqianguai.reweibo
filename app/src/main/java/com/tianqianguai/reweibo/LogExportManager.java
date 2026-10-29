@@ -3,6 +3,10 @@ package com.tianqianguai.reweibo;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
+import android.content.ClipData;
+import android.content.pm.PackageManager;
+import android.content.pm.ProviderInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -32,15 +36,59 @@ final class LogExportManager {
 
     private LogExportManager() {}
 
+    static Intent shareIntent(Context context, ExportResult result) throws IOException {
+        Uri uri = Uri.parse(result.uri);
+        if (!"content".equals(uri.getScheme())) {
+            // Pre-29 exports live in the host's external-files directory. Reuse its declared
+            // FileProvider; a provider in the module APK cannot read the host's private files.
+            uri = hostFileUri(context, new File(result.location));
+        }
+        Intent send = new Intent(Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_SUBJECT, "ReWeibo 日志")
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        send.setClipData(ClipData.newRawUri("ReWeibo 日志", uri));
+        return send;
+    }
+
+    private static Uri hostFileUri(Context context, File file) throws IOException {
+        try {
+            ProviderInfo[] providers = context.getPackageManager().getPackageInfo(
+                context.getPackageName(), PackageManager.GET_PROVIDERS | PackageManager.GET_META_DATA).providers;
+            if (providers != null) {
+                Class<?> provider = Class.forName("androidx.core.content.FileProvider", false,
+                    context.getClassLoader());
+                for (ProviderInfo info : providers) {
+                    if (!info.grantUriPermissions || info.metaData == null
+                        || !info.metaData.containsKey("android.support.FILE_PROVIDER_PATHS")) continue;
+                    for (String authority : info.authority.split(";")) {
+                        try {
+                            return (Uri) provider.getMethod("getUriForFile", Context.class, String.class, File.class)
+                                .invoke(null, context, authority, file);
+                        } catch (ReflectiveOperationException | IllegalArgumentException unavailable) {
+                            // Another declared provider may cover external-files exports.
+                        }
+                    }
+                }
+            }
+        } catch (ReflectiveOperationException | PackageManager.NameNotFoundException error) {
+            throw new IOException("host sharing provider unavailable", error);
+        }
+        throw new IOException("host sharing provider does not cover this export");
+    }
+
     static ExportResult exportForUser(
             Context context,
             LogFileTools.Snapshot source,
             LogFileTools.Range range
     ) throws IOException {
-        if (Build.VERSION.SDK_INT >= 29) {
-            return exportToDownloads(context, source, range);
+        try (LogFileTools.Snapshot owned = source) {
+            if (Build.VERSION.SDK_INT >= 29) {
+                return exportToDownloads(context, owned, range);
+            }
+            return exportToExternalFiles(context, owned, range, "user");
         }
-        return exportToExternalFiles(context, source, range, "user");
     }
 
     static ExportResult exportForCli(
@@ -48,7 +96,9 @@ final class LogExportManager {
             LogFileTools.Snapshot source,
             LogFileTools.Range range
     ) throws IOException {
-        return exportToExternalFiles(context, source, range, "cli");
+        try (LogFileTools.Snapshot owned = source) {
+            return exportToExternalFiles(context, owned, range, "cli");
+        }
     }
 
     private static ExportResult exportToDownloads(

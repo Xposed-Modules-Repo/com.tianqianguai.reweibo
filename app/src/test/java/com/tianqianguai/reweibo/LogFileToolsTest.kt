@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardOpenOption
+import java.util.TimeZone
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -95,6 +96,61 @@ class LogFileToolsTest {
     }
 
     @Test
+    fun legacyClockPrefixesAreRecognizedAtUtcPlusEight() = withTimeZone("Asia/Shanghai") {
+        val sample = """
+            00:00:00 midnight
+            07:59:59 before-utc-midnight
+            08:00:00 utc-midnight
+            25:00:00 invalid-time
+        """.trimIndent() + "\n"
+        withLog(sample) { file ->
+            val preview = LogFileTools.readPreview(
+                file,
+                LogFileTools.parseRange("2026-09-02", "2026-09-02"),
+                4096
+            )
+
+            assertEquals(4L, preview.totalLines)
+            assertEquals(3L, preview.legacyLines)
+            assertEquals(3L, preview.skippedLegacyLines)
+            assertEquals(0L, preview.matchedLines)
+        }
+    }
+
+    @Test
+    fun datedRangeExportSkipsLegacySegmentAndItsContinuationAtUtcPlusEight() =
+        withTimeZone("Asia/Shanghai") {
+            val sample = """
+                2026-09-02 09:00:00.000 inside-start
+                00:00:00 legacy-after-date
+                  legacy-continuation
+                2026-09-02 09:05:00.000 inside-end
+            """.trimIndent() + "\n"
+            withLog(sample) { file ->
+                val output = ByteArrayOutputStream()
+                val exported = LogFileTools.writeFiltered(
+                    file,
+                    LogFileTools.parseRange(
+                        "2026-09-02 09:00:00",
+                        "2026-09-02 09:10:00"
+                    ),
+                    output
+                )
+                val expectedOutputBytes = (
+                    "2026-09-02 09:00:00.000 inside-start\n" +
+                        "2026-09-02 09:05:00.000 inside-end\n"
+                    ).toByteArray(StandardCharsets.UTF_8).size.toLong()
+
+                assertEquals(4L, exported.totalLines)
+                assertEquals(2L, exported.matchedLines)
+                assertEquals(1L, exported.legacyLines)
+                assertEquals(1L, exported.skippedLegacyLines)
+                assertEquals(expectedOutputBytes, exported.outputBytes)
+                assertEquals(exported.outputBytes, output.size().toLong())
+            }
+        }
+
+    @Test
     fun snapshotStopsAtTheCompleteByteBoundaryWhileTheLogKeepsGrowing() =
         withLog("2026-09-02 09:00:00.000 before\n") { file ->
             val snapshot = LogFileTools.snapshot(file)
@@ -131,6 +187,16 @@ class LogFileToolsTest {
             assertion(path.toFile())
         } finally {
             Files.deleteIfExists(path)
+        }
+    }
+
+    private fun <T> withTimeZone(id: String, assertion: () -> T): T {
+        val original = TimeZone.getDefault()
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone(id))
+            return assertion()
+        } finally {
+            TimeZone.setDefault(original)
         }
     }
 }

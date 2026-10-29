@@ -24,6 +24,9 @@ public final class CliContract {
         add(commands, "weico.logs.status", PACKAGE_WEICO, "logs.status");
         add(commands, "weico.logs.read", PACKAGE_WEICO, "logs.read");
         add(commands, "weico.logs.export", PACKAGE_WEICO, "logs.export");
+        add(commands, "weico.diagnostics.status", PACKAGE_WEICO, "diagnostics.status");
+        add(commands, "weico.diagnostics.start", PACKAGE_WEICO, "diagnostics.start");
+        add(commands, "weico.diagnostics.stop", PACKAGE_WEICO, "diagnostics.stop");
         add(commands, "weico.timeline.top", PACKAGE_WEICO, "timeline.top");
         add(commands, "weico.timeline.bottom", PACKAGE_WEICO, "timeline.bottom");
         add(commands, "weico.timeline.jump", PACKAGE_WEICO, "timeline.jump");

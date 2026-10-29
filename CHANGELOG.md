@@ -2,6 +2,36 @@
 
 # Changelog
 
+## 1.3.1
+
+### 新增与改进 / Added And Improved
+
+- 微博内设置按功能分组，增加独立卡片、留白和说明行距，保留全部开关与操作入口。
+  In-app settings now use feature groups, separate cards, more spacing, and clearer descriptions while retaining every switch and action.
+- 日志导出完成后直接打开系统分享面板；文件仍会保留，取消分享不会丢失导出结果。
+  Log exports now open the system share sheet directly; exported files remain available even if sharing is cancelled.
+- 持久诊断采用后台批量写入与轮转保留，记录慢操作、异常和界面性能摘要，并支持限时十分钟详细诊断。
+  Persistent diagnostics use batched background writes and log rotation to capture slow operations, errors, and UI performance summaries, with an optional ten-minute detailed mode.
+- 缓存和阅读状态按账号隔离，切换账号时取消过期任务，旧缓存仅在归属可确认时迁移且保留原文件。
+  Caches and reading state are isolated by account, stale tasks are cancelled on account changes, and legacy caches are migrated only when ownership is confirmed while preserving the originals.
+
+### 修复 / Fixes
+
+- 适配微博轻享版 7.0.1 的新开屏广告判断入口，同时保留旧版兼容和原登录、导航流程。
+  Supports Weibo Lite 7.0.1's new splash-ad decision method while retaining older-version compatibility and the original login and navigation flow.
+- 修复重启时过期的大影子缓存覆盖较新原生检查点的问题；补齐缓存时保留最新微博与更新后的条目。
+  Fixes stale, larger shadow caches taking precedence over newer native checkpoints on restart, preserving recent posts and updated entries when combining caches.
+- 修复异步缓存恢复遗漏迟到网络数据，以及旧账号任务覆盖新账号待写数据的问题。
+  Fixes late network data being lost during asynchronous cache restoration and old-account tasks overwriting queued writes for a new account.
+- 修复设置重置后被宿主旧值回写，以及关闭下拉刷新控制后仍错误报告刷新状态的问题；加强设置访问校验。
+  Fixes reset settings being overwritten by stale host values and incorrect refresh-state reporting when pull-to-refresh control is disabled, and strengthens settings access checks.
+- 新导航和手动触摸会取消旧时间跳转重试；快捷按钮支持标准点击，硬件键盘与方向键使用宿主窗口内的焦点路径。
+  New navigation and manual touch cancel stale time-jump retries; shortcut buttons support standard clicks, with host-window focus handling for hardware keyboards and directional controls.
+- 完善热重载替换失败时的回退与就绪判定，避免仅保留旧句柄却丢失可用运行态。
+  Improves fallback and readiness checks when hot-reload replacement fails, avoiding retained hooks that no longer have a usable runtime.
+- 修复旧格式凌晨日志的时间识别与范围筛选，以及前置 Hook 异常后诊断关联未恢复的问题。
+  Fixes early-morning timestamp recognition and range filtering for legacy logs, and restores diagnostic context after before-hook failures.
+
 ## 1.3.0
 
 ### 新增与改进 / Added And Improved

@@ -9,6 +9,8 @@ import com.tianqianguai.reweibo.compat.XposedBridge;
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -42,7 +44,8 @@ public final class MainHook extends XposedModule {
         XposedBridge.RegistrationReport report = registerHooks(
             param.getPackageName(),
             param.getClassLoader(),
-            Collections.emptyList()
+            Collections.emptyList(),
+            Collections.emptyMap()
         );
         WeiboLiteHook.markHotReloadReady(report.completed);
         logRegistrationReport("initial", report);
@@ -61,14 +64,18 @@ public final class MainHook extends XposedModule {
             XposedBridge.log("ReWeibo: hot reload rejected: saved state is not classloader-neutral");
             return false;
         }
-        if (!WeiboLiteHook.prepareForHotReload(savedState)) {
+        Object preparedState = saveStateAfterPreparation(
+            savedState,
+            WeiboLiteHook.prepareForHotReload(savedState)
+        );
+        if (preparedState == null) {
             XposedBridge.log(
                 "ReWeibo: hot reload rejected during quiesce blocker="
                     + WeiboLiteHook.hotReloadBlocker()
             );
             return false;
         }
-        param.setSavedInstanceState(savedState);
+        param.setSavedInstanceState(preparedState);
         XposedBridge.log(
             "ReWeibo: old generation quiesced process=" + loadedProcessName
                 + " generation=" + HotReloadState.previousGeneration(savedState)
@@ -85,6 +92,8 @@ public final class MainHook extends XposedModule {
             param.getOldHookHandles()
         );
         Object savedState = param.getSavedInstanceState();
+        Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes =
+            HotReloadState.routes(savedState);
         long generation = Math.max(2L, HotReloadState.previousGeneration(savedState) + 1L);
         ClassLoader targetClassLoader = resolveTargetClassLoader(savedState, param.getOldHookHandles());
         if (targetClassLoader == null) {
@@ -96,7 +105,8 @@ public final class MainHook extends XposedModule {
         XposedBridge.RegistrationReport report = registerHooks(
             TARGET_PACKAGE,
             targetClassLoader,
-            oldHooks
+            oldHooks,
+            oldRoutes
         );
         XposedBridge.OldHookReconcileReport reconciliation =
             XposedBridge.reconcileOldHooks(oldHooks, report);
@@ -108,6 +118,7 @@ public final class MainHook extends XposedModule {
                 + " restored=" + restored
                 + " oldHooks=" + oldHooks.size()
                 + " atomicallyReplaced=" + reconciliation.atomicallyReplaced
+                + " forwarded=" + reconciliation.forwarded
                 + " legacyRemoved=" + reconciliation.legacyRemoved
                 + " staleRemoved=" + reconciliation.staleRemoved
                 + " retainedAfterFailure=" + reconciliation.retainedAfterFailure
@@ -117,9 +128,10 @@ public final class MainHook extends XposedModule {
     private XposedBridge.RegistrationReport registerHooks(
             String packageName,
             ClassLoader classLoader,
-            List<XposedBridge.OldHookSnapshot> oldHooks
+            List<XposedBridge.OldHookSnapshot> oldHooks,
+            Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes
     ) {
-        XposedBridge.beginRegistration(oldHooks);
+        XposedBridge.beginRegistration(oldHooks, oldRoutes);
         boolean completed = false;
         try {
             WeiboLiteHook.hook(new XC_LoadPackage.LoadPackageParam(packageName, classLoader));
@@ -130,10 +142,27 @@ public final class MainHook extends XposedModule {
         return XposedBridge.finishRegistration(completed);
     }
 
+    static Object saveStateAfterPreparation(Object savedState, boolean preparationSucceeded) {
+        if (!preparationSucceeded) return null;
+        return HotReloadState.withRoutes(
+            savedState,
+            XposedBridge.prepareRoutesForHotReload()
+        );
+    }
+
     private void logRegistrationReport(
             String phase,
             XposedBridge.RegistrationReport report
     ) {
+        StringBuilder evidence = new StringBuilder("phase=").append(phase)
+            .append(" attempted=").append(report.attempted.size())
+            .append(" successful=").append(report.successful.size())
+            .append(" failures=").append(report.failures.size())
+            .append(" completed=").append(report.completed);
+        for (int i = 0; i < Math.min(10, report.failures.size()); i++) {
+            evidence.append(" failure=").append(report.failures.get(i).identity.executable);
+        }
+        WeiboLiteHook.recordRegistrationEvidence(evidence.toString());
         XposedBridge.log(
             "ReWeibo: hook registration phase=" + phase
                 + " attempted=" + report.attempted.size()

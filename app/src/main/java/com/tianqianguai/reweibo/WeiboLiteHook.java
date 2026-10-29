@@ -48,7 +48,7 @@ import java.io.Closeable;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.FileWriter;
+
 import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.lang.ref.WeakReference;
@@ -179,12 +179,17 @@ public class WeiboLiteHook {
     private static final ExecutorService sLogIoExecutor =
         HotReloadRuntime.newSingleThreadExecutor("ReWeibo-log-io", Thread.MIN_PRIORITY);
     private static final Map sTimelineCumulativeStatusesById = new LinkedHashMap();
+    private static volatile TimelineAccountFiles sTimelineAccount;
+    private static final ThreadLocal<TimelineAccountFiles> sTimelineTaskAccount = new ThreadLocal<>();
+    private static final Map<Object, TimelineAccountFiles> sTimelineOwnerAccounts = new WeakHashMap<>();
     private static final GapFillState sTimelineGapFillState = new GapFillState();
-    private static File sLogFile = null;
+    private static volatile File sLogFile = null;
     private static Context sWeicoContext = null;
     private static volatile boolean sTimelineCacheDaysSettingConfirmed = false;
     private static volatile boolean sTimelineCacheClearInFlight = false;
     private static volatile boolean sTimelineCacheClearDialogLoading = false;
+    private static AlertDialog sTimelineCacheClearProgressDialog;
+    private static boolean sTimelineShortcutPanelMode = true;
     private static TimelineNativePersistRequest sPendingTimelineNativePersist = null;
     private static TimelineShadowPersistRequest sPendingTimelineShadowPersist = null;
     private static boolean sTimelinePersistWorkerScheduled = false;
@@ -252,7 +257,6 @@ public class WeiboLiteHook {
                 return formats;
             }
         };
-    private static int sTimelineShadowCacheCount = 0;
     private static int sTimelineNetworkProbeSeq = 0;
     private static boolean sTimelineCursorActionDumped = false;
     private static String sPendingTimelineNoMoreSource = null;
@@ -279,6 +283,7 @@ public class WeiboLiteHook {
     private static String sCliLastLogExportPath = "";
     private static long sCliLastLogExportLines = 0L;
     private static long sCliLastLogExportBytes = 0L;
+    private static TimelineAccountFiles sCliLastOperationAccount;
     private static final AtomicInteger sPendingLogIoTasks = new AtomicInteger();
     private static final AtomicInteger sActiveTimelineObservableSubscriptions = new AtomicInteger();
     private static final List<WeakReference<Object>> sLiveTimelineObservableWrappers = new ArrayList<>();
@@ -430,6 +435,7 @@ public class WeiboLiteHook {
     }
 
     private static final class TimelineRestoreRequest {
+        final TimelineAccountFiles account = timelineAccount();
         final Object presenter;
         final ArrayList liveStatuses;
         final ArrayList cumulativeStatuses;
@@ -525,6 +531,7 @@ public class WeiboLiteHook {
     }
 
     private static final class TimelineNativePersistRequest {
+        final TimelineAccountFiles account = timelineAccount();
         final Object result;
         final Object gson;
         final File nativeFile;
@@ -562,6 +569,7 @@ public class WeiboLiteHook {
     }
 
     private static final class TimelineShadowPersistRequest {
+        final TimelineAccountFiles account = timelineAccount();
         final String source;
         final int count;
         final String maxId;
@@ -632,6 +640,12 @@ public class WeiboLiteHook {
     }
 
     private static volatile ModuleSettings.FeatureSnapshot sFeatures;
+    private static volatile String sRegistrationEvidence = "pending";
+
+    static void recordRegistrationEvidence(String evidence) {
+        sRegistrationEvidence = Diagnostics.clean(evidence);
+        Diagnostics.event("hook", "registration", sRegistrationEvidence, true);
+    }
 
     private static boolean feature(String key) {
         ModuleSettings.FeatureSnapshot snapshot = sFeatures;
@@ -644,14 +658,51 @@ public class WeiboLiteHook {
     }
 
     /** All callbacks stay registered, preserving stable hook IDs and native calls when disabled. */
-    private abstract static class FeatureHook extends XC_MethodHook {
+    abstract static class FeatureHook extends XC_MethodHook {
         private final String[] keys;
         FeatureHook(String... keys) { this.keys = keys; }
         @Override protected final void beforeHookedMethod(MethodHookParam param) throws Throwable {
-            if (anyFeature(keys)) beforeEnabled(param);
+            if (!anyFeature(keys)) return;
+            String name = param.method.getName();
+            if (param.method.getDeclaringClass().getName().startsWith("com.weico.international.ui.indexv")
+                && param.method.getDeclaringClass().getSimpleName().endsWith("Presenter")) {
+                if (!ensureTimelineAccount(param.thisObject)) {
+                    param.setObjectExtra("reweibo.account.skip", Boolean.TRUE);
+                    return;
+                }
+                param.setObjectExtra("reweibo.account", sTimelineAccount);
+            }
+            boolean measured = name.equals("addData") || name.equals("setData") || name.equals("distinct")
+                || name.equals("showData") || name.equals("doLoadData") || name.equals("loadHomeTimeline")
+                || name.equals("doLoadCache");
+            Diagnostics.Span span = measured ? Diagnostics.begin("hook", name) : null;
+            if (span != null) param.setObjectExtra("reweibo.performance", span);
+            try { beforeEnabled(param); }
+            catch (Throwable error) {
+                if (span != null) {
+                    span.beforeEnd = span.afterStart = System.nanoTime();
+                    Diagnostics.endHook(span, error);
+                    param.setObjectExtra("reweibo.performance", null);
+                }
+                throw error;
+            }
+            finally { if (span != null) span.beforeEnd = System.nanoTime(); }
         }
         @Override protected final void afterHookedMethod(MethodHookParam param) throws Throwable {
-            if (anyFeature(keys)) afterEnabled(param);
+            if (!anyFeature(keys)) return;
+            Object account = param.getObjectExtra("reweibo.account");
+            if (Boolean.TRUE.equals(param.getObjectExtra("reweibo.account.skip"))
+                || account != null && account != sTimelineAccount) {
+                Diagnostics.endHook((Diagnostics.Span) param.getObjectExtra("reweibo.performance"), null);
+                return;
+            }
+            Diagnostics.Span span = (Diagnostics.Span) param.getObjectExtra("reweibo.performance");
+            if (span != null) span.afterStart = System.nanoTime();
+            Throwable failure = param.getThrowable();
+            if (failure == null && span != null) failure = span.failure;
+            try { afterEnabled(param); }
+            catch (Throwable error) { failure = error; throw error; }
+            finally { Diagnostics.endHook(span, failure); }
         }
         protected void beforeEnabled(MethodHookParam param) throws Throwable {}
         protected void afterEnabled(MethodHookParam param) throws Throwable {}
@@ -685,43 +736,42 @@ public class WeiboLiteHook {
     }
 
     private static void log(String msg) {
-        if (sFeatures == null || !feature(ModuleSettings.KEY_WEICO_PERSISTENT_LOGS)) return;
-        XposedBridge.log("ReWeibo: " + msg);
+        Diagnostics.legacy(msg);
+    }
+
+    private static void startDiagnostics(Context context) {
+        if (Diagnostics.enabled()) { PerformanceMonitor.start(context); return; }
+        if (context == null || sFeatures == null || !feature(ModuleSettings.KEY_WEICO_PERSISTENT_LOGS)) return;
+        String process = Application.getProcessName();
+        // Per-process files prevent multiple independent writers from rotating the same path.
+        String suffix = "com.weico.international".equals(process) ? ""
+            : ".process-" + (process == null ? android.os.Process.myPid() : process.replaceAll("[^a-zA-Z0-9_-]", "_"));
         synchronized (sLogFileLock) {
-            if (sLogFile == null) return;
-            try {
-                FileWriter fw = new FileWriter(sLogFile, true);
-                fw.write(LogFileTools.formatLogTimestamp(System.currentTimeMillis())
-                    + " " + msg + "\n");
-                fw.close();
-            } catch (Throwable ignored) {}
+            sLogFile = new File(context.getFilesDir(), WEICO_LOG_FILE_NAME + suffix);
         }
+        Diagnostics.start(getWeicoLogFile(), sLogFileLock, process);
+        Diagnostics.event("hook", "registration", sRegistrationEvidence, true);
+        Diagnostics.event("hook", "readiness", "ready=" + sHotReloadReady
+            + " generation=" + sHotReloadGeneration + " ad_hooks=" + sTimelineAdHookCount
+            + " ad_strategy=" + sTimelineAdHookStrategy, true);
+        StringBuilder configuration = new StringBuilder();
+        for (String key : ModuleSettings.booleanKeys()) configuration.append(key).append('=').append(feature(key)).append(' ');
+        Diagnostics.event("session", "features", configuration.toString(), true);
+        PerformanceMonitor.start(context);
     }
 
     private static void initLogFile() {
-        synchronized (sLogFileLock) {
-            try {
-                File dir = new File("/data/data/com.weico.international/files");
-                if (!dir.exists()) dir.mkdirs();
-                sLogFile = new File(dir, WEICO_LOG_FILE_NAME);
-            } catch (Throwable ignored) {
-                sLogFile = null;
-            }
-        }
-        log("=== Log started ===");
+        if (sLogFile == null) sLogFile = new File("/data/data/com.weico.international/files", WEICO_LOG_FILE_NAME);
+        { if (Diagnostics.shouldLog("=== Log started ===")) log("=== Log started ==="); }
     }
 
     private static File getWeicoLogFile() {
-        synchronized (sLogFileLock) {
-            if (sLogFile != null) return sLogFile;
-            return new File(
-                "/data/data/com.weico.international/files",
-                WEICO_LOG_FILE_NAME
-            );
-        }
+        File file = sLogFile;
+        return file != null ? file : new File("/data/data/com.weico.international/files", WEICO_LOG_FILE_NAME);
     }
 
     private static LogFileTools.Snapshot snapshotWeicoLogFile() throws java.io.IOException {
+        Diagnostics.flushOnWorker();
         synchronized (sLogFileLock) {
             return LogFileTools.snapshot(getWeicoLogFile());
         }
@@ -778,6 +828,7 @@ public class WeiboLiteHook {
     }
 
     private static String findHotReloadBlocker(boolean includePreparing) {
+        if (Diagnostics.busy()) return "diagnostic-write-pending";
         if (includePreparing && sHotReloadPreparing) return "generation-retiring";
         if (sTimelineCacheClearInFlight) return "cache-clear-active";
         if (sTimelineCacheClearDialogLoading) return "cache-dialog-loading";
@@ -844,6 +895,7 @@ public class WeiboLiteHook {
             sHotReloadStateRestoredBeforePrepare = sHotReloadStateRestored;
             sHotReloadPreparing = true;
             sHotReloadReady = false;
+            Diagnostics.pause();
         }
         if (findHotReloadBlocker(false) != null) {
             restoreRejectedHotReloadFlags();
@@ -853,6 +905,7 @@ public class WeiboLiteHook {
             () -> HotReloadRuntime.runMainCleanup(new Runnable() {
                 @Override
                 public void run() {
+                    PerformanceMonitor.stop();
                     removeTimelineGapFillProgressView("hot-reload");
                     removeTimelineTimeJumpButton("hot-reload");
                     removeTimelineLastReadMarkers();
@@ -871,6 +924,7 @@ public class WeiboLiteHook {
             resumeAfterRejectedHotReload(savedState);
             return false;
         }
+        Diagnostics.stop();
         clearGenerationOwnedReferences();
         return true;
     }
@@ -882,12 +936,15 @@ public class WeiboLiteHook {
         HotReloadRuntime.post(new Runnable() {
             @Override
             public void run() {
+                PerformanceMonitor.restoreActivity(sTimelineTimeJumpActivity);
                 refreshTimelineShortcutButtons("hot-reload-rejected");
             }
         });
     }
 
     private static void restoreRejectedHotReloadFlags() {
+        Diagnostics.resume();
+        if (sWeicoContext != null) PerformanceMonitor.start(sWeicoContext);
         synchronized (sHotReloadLock) {
             sHotReloadPreparing = false;
             sHotReloadReady = sHotReloadReadyBeforePrepare;
@@ -928,8 +985,10 @@ public class WeiboLiteHook {
         if (context != null) {
             Context applicationContext = context.getApplicationContext();
             sWeicoContext = applicationContext == null ? context : applicationContext;
+            startDiagnostics(sWeicoContext);
             registerWeicoCliBridge(sWeicoContext, hotReloaded ? "hot-reload" : "hot-reload-rejected");
         }
+        if (presenter != null) ensureTimelineAccount(presenter);
         sLastTimelinePresenter = presenter;
         sLastActiveHomeTimelinePresenter = new WeakReference<>(presenter);
         sLastActiveHomeTimelineRecyclerView = new WeakReference<>(recyclerView);
@@ -955,6 +1014,7 @@ public class WeiboLiteHook {
         HotReloadRuntime.post(new Runnable() {
             @Override
             public void run() {
+                PerformanceMonitor.restoreActivity(sTimelineTimeJumpActivity);
                 refreshTimelineShortcutButtons("hot-reload-restored");
                 if (presenter != null && "-1".equals(getTimelineGroupId(presenter))) {
                     resetPreloadState(presenter, "hot-reload-restored");
@@ -1033,15 +1093,37 @@ public class WeiboLiteHook {
                 "registration group threw before completion",
                 error
             );
-            log("Hook registration group failed name=" + name + ": " + error.getMessage());
+            { if (Diagnostics.shouldLog("Hook registration group failed name=")) log("Hook registration group failed name=" + name + ": " + error.getMessage()); }
         } finally {
             XposedBridge.completeRegistrationGroup(name);
         }
     }
 
     public static void hook(final XC_LoadPackage.LoadPackageParam lpparam) {
-        log("WeicoHook start");
+        { if (Diagnostics.shouldLog("WeicoHook start")) log("WeicoHook start"); }
         initLogFile();
+        registerHookGroup("diagnostics-ui", () -> {
+            XposedHelpers.findAndHookMethod(android.app.Instrumentation.class, "callActivityOnNewIntent",
+                Activity.class, Intent.class, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        PerformanceMonitor.intent((Activity) param.args[0], (Intent) param.args[1], "new_intent");
+                    }
+                });
+            XposedHelpers.findAndHookMethod(Activity.class, "dispatchTouchEvent", MotionEvent.class,
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!Diagnostics.enabled()) return;
+                        MotionEvent event = (MotionEvent) param.args[0];
+                        if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                            Diagnostics.interaction("touch_up");
+                            param.setObjectExtra("reweibo.ui.input", Diagnostics.begin("ui", "dispatch_touch_up"));
+                        }
+                    }
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        Diagnostics.end((Diagnostics.Span) param.getObjectExtra("reweibo.ui.input"), param.getThrowable());
+                    }
+                });
+        });
         registerHookGroup("profile-settings", () -> hookMainProfileSettingsEntry(lpparam.classLoader));
         registerHookGroup("native-reverse", () -> forceNativeReverseOrder(lpparam.classLoader));
         registerHookGroup("timeline-layout", () -> forceTimelineLayoutDirection(lpparam.classLoader));
@@ -1051,7 +1133,7 @@ public class WeiboLiteHook {
         registerHookGroup("pull-refresh", () -> disableWeicoPullRefresh(lpparam.classLoader));
         registerHookGroup("splash-ad", () -> removeSplashAd(lpparam.classLoader));
         registerHookGroup("timeline-ad", () -> removeTimelineAd(lpparam.classLoader));
-        log("WeicoHook done");
+        { if (Diagnostics.shouldLog("WeicoHook done")) log("WeicoHook done"); }
     }
 
     private static void hookMainProfileSettingsEntry(final ClassLoader cl) {
@@ -1070,7 +1152,7 @@ public class WeiboLiteHook {
                 }
             );
         } catch (Throwable t) {
-            log("MainProfile application attach hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("MainProfile application attach hook error: ")) log("MainProfile application attach hook error: " + t.getMessage()); }
         }
 
         try {
@@ -1083,7 +1165,7 @@ public class WeiboLiteHook {
                 }
             });
         } catch (Throwable t) {
-            log("MainProfile context hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("MainProfile context hook error: ")) log("MainProfile context hook error: " + t.getMessage()); }
         }
 
         try {
@@ -1104,9 +1186,9 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            log("MainProfile drawer entry hook installed");
+            { if (Diagnostics.shouldLog("MainProfile drawer entry hook installed")) log("MainProfile drawer entry hook installed"); }
         } catch (Throwable t) {
-            log("MainProfile drawer entry hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("MainProfile drawer entry hook error: ")) log("MainProfile drawer entry hook error: " + t.getMessage()); }
         }
 
         try {
@@ -1130,14 +1212,14 @@ public class WeiboLiteHook {
                         }
                     }
                     if (!isReWeibo) return;
-                    log("ReWeibo profile row click intercepted");
+                    { if (Diagnostics.shouldLog("ReWeibo profile row click intercepted")) log("ReWeibo profile row click intercepted"); }
                     openReWeiboSettings(row.getContext());
                     param.setResult(Boolean.TRUE);
                 }
             });
-            log("MainProfile stable click hook installed");
+            { if (Diagnostics.shouldLog("MainProfile stable click hook installed")) log("MainProfile stable click hook installed"); }
         } catch (Throwable t) {
-            log("MainProfile stable click hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("MainProfile stable click hook error: ")) log("MainProfile stable click hook error: " + t.getMessage()); }
         }
 
         try {
@@ -1167,9 +1249,9 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            log("MainProfile drawer click hook installed");
+            { if (Diagnostics.shouldLog("MainProfile drawer click hook installed")) log("MainProfile drawer click hook installed"); }
         } catch (Throwable t) {
-            log("MainProfile drawer click hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("MainProfile drawer click hook error: ")) log("MainProfile drawer click hook error: " + t.getMessage()); }
         }
 
         try {
@@ -1195,9 +1277,9 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            log("MainProfile drawer update hook installed");
+            { if (Diagnostics.shouldLog("MainProfile drawer update hook installed")) log("MainProfile drawer update hook installed"); }
         } catch (Throwable t) {
-            log("MainProfile drawer update hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("MainProfile drawer update hook error: ")) log("MainProfile drawer update hook error: " + t.getMessage()); }
         }
     }
 
@@ -1225,7 +1307,7 @@ public class WeiboLiteHook {
             copy.add(insertAt, entry);
             return copy;
         } catch (Throwable t) {
-            log("append ReWeibo drawer item error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("append ReWeibo drawer item error: ")) log("append ReWeibo drawer item error: " + t.getMessage()); }
             return original;
         }
     }
@@ -1268,7 +1350,7 @@ public class WeiboLiteHook {
                 navNormal
             );
         } catch (Throwable t) {
-            log("create ReWeibo drawer item error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("create ReWeibo drawer item error: ")) log("create ReWeibo drawer item error: " + t.getMessage()); }
             return null;
         }
     }
@@ -1313,7 +1395,7 @@ public class WeiboLiteHook {
             iconView.setAlpha(1f);
             iconView.setVisibility(View.VISIBLE);
         } catch (Throwable t) {
-            log("apply ReWeibo profile icon error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("apply ReWeibo profile icon error: ")) log("apply ReWeibo profile icon error: " + t.getMessage()); }
         }
     }
 
@@ -1342,15 +1424,18 @@ public class WeiboLiteHook {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             }
             launchContext.startActivity(intent);
-            log("Opened ReWeibo settings activity");
+            { if (Diagnostics.shouldLog("Opened ReWeibo settings activity")) log("Opened ReWeibo settings activity"); }
             return;
         } catch (Throwable t) {
-            log("open ReWeibo settings error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("open ReWeibo settings error: ")) log("open ReWeibo settings error: " + t.getMessage()); }
             Toast.makeText(context, "无法打开 ReWeibo 设置", Toast.LENGTH_SHORT).show();
         }
     }
 
     private static void showReWeiboSettingsDialog(final Activity activity) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("ui", "showReWeiboSettingsDialog");
+        Throwable diagnosticError = null;
+        try {
         try {
             final SharedPreferences prefs = getWeicoSettingsPrefs();
             if (prefs == null) return;
@@ -1358,12 +1443,13 @@ public class WeiboLiteHook {
             LinearLayout panel = new LinearLayout(activity);
             panel.setOrientation(LinearLayout.VERTICAL);
             int padding = dpToPx(activity.getWindow().getDecorView(), 20);
-            panel.setPadding(padding, padding / 2, padding, padding / 2);
+            panel.setPadding(padding, padding, padding, padding);
 
             TextView label = new TextView(activity);
             label.setText("首页缓存天数（1-30）");
             label.setTextColor(Color.WHITE);
             label.setTextSize(15f);
+            label.setPadding(0, 0, 0, padding / 2);
             panel.addView(label);
 
             final EditText input = new EditText(activity);
@@ -1371,6 +1457,8 @@ public class WeiboLiteHook {
             input.setSelectAllOnFocus(true);
             input.setInputType(InputType.TYPE_CLASS_NUMBER);
             input.setTextColor(Color.WHITE);
+            input.setTextSize(18f);
+            input.setPadding(padding * 3 / 4, 0, padding * 3 / 4, 0);
             input.setHintTextColor(Color.rgb(145, 155, 170));
             input.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
             int current = getTimelineCacheDaysSetting();
@@ -1378,8 +1466,8 @@ public class WeiboLiteHook {
                 boolean migrated = prefs.edit()
                     .putInt(ModuleSettings.KEY_WEICO_TIMELINE_CACHE_DAYS, current)
                     .commit();
-                log("Timeline cache-days target migration value=" + current
-                    + " saved=" + migrated);
+                { if (Diagnostics.shouldLog("Timeline cache-days target migration value=")) log("Timeline cache-days target migration value=" + current
+                    + " saved=" + migrated); }
             }
             input.setText(String.valueOf(current));
             panel.addView(input, new LinearLayout.LayoutParams(
@@ -1389,24 +1477,69 @@ public class WeiboLiteHook {
 
             TextView featureNote = new TextView(activity);
             featureNote.setText("功能开关在重启微博轻享版后生效；关闭模块入口后，可从桌面 ReWeibo 应用图标重新设置。扩展缓存关闭时，预加载、补齐和阅读位置暂不生效，原选择与缓存文件仍保留。");
-            featureNote.setTextColor(Color.LTGRAY);
+            featureNote.setTextColor(0xFFACB7C6);
+            featureNote.setTextSize(13f);
+            featureNote.setLineSpacing(dpToPx(activity.getWindow().getDecorView(), 3), 1.08f);
+            featureNote.setPadding(0, padding, 0, padding);
             panel.addView(featureNote);
             final Map<String, Switch> featureToggles = new LinkedHashMap<>();
             Button onlyAds = new Button(activity);
             onlyAds.setText("仅去广告");
+            onlyAds.setTextSize(15f);
+            onlyAds.setTextColor(0xFFDCEBFF);
+            onlyAds.setAllCaps(false);
+            onlyAds.setMinHeight(dpToPx(activity.getWindow().getDecorView(), 48));
+            onlyAds.setBackground(makeDarkDialogInputBackground(activity.getWindow().getDecorView()));
             panel.addView(onlyAds);
-            for (String key : ModuleSettings.booleanKeys()) {
-                Switch toggle = new Switch(activity);
-                toggle.setText(ModuleSettings.titleFor(key));
-                toggle.setTextColor(Color.WHITE);
-                toggle.setChecked(readConfiguredBoolean(key, ModuleSettings.defaultFor(key)));
-                featureToggles.put(key, toggle);
-                panel.addView(toggle);
-                TextView description = new TextView(activity);
-                description.setText(ModuleSettings.descriptionFor(key));
-                description.setTextColor(Color.LTGRAY);
-                description.setTextSize(12f);
-                panel.addView(description);
+            String[][] groups = {
+                {"入口与广告", ModuleSettings.KEY_WEICO_PROFILE_ENTRY, ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL,
+                    ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER},
+                {"阅读与交互", ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_DISABLE_PULL_REFRESH,
+                    ModuleSettings.KEY_WEICO_TIMELINE_JUMP, ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ},
+                {"缓存与媒体", ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD,
+                    ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL, ModuleSettings.KEY_WEICO_STATUS_HYDRATION,
+                    ModuleSettings.KEY_WEICO_VIDEO_REFRESH},
+                {"快捷入口与诊断", ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
+                    ModuleSettings.KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON, ModuleSettings.KEY_WEICO_PERSISTENT_LOGS}
+            };
+            for (String[] group : groups) {
+                TextView heading = new TextView(activity);
+                heading.setText(group[0]);
+                heading.setTextSize(14f);
+                heading.setTextColor(0xFF9CBEE8);
+                heading.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+                heading.setPadding(0, padding * 3 / 2, 0, padding * 3 / 4);
+                panel.addView(heading);
+                for (int i = 1; i < group.length; i++) {
+                    String key = group[i];
+                    LinearLayout card = new LinearLayout(activity);
+                    card.setOrientation(LinearLayout.VERTICAL);
+                    int inset = dpToPx(activity.getWindow().getDecorView(), 14);
+                    card.setPadding(inset, inset / 2, inset, inset);
+                    GradientDrawable cardBackground = new GradientDrawable();
+                    cardBackground.setColor(0xFF252C39);
+                    cardBackground.setCornerRadius(dpToPx(activity.getWindow().getDecorView(), 12));
+                    card.setBackground(cardBackground);
+                    Switch toggle = new Switch(activity);
+                    toggle.setText(ModuleSettings.titleFor(key));
+                    toggle.setTextSize(16f);
+                    toggle.setTextColor(0xFFF0F3F7);
+                    toggle.setSwitchPadding(inset);
+                    toggle.setMinHeight(dpToPx(activity.getWindow().getDecorView(), 48));
+                    toggle.setChecked(readConfiguredBoolean(key, ModuleSettings.defaultFor(key)));
+                    featureToggles.put(key, toggle);
+                    card.addView(toggle, new LinearLayout.LayoutParams(-1, -2));
+                    TextView description = new TextView(activity);
+                    description.setText(ModuleSettings.descriptionFor(key));
+                    description.setTextColor(0xFFACB7C6);
+                    description.setTextSize(13f);
+                    description.setLineSpacing(dpToPx(activity.getWindow().getDecorView(), 3), 1.08f);
+                    description.setPadding(0, dpToPx(activity.getWindow().getDecorView(), 4), 0, 0);
+                    card.addView(description);
+                    LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(-1, -2);
+                    cardParams.bottomMargin = dpToPx(activity.getWindow().getDecorView(), 12);
+                    panel.addView(card, cardParams);
+                }
             }
             onlyAds.setOnClickListener(v -> {
                 for (Map.Entry<String, Boolean> entry : ModuleSettings.onlyAdsPreset().entrySet()) {
@@ -1556,10 +1689,14 @@ public class WeiboLiteHook {
             });
             dialog.show();
             HotReloadRuntime.trackDialog(dialog);
-            input.requestFocus();
+            panel.setFocusableInTouchMode(true);
+            panel.requestFocus();
         } catch (Throwable t) {
-            log("show ReWeibo settings dialog error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("show ReWeibo settings dialog error: ")) log("show ReWeibo settings dialog error: " + t.getMessage()); }
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static String formatTimelineCacheRangeSummary(TimelineCacheStats stats) {
@@ -1633,25 +1770,25 @@ public class WeiboLiteHook {
 
         final Object presenter = sLastTimelinePresenter;
         Toast.makeText(activity, "正在读取缓存范围，请稍候", Toast.LENGTH_SHORT).show();
-        log("Timeline cache-clear dialog stats loading");
+        { if (Diagnostics.shouldLog("Timeline cache-clear dialog stats loading")) log("Timeline cache-clear dialog stats loading"); }
         try {
-            sTimelineRestoreExecutor.execute(new Runnable() {
+            executeTimelineTask(sTimelineRestoreExecutor, new Runnable() {
                 @Override
                 public void run() {
                     TimelineCacheStats loadedStats;
                     try {
                         loadedStats = buildBestTimelineCacheStats(presenter);
                     } catch (Throwable t) {
-                        log("Timeline cache-clear dialog stats error: " + t.getMessage());
+                        { if (Diagnostics.shouldLog("Timeline cache-clear dialog stats error: ")) log("Timeline cache-clear dialog stats error: " + t.getMessage()); }
                         loadedStats = new TimelineCacheStats();
                     }
                     final TimelineCacheStats stats = loadedStats;
-                    HotReloadRuntime.post(new Runnable() {
+                    postTimelineResult(new Runnable() {
                         @Override
                         public void run() {
                             sTimelineCacheClearDialogLoading = false;
                             if (activity.isFinishing()) return;
-                            log("Timeline cache-clear dialog stats ready count=" + stats.count);
+                            { if (Diagnostics.shouldLog("Timeline cache-clear dialog stats ready count=")) log("Timeline cache-clear dialog stats ready count=" + stats.count); }
                             showTimelineCacheClearRangeDialog(activity, stats);
                         }
                     });
@@ -1659,7 +1796,7 @@ public class WeiboLiteHook {
             });
         } catch (Throwable t) {
             sTimelineCacheClearDialogLoading = false;
-            log("Timeline cache-clear dialog schedule error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline cache-clear dialog schedule error: ")) log("Timeline cache-clear dialog schedule error: " + t.getMessage()); }
             Toast.makeText(activity, "无法读取缓存范围，请重试", Toast.LENGTH_SHORT).show();
         }
     }
@@ -1895,7 +2032,7 @@ public class WeiboLiteHook {
             dialog.show();
             HotReloadRuntime.trackDialog(dialog);
         } catch (Throwable t) {
-            log("show timeline cache clear range error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("show timeline cache clear range error: ")) log("show timeline cache clear range error: " + t.getMessage()); }
             Toast.makeText(activity, "无法打开缓存清理，请重试", Toast.LENGTH_SHORT).show();
         }
     }
@@ -2108,7 +2245,7 @@ public class WeiboLiteHook {
             cumulativeStatuses = new ArrayList(sTimelineCumulativeStatusesById.values());
         }
         prepareTimelineStateForCacheClear(presenter);
-        log("Timeline cache range clear prepared live=" + liveStatuses.size());
+        { if (Diagnostics.shouldLog("Timeline cache range clear prepared live=")) log("Timeline cache range clear prepared live=" + liveStatuses.size()); }
 
         final AlertDialog progressDialog;
         if (activity != null) {
@@ -2130,11 +2267,12 @@ public class WeiboLiteHook {
             progressDialog = null;
         }
 
+        sTimelineCacheClearProgressDialog = progressDialog;
         if (cliOperationId != null) {
             updateCliOperation(cliOperationId, "running", "rewriting timeline cache");
         }
 
-        sTimelinePersistExecutor.execute(new Runnable() {
+        executeTimelineTask(sTimelinePersistExecutor, new Runnable() {
             @Override
             public void run() {
                 TimelineCacheRangeClearResult result = null;
@@ -2153,7 +2291,7 @@ public class WeiboLiteHook {
 
                 final TimelineCacheRangeClearResult completed = result;
                 final Throwable failure = error;
-                HotReloadRuntime.post(new Runnable() {
+                postTimelineResult(new Runnable() {
                     @Override
                     public void run() {
                         try {
@@ -2165,7 +2303,7 @@ public class WeiboLiteHook {
                                 String detail = failure == null
                                     ? "unknown error"
                                     : failure.getClass().getSimpleName() + ": " + failure.getMessage();
-                                log("Timeline cache range clear failed: " + detail);
+                                { if (Diagnostics.shouldLog("Timeline cache range clear failed: ")) log("Timeline cache range clear failed: " + detail); }
                                 showTimelineCacheClearToast(
                                     activity,
                                     "缓存清理失败，请重试",
@@ -2206,6 +2344,9 @@ public class WeiboLiteHook {
                             }
                         } finally {
                             sTimelineCacheClearInFlight = false;
+                            if (sTimelineCacheClearProgressDialog == progressDialog) {
+                                sTimelineCacheClearProgressDialog = null;
+                            }
                         }
                     }
                 });
@@ -2322,13 +2463,13 @@ public class WeiboLiteHook {
             shadowFile.length(),
             stats
         );
-        sTimelineShadowCacheCount = retained.size();
-        log("Timeline cache range cleared start=" + startMs
+        timelineAccount().shadowCount = retained.size();
+        { if (Diagnostics.shouldLog("Timeline cache range cleared start=")) log("Timeline cache range cleared start=" + startMs
             + " end=" + endMs
             + " source=" + (load == null ? "memory" : load.source)
             + " before=" + filtered.sourceCount
             + " removed=" + filtered.removedCount
-            + " retained=" + retained.size());
+            + " retained=" + retained.size()); }
         return new TimelineCacheRangeClearResult(
             retained,
             adapterModels,
@@ -2423,12 +2564,12 @@ public class WeiboLiteHook {
                 true,
                 adapterSyncGeneration
             );
-            log("Timeline cache range clear applied before=" + result.sourceCount
+            { if (Diagnostics.shouldLog("Timeline cache range clear applied before=")) log("Timeline cache range clear applied before=" + result.sourceCount
                 + " removed=" + result.removedCount
-                + " retained=" + result.retainedStatuses.size());
+                + " retained=" + result.retainedStatuses.size()); }
         } catch (Throwable t) {
             setTimelineCacheRestoring(presenter, false);
-            log("Timeline cache range clear apply error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline cache range clear apply error: ")) log("Timeline cache range clear apply error: " + t.getMessage()); }
         }
     }
 
@@ -2446,7 +2587,7 @@ public class WeiboLiteHook {
         for (int i = 0; i < fields.length; i++) {
             setTimelineCursorField(action, fields[i], "0");
         }
-        log("Timeline cursor reset source=manual-range-clear");
+        { if (Diagnostics.shouldLog("Timeline cursor reset source=manual-range-clear")) log("Timeline cursor reset source=manual-range-clear"); }
     }
 
     private static GradientDrawable makeDarkDialogInputBackground(View anchor) {
@@ -2510,8 +2651,9 @@ public class WeiboLiteHook {
         boolean recovered = sWeicoContext == null;
         sWeicoContext = context;
         loadFeatureSnapshot(context);
+        startDiagnostics(context);
         if (recovered) {
-            log("Weico application context captured source=" + source);
+            { if (Diagnostics.shouldLog("Weico application context captured source=")) log("Weico application context captured source=" + source); }
         }
         registerWeicoCliBridge(context, source);
         getTimelineCacheDaysSetting();
@@ -2548,10 +2690,10 @@ public class WeiboLiteHook {
             );
             if (registered) {
                 sCliBridgeRegistered = true;
-                log("Weico CLI bridge registered source=" + source);
+                { if (Diagnostics.shouldLog("Weico CLI bridge registered source=")) log("Weico CLI bridge registered source=" + source); }
             }
         } catch (Throwable t) {
-            log("Weico CLI bridge registration error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Weico CLI bridge registration error source=")) log("Weico CLI bridge registration error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -2583,6 +2725,14 @@ public class WeiboLiteHook {
     }
 
     private static CliCommandBridge.Result handleWeicoCliCommand(String command, Bundle args) {
+        if ("diagnostics.status".equals(command)) return CliCommandBridge.Result.ready(Diagnostics.status());
+        if ("diagnostics.start".equals(command)) return Diagnostics.startDetailed()
+            ? CliCommandBridge.Result.ready("Detailed diagnostics enabled for 10 minutes")
+            : CliCommandBridge.Result.error("Enable persistent diagnostics and restart Weibo Lite first");
+        if ("diagnostics.stop".equals(command)) {
+            Diagnostics.stopDetailed();
+            return CliCommandBridge.Result.ready("Detailed diagnostics stopped");
+        }
         if (("timeline.top".equals(command) || "timeline.bottom".equals(command) || "timeline.jump".equals(command))
             && !feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP)) {
             return CliCommandBridge.Result.error("timeline navigation is disabled; enable it and restart Weibo Lite");
@@ -2676,6 +2826,7 @@ public class WeiboLiteHook {
             .with("hot_reload_active_tasks", HotReloadRuntime.activeTaskCount())
             .with("hot_reload_pending_callbacks", HotReloadRuntime.pendingMainTaskCount())
             .with("log_io_pending", sPendingLogIoTasks.get())
+            .with("diagnostics", Diagnostics.status())
             .with(
                 "hot_reload_observable_subscriptions",
                 sActiveTimelineObservableSubscriptions.get()
@@ -2829,13 +2980,13 @@ public class WeiboLiteHook {
             Method method = presenter.getClass().getMethod(refresh ? "loadNew" : "loadMore");
             if (refresh) captureTimelineRefreshAnchorForKnownRecyclerViews(presenter, "cli-refresh");
             method.invoke(presenter);
-            log("CLI native timeline action command=" + command);
+            { if (Diagnostics.shouldLog("CLI native timeline action command=")) log("CLI native timeline action command=" + command); }
             return CliCommandBridge.Result.accepted("native timeline action invoked; network completion is not implied")
                 .with("command", command)
                 .with("completion", "not_tracked")
                 .with("poll", "weico.timeline.status,weico.preload.status,weico.gap.status,weico.logs.read");
         } catch (Throwable error) {
-            log("CLI native timeline action error command=" + command + ": " + error.getClass().getSimpleName());
+            { if (Diagnostics.shouldLog("CLI native timeline action error command=")) log("CLI native timeline action error command=" + command + ": " + error.getClass().getSimpleName()); }
             return CliCommandBridge.Result.error("native timeline action failed: " + error.getClass().getSimpleName());
         }
     }
@@ -2898,18 +3049,12 @@ public class WeiboLiteHook {
         }
         final Context context = getWeicoContext();
         if (context == null) return CliCommandBridge.Result.error("target context is unavailable");
-        final LogFileTools.Snapshot snapshot;
-        try {
-            snapshot = snapshotWeicoLogFile();
-        } catch (Throwable error) {
-            return CliCommandBridge.Result.error("log snapshot failed: " + error.getMessage());
-        }
         final String operationId = beginCliOperation("logs.export", range.describe());
         boolean accepted = submitLogIoTask(new Runnable() {
             @Override
             public void run() {
                 updateCliOperation(operationId, "running", "exporting log range");
-                try {
+                try (LogFileTools.Snapshot snapshot = snapshotWeicoLogFile()) {
                     LogExportManager.ExportResult exported = LogExportManager.exportForCli(
                         context,
                         snapshot,
@@ -2921,10 +3066,10 @@ public class WeiboLiteHook {
                         "completed",
                         "exported " + exported.log.matchedLines + " lines to " + exported.location
                     );
-                    log("CLI log export completed range=" + range.describe()
+                    { if (Diagnostics.shouldLog("CLI log export completed range=")) log("CLI log export completed range=" + range.describe()
                         + " lines=" + exported.log.matchedLines
                         + " bytes=" + exported.log.outputBytes
-                        + " path=" + exported.location);
+                        + " path=" + exported.location); }
                 } catch (Throwable error) {
                     finishCliOperation(
                         operationId,
@@ -3028,23 +3173,24 @@ public class WeiboLiteHook {
 
     private static CliCommandBridge.Result runTimelineCacheStatsCliCommand() {
         final String operationId = beginCliOperation("cache.stats", "scheduled");
+        final Object presenter = sLastTimelinePresenter;
         try {
-            sTimelineRestoreExecutor.execute(new Runnable() {
+            executeTimelineTask(sTimelineRestoreExecutor, new Runnable() {
                 @Override
                 public void run() {
                     updateCliOperation(operationId, "running", "reading cache statistics");
                     try {
-                        TimelineCacheStats stats = buildBestTimelineCacheStats(sLastTimelinePresenter);
+                        TimelineCacheStats stats = buildBestTimelineCacheStats(presenter);
                         updateCliCacheStats(operationId, stats);
                         finishCliOperation(
                             operationId,
                             "completed",
                             formatTimelineCacheRangeSummary(stats)
                         );
-                        log("Timeline CLI cache stats count=" + stats.count
+                        { if (Diagnostics.shouldLog("Timeline CLI cache stats count=")) log("Timeline CLI cache stats count=" + stats.count
                             + " dated=" + stats.datedCount
                             + " oldest=" + stats.oldestMs
-                            + " newest=" + stats.newestMs);
+                            + " newest=" + stats.newestMs); }
                     } catch (Throwable t) {
                         finishCliOperation(
                             operationId,
@@ -3191,6 +3337,7 @@ public class WeiboLiteHook {
             sCliOperationSequence++;
             sCliLastOperationId = "weico-" + System.currentTimeMillis() + "-" + sCliOperationSequence;
             sCliLastOperationCommand = command == null ? "" : command;
+            sCliLastOperationAccount = timelineAccount();
             sCliLastOperationState = "accepted";
             sCliLastOperationMessage = message == null ? "" : message;
             sCliLastOperationUpdatedAtMs = System.currentTimeMillis();
@@ -3209,7 +3356,9 @@ public class WeiboLiteHook {
 
     private static void updateCliOperation(String operationId, String state, String message) {
         synchronized (sCliOperationLock) {
-            if (!sCliLastOperationId.equals(operationId)) return;
+            if (!sCliLastOperationId.equals(operationId)
+                || sCliLastOperationCommand.startsWith("cache.")
+                    && sCliLastOperationAccount != sTimelineAccount) return;
             sCliLastOperationState = state == null ? sCliLastOperationState : state;
             sCliLastOperationMessage = message == null ? sCliLastOperationMessage : message;
             sCliLastOperationUpdatedAtMs = System.currentTimeMillis();
@@ -3223,7 +3372,9 @@ public class WeiboLiteHook {
     private static void updateCliCacheStats(String operationId, TimelineCacheStats stats) {
         if (stats == null) return;
         synchronized (sCliOperationLock) {
-            if (!sCliLastOperationId.equals(operationId)) return;
+            if (!sCliLastOperationId.equals(operationId)
+                || sCliLastOperationCommand.startsWith("cache.")
+                    && sCliLastOperationAccount != sTimelineAccount) return;
             sCliLastCacheCount = stats.count;
             sCliLastCacheDatedCount = stats.datedCount;
             sCliLastCacheNewestMs = stats.newestMs;
@@ -3237,7 +3388,9 @@ public class WeiboLiteHook {
     ) {
         if (exported == null || exported.log == null) return;
         synchronized (sCliOperationLock) {
-            if (!sCliLastOperationId.equals(operationId)) return;
+            if (!sCliLastOperationId.equals(operationId)
+                || sCliLastOperationCommand.startsWith("cache.")
+                    && sCliLastOperationAccount != sTimelineAccount) return;
             sCliLastLogExportPath = exported.location;
             sCliLastLogExportLines = exported.log.matchedLines;
             sCliLastLogExportBytes = exported.log.outputBytes;
@@ -3321,7 +3474,7 @@ public class WeiboLiteHook {
             int isSetColumn = cursor.getColumnIndex("is_set");
             result.isSet = isSetColumn >= 0 && cursor.getInt(isSetColumn) != 0;
         } catch (Throwable t) {
-            log("read module setting error: " + key + " " + t.getMessage());
+            { if (Diagnostics.shouldLog("read module setting error: ")) log("read module setting error: " + key + " " + t.getMessage()); }
         } finally {
             if (cursor != null) {
                 try {
@@ -3339,10 +3492,10 @@ public class WeiboLiteHook {
             Object current = prefs.getAll().get(key);
             if (current instanceof Boolean && ((Boolean) current).booleanValue() == value) return;
             if (!prefs.edit().putBoolean(key, value).commit()) {
-                log("sync target boolean setting failed: " + key);
+                { if (Diagnostics.shouldLog("sync target boolean setting failed: ")) log("sync target boolean setting failed: " + key); }
             }
         } catch (Throwable t) {
-            log("sync target boolean setting error: " + key + " " + t.getMessage());
+            { if (Diagnostics.shouldLog("sync target boolean setting error: ")) log("sync target boolean setting error: " + key + " " + t.getMessage()); }
         }
     }
 
@@ -3353,10 +3506,10 @@ public class WeiboLiteHook {
             Object current = prefs.getAll().get(key);
             if (current instanceof Number && ((Number) current).intValue() == value) return;
             if (!prefs.edit().putInt(key, value).commit()) {
-                log("sync target int setting failed: " + key);
+                { if (Diagnostics.shouldLog("sync target int setting failed: ")) log("sync target int setting failed: " + key); }
             }
         } catch (Throwable t) {
-            log("sync target int setting error: " + key + " " + t.getMessage());
+            { if (Diagnostics.shouldLog("sync target int setting error: ")) log("sync target int setting error: " + key + " " + t.getMessage()); }
         }
     }
 
@@ -3374,7 +3527,7 @@ public class WeiboLiteHook {
                 null
             ) == 1;
         } catch (Throwable t) {
-            log("write module setting error: " + key + " " + t.getMessage());
+            { if (Diagnostics.shouldLog("write module setting error: ")) log("write module setting error: " + key + " " + t.getMessage()); }
             return false;
         }
     }
@@ -3411,7 +3564,7 @@ public class WeiboLiteHook {
             syncTargetIntSetting(key, days);
         }
         rememberModuleIntSetting(key, days);
-        log("Module settings reloaded cacheDays=" + days);
+        { if (Diagnostics.shouldLog("Module settings reloaded cacheDays=")) log("Module settings reloaded cacheDays=" + days); }
     }
 
     private static boolean rememberModuleIntSetting(String key, int value) {
@@ -3423,7 +3576,7 @@ public class WeiboLiteHook {
         if (changed || firstConfirmation) {
             sTimelinePreloadDone = null;
             sTimelinePreloadDoneCacheDays = -1;
-            log("Timeline cache-days setting confirmed value=" + value);
+            { if (Diagnostics.shouldLog("Timeline cache-days setting confirmed value=")) log("Timeline cache-days setting confirmed value=" + value); }
         }
         return changed || firstConfirmation;
     }
@@ -3478,9 +3631,9 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            log("Timeline top-bar double-tap hook installed");
+            { if (Diagnostics.shouldLog("Timeline top-bar double-tap hook installed")) log("Timeline top-bar double-tap hook installed"); }
         } catch (Throwable t) {
-            log("Timeline top-bar double-tap hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline top-bar double-tap hook error: ")) log("Timeline top-bar double-tap hook error: " + t.getMessage()); }
         }
     }
 
@@ -3515,7 +3668,7 @@ public class WeiboLiteHook {
                 }
             }
         } catch (Throwable t) {
-            log("Timeline top-bar double-tap error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline top-bar double-tap error: ")) log("Timeline top-bar double-tap error: " + t.getMessage()); }
         }
     }
 
@@ -3548,11 +3701,11 @@ public class WeiboLiteHook {
                 sHomeTabLastTapAtMs = 0L;
                 if (!captureTimelineRefreshAnchorFromPendingHomeTab("home-tab-double-tap")
                     && !captureTimelineRefreshAnchorForKnownRecyclerViews(sLastTimelinePresenter, "home-tab-double-tap")) {
-                    log("Timeline refresh anchor capture skipped source=home-tab-double-tap");
+                    { if (Diagnostics.shouldLog("Timeline refresh anchor capture skipped source=home-tab-double-tap")) log("Timeline refresh anchor capture skipped source=home-tab-double-tap"); }
                 }
             }
         } catch (Throwable t) {
-            log("Timeline home-tab double-tap error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline home-tab double-tap error: ")) log("Timeline home-tab double-tap error: " + t.getMessage()); }
         }
     }
 
@@ -3642,13 +3795,16 @@ public class WeiboLiteHook {
                 }
             );
 
-            log("Timeline stale video-open hook installed");
+            { if (Diagnostics.shouldLog("Timeline stale video-open hook installed")) log("Timeline stale video-open hook installed"); }
         } catch (Throwable t) {
-            log("Timeline stale video-open hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline stale video-open hook error: ")) log("Timeline stale video-open hook error: " + t.getMessage()); }
         }
     }
 
     private static boolean redirectStaleVideoOpen(Object opener, Object[] args, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("video", "redirectStaleVideoOpen");
+        Throwable diagnosticError = null;
+        try {
         if (!feature(ModuleSettings.KEY_WEICO_VIDEO_REFRESH)) return false;
         try {
             if (opener == null || args == null || args.length < 3) return false;
@@ -3675,28 +3831,31 @@ public class WeiboLiteHook {
 
             markVideoOpenRefreshBypass(statusId);
             XposedHelpers.callMethod(opener, "openWeiboVideo", context, Long.valueOf(statusId));
-            log("Timeline stale video url refreshed source=" + source
+            { if (Diagnostics.shouldLog("Timeline stale video url refreshed source=")) log("Timeline stale video url refreshed source=" + source
                 + " id=" + statusId
                 + " url=" + describeVideoUrlState(url)
-                + " playUrl=" + describeVideoUrlState(playUrl));
+                + " playUrl=" + describeVideoUrlState(playUrl)); }
             return true;
         } catch (Throwable t) {
-            log("Timeline stale video url refresh error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline stale video url refresh error source=")) log("Timeline stale video url refresh error source=" + source + ": " + t.getMessage()); }
             return false;
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static boolean replaceVideoInfoUrl(Object videoInfo, String playUrl, String source, long statusId) {
         try {
             XposedHelpers.callMethod(videoInfo, "setUrl", playUrl);
-            log("Timeline video url replaced source=" + source + " id=" + statusId
-                + " playUrl=" + describeVideoUrlState(playUrl));
+            { if (Diagnostics.shouldLog("Timeline video url replaced source=")) log("Timeline video url replaced source=" + source + " id=" + statusId
+                + " playUrl=" + describeVideoUrlState(playUrl)); }
             return true;
         } catch (Throwable ignored) {}
         try {
             setFieldValue(videoInfo, "url", playUrl);
-            log("Timeline video url field replaced source=" + source + " id=" + statusId
-                + " playUrl=" + describeVideoUrlState(playUrl));
+            { if (Diagnostics.shouldLog("Timeline video url field replaced source=")) log("Timeline video url field replaced source=" + source + " id=" + statusId
+                + " playUrl=" + describeVideoUrlState(playUrl)); }
             return true;
         } catch (Throwable ignored) {
             return false;
@@ -3802,17 +3961,20 @@ public class WeiboLiteHook {
                 "androidx.swiperefreshlayout.widget.SwipeRefreshLayout",
                 cl,
                 "isRefreshing",
-                new XC_MethodReplacement() {
-                    @Override
-                    protected Object replaceHookedMethod(MethodHookParam param) {
-                        return false;
-                    }
-                }
+                pullRefreshStateHook()
             );
-            log("SwipeRefreshLayout pull-refresh disabled");
+            { if (Diagnostics.shouldLog("SwipeRefreshLayout pull-refresh disabled")) log("SwipeRefreshLayout pull-refresh disabled"); }
         } catch (Throwable t) {
-            log("SwipeRefreshLayout pull-refresh hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("SwipeRefreshLayout pull-refresh hook error: ")) log("SwipeRefreshLayout pull-refresh hook error: " + t.getMessage()); }
         }
+    }
+
+    static XC_MethodHook pullRefreshStateHook() {
+        return new FeatureHook(ModuleSettings.KEY_WEICO_DISABLE_PULL_REFRESH) {
+            @Override protected void beforeEnabled(MethodHookParam param) {
+                param.setResult(false);
+            }
+        };
     }
 
     private static void forceTimelineLayoutDirection(ClassLoader cl) {
@@ -3834,7 +3996,7 @@ public class WeiboLiteHook {
                     protected void afterEnabled(final MethodHookParam param) {
                         final Object recyclerView = param.thisObject;
                         final Object layoutManager = param.args[0];
-                        HotReloadRuntime.postDelayed(new Runnable() {
+                        postTimelineViewInitialization(recyclerView, new Runnable() {
                             @Override
                             public void run() {
                                 if (fixTimelineLayoutDirection(recyclerView, layoutManager)) {
@@ -3859,7 +4021,7 @@ public class WeiboLiteHook {
                     @Override
                     protected void afterEnabled(final MethodHookParam param) {
                         final Object recyclerView = param.thisObject;
-                        HotReloadRuntime.postDelayed(new Runnable() {
+                        postTimelineViewInitialization(recyclerView, new Runnable() {
                             @Override
                             public void run() {
                                 try {
@@ -3870,7 +4032,7 @@ public class WeiboLiteHook {
                                         }
                                     }
                                 } catch (Throwable t) {
-                                    log("Timeline layout adapter fix error: " + t.getMessage());
+                                    { if (Diagnostics.shouldLog("Timeline layout adapter fix error: ")) log("Timeline layout adapter fix error: " + t.getMessage()); }
                                 }
                             }
                         }, 300L);
@@ -3930,7 +4092,7 @@ public class WeiboLiteHook {
                     Object oldTarget = param.args[0];
                     if (oldTarget instanceof Integer && ((Integer) oldTarget).intValue() == target) return;
                     param.args[0] = Integer.valueOf(target);
-                    log("Timeline initial scroll redirected from=" + oldTarget + " to=" + target);
+                    { if (Diagnostics.shouldLog("Timeline initial scroll redirected from=")) log("Timeline initial scroll redirected from=" + oldTarget + " to=" + target); }
                 }
             };
             XposedHelpers.findAndHookMethod(recyclerViewClass, "scrollToPosition", int.class, redirectInitialScroll);
@@ -3972,9 +4134,9 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            log("Timeline layout hook installed");
+            { if (Diagnostics.shouldLog("Timeline layout hook installed")) log("Timeline layout hook installed"); }
         } catch (Throwable t) {
-            log("Timeline layout hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline layout hook error: ")) log("Timeline layout hook error: " + t.getMessage()); }
         }
     }
 
@@ -3991,10 +4153,10 @@ public class WeiboLiteHook {
                 XposedHelpers.callMethod(layoutManager, "setStackFromEnd", false);
             }
             rememberTimelineRecyclerView(recyclerView);
-            log("Timeline layout fixed reverse adapter=" + adapterName);
+            { if (Diagnostics.shouldLog("Timeline layout fixed reverse adapter=")) log("Timeline layout fixed reverse adapter=" + adapterName); }
             return true;
         } catch (Throwable t) {
-            log("Timeline layout fix error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline layout fix error: ")) log("Timeline layout fix error: " + t.getMessage()); }
             return false;
         }
     }
@@ -4016,17 +4178,17 @@ public class WeiboLiteHook {
                     }
                     int incomingCount = param.args != null && param.args.length > 0 && param.args[0] instanceof List
                         ? ((List) param.args[0]).size() : -1;
-                    log("Timeline addData enter source=presenter-addData thread="
+                    { if (Diagnostics.shouldLog("Timeline addData enter source=presenter-addData thread=")) log("Timeline addData enter source=presenter-addData thread="
                         + Thread.currentThread().getName()
                         + " incoming=" + incomingCount
-                        + " cached=" + getTimelineStatusCount(param.thisObject)
-                        + " activity=" + describeTimelinePresenterActivity(param.thisObject));
+                        + " cached=" + getTimelinePresenterRawStatusCount(param.thisObject)
+                        + " activity=" + describeTimelinePresenterActivity(param.thisObject)); }
                     if (hasActiveTimelineGapFill()) {
                         captureTimelineGapFillViewportAnchor("presenter-addData-before");
                     }
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
                         int incoming = param.args[0] instanceof List ? ((List) param.args[0]).size() : -1;
-                        log("Timeline addData suppressed stable-cache incoming=" + incoming);
+                        { if (Diagnostics.shouldLog("Timeline addData suppressed stable-cache incoming=")) log("Timeline addData suppressed stable-cache incoming=" + incoming); }
                         param.setResult(null);
                     }
                 }
@@ -4040,10 +4202,10 @@ public class WeiboLiteHook {
                     }
                     Object started = param.getObjectExtra("reweibo.addData.startedAt");
                     long startedAt = started instanceof Long ? ((Long) started).longValue() : SystemClock.elapsedRealtime();
-                    log("Timeline addData exit source=presenter-addData elapsedMs="
+                    { if (Diagnostics.shouldLog("Timeline addData host-return source=presenter-addData hostPhaseMs=")) log("Timeline addData host-return source=presenter-addData hostPhaseMs="
                         + (SystemClock.elapsedRealtime() - startedAt)
-                        + " cached=" + getTimelineStatusCount(param.thisObject)
-                        + " gap=" + describeTimelineGapFillProbeState());
+                        + " cached=" + getTimelinePresenterRawStatusCount(param.thisObject)
+                        + " gap=" + describeTimelineGapFillProbeState()); }
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
                         if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-addData-suppressed")) {
                             finishTimelineTopAnchorForKnownRecyclerViews("presenter-addData-suppressed");
@@ -4057,7 +4219,7 @@ public class WeiboLiteHook {
                             "presenter-addData-in-flight",
                             false
                         );
-                        log("Timeline addData deferred during cache restore");
+                        { if (Diagnostics.shouldLog("Timeline addData deferred during cache restore")) log("Timeline addData deferred during cache restore"); }
                         return;
                     }
                     List incomingData = null;
@@ -4129,7 +4291,7 @@ public class WeiboLiteHook {
                         return;
                     }
                     if (isTimelineCacheRestoring(param.thisObject)) {
-                        log("Timeline setData observed prepared cache apply");
+                        { if (Diagnostics.shouldLog("Timeline setData observed prepared cache apply")) log("Timeline setData observed prepared cache apply"); }
                         return;
                     }
                     resetPreloadState(param.thisObject, "presenter-setData");
@@ -4171,7 +4333,7 @@ public class WeiboLiteHook {
                             "presenter-distinct-in-flight",
                             false
                         );
-                        log("Timeline distinct deferred during cache restore");
+                        { if (Diagnostics.shouldLog("Timeline distinct deferred during cache restore")) log("Timeline distinct deferred during cache restore"); }
                         return;
                     }
                     if (shouldFreezeTimelineNetworkMutation(param.thisObject)) {
@@ -4194,7 +4356,7 @@ public class WeiboLiteHook {
                         return;
                     }
                     if (shouldSuppressTimelineLoadMore(param.thisObject)) {
-                        log("Timeline loadMore suppressed warmed");
+                        { if (Diagnostics.shouldLog("Timeline loadMore suppressed warmed")) log("Timeline loadMore suppressed warmed"); }
                         param.setResult(null);
                     }
                 }
@@ -4249,9 +4411,9 @@ public class WeiboLiteHook {
                 }
             });
 
-            log("Timeline merge-order hooks installed");
+            { if (Diagnostics.shouldLog("Timeline merge-order hooks installed")) log("Timeline merge-order hooks installed"); }
         } catch (Throwable t) {
-            log("Timeline merge-order hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline merge-order hook error: ")) log("Timeline merge-order hook error: " + t.getMessage()); }
         }
     }
 
@@ -4267,13 +4429,13 @@ public class WeiboLiteHook {
             try {
                 Class<?> lambdaClass = Class.forName(classNames[i], false, cl);
                 XposedHelpers.findAndHookMethod(lambdaClass, "invoke", parameterTypes[i], callback);
-                log(label + " hook installed class=" + classNames[i]
-                    + " invoke(" + parameterTypes[i].getName() + ")");
+                { if (Diagnostics.shouldLog(" hook installed class=")) log(label + " hook installed class=" + classNames[i]
+                    + " invoke(" + parameterTypes[i].getName() + ")"); }
                 return true;
             } catch (ClassNotFoundException ignored) {
                 // Try the next version-specific lambda name.
             } catch (Throwable t) {
-                log(label + " candidate failed class=" + classNames[i] + ": " + t.getMessage());
+                { if (Diagnostics.shouldLog(" candidate failed class=")) log(label + " candidate failed class=" + classNames[i] + ": " + t.getMessage()); }
             }
         }
         return false;
@@ -4321,7 +4483,7 @@ public class WeiboLiteHook {
                     "V2 timeline network hook candidates unavailable",
                     null
                 );
-                log("V2 timeline data-order network hook unavailable");
+                { if (Diagnostics.shouldLog("V2 timeline data-order network hook unavailable")) log("V2 timeline data-order network hook unavailable"); }
             }
 
             XposedHelpers.findAndHookMethod(actionClass, "doLoadCache",
@@ -4336,15 +4498,15 @@ public class WeiboLiteHook {
                             filtered = trimTimelineStatusesToCacheDays(filtered, param.thisObject, "v2-cache");
                             List ordered = ensureNewestFirst(filtered, param.thisObject, "v2-cache", false);
                             param.setResult(ordered);
-                            log("Timeline native cache restored source=v2-cache count=" + countTimelineStatuses(ordered));
+                            { if (Diagnostics.shouldLog("Timeline native cache restored source=v2-cache count=")) log("Timeline native cache restored source=v2-cache count=" + ordered.size()); }
                         }
                     }
                 }
             );
 
-            log("V2 timeline data-order hooks installed");
+            { if (Diagnostics.shouldLog("V2 timeline data-order hooks installed")) log("V2 timeline data-order hooks installed"); }
         } catch (Throwable t) {
-            log("V2 timeline data-order hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("V2 timeline data-order hook error: ")) log("V2 timeline data-order hook error: " + t.getMessage()); }
         }
     }
 
@@ -4367,12 +4529,12 @@ public class WeiboLiteHook {
                         protected void beforeEnabled(MethodHookParam param) {
                             if (!shouldLogTimelineNetworkProbe(param.thisObject)) return;
                             boolean loadNew = param.args[3] instanceof Boolean && (Boolean) param.args[3];
-                            log("Timeline v3 loadHomeTimeline request"
+                            { if (Diagnostics.shouldLog("Timeline v3 loadHomeTimeline request")) log("Timeline v3 loadHomeTimeline request"
                                 + " loadNew=" + loadNew
                                 + " sinId=" + param.args[0]
                                 + " maxId=" + param.args[1]
                                 + " itemTime=" + param.args[2]
-                                + describeTimelineActionState(param.thisObject));
+                                + describeTimelineActionState(param.thisObject)); }
                         }
 
                         @Override
@@ -4381,10 +4543,10 @@ public class WeiboLiteHook {
                             boolean loadNew = param.args[3] instanceof Boolean && (Boolean) param.args[3];
                             Throwable throwable = getHookThrowableSafe(param);
                             if (throwable != null) {
-                                log("Timeline v3 loadHomeTimeline threw"
+                                { if (Diagnostics.shouldLog("Timeline v3 loadHomeTimeline threw")) log("Timeline v3 loadHomeTimeline threw"
                                     + " loadNew=" + loadNew
                                     + describeTimelineActionState(param.thisObject)
-                                    + " error=" + describeThrowableForLog(throwable));
+                                    + " error=" + describeThrowableForLog(throwable)); }
                                 return;
                             }
                             Object result = param.getResult();
@@ -4397,7 +4559,7 @@ public class WeiboLiteHook {
                     }
                 );
             } catch (Throwable t) {
-                log("V3 timeline loadHomeTimeline probe hook error: " + t.getMessage());
+                { if (Diagnostics.shouldLog("V3 timeline loadHomeTimeline probe hook error: ")) log("V3 timeline loadHomeTimeline probe hook error: " + t.getMessage()); }
             }
 
             try {
@@ -4407,9 +4569,9 @@ public class WeiboLiteHook {
                         protected void beforeEnabled(MethodHookParam param) {
                             if (!shouldLogTimelineNetworkProbe(param.thisObject)) return;
                             boolean loadNew = param.args[0] instanceof Boolean && (Boolean) param.args[0];
-                            log("Timeline v3 doLoadData request"
+                            { if (Diagnostics.shouldLog("Timeline v3 doLoadData request")) log("Timeline v3 doLoadData request"
                                 + " loadNew=" + loadNew
-                                + describeTimelineActionState(param.thisObject));
+                                + describeTimelineActionState(param.thisObject)); }
                         }
 
                         @Override
@@ -4418,10 +4580,10 @@ public class WeiboLiteHook {
                             boolean loadNew = param.args[0] instanceof Boolean && (Boolean) param.args[0];
                             Throwable throwable = getHookThrowableSafe(param);
                             if (throwable != null) {
-                                log("Timeline v3 doLoadData threw"
+                                { if (Diagnostics.shouldLog("Timeline v3 doLoadData threw")) log("Timeline v3 doLoadData threw"
                                     + " loadNew=" + loadNew
                                     + describeTimelineActionState(param.thisObject)
-                                    + " error=" + describeThrowableForLog(throwable));
+                                    + " error=" + describeThrowableForLog(throwable)); }
                                 return;
                             }
                             Object result = param.getResult();
@@ -4434,7 +4596,7 @@ public class WeiboLiteHook {
                     }
                 );
             } catch (Throwable t) {
-                log("V3 timeline doLoadData probe hook error: " + t.getMessage());
+                { if (Diagnostics.shouldLog("V3 timeline doLoadData probe hook error: ")) log("V3 timeline doLoadData probe hook error: " + t.getMessage()); }
             }
 
             XC_MethodHook networkHook = new FeatureHook(ModuleSettings.KEY_WEICO_TIMELINE_CACHE, ModuleSettings.KEY_WEICO_FEED_REVERSE, ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL, ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER, ModuleSettings.KEY_WEICO_STATUS_HYDRATION, ModuleSettings.KEY_WEICO_PERSISTENT_LOGS) {
@@ -4468,7 +4630,7 @@ public class WeiboLiteHook {
                     "V3 timeline network hook candidates unavailable",
                     null
                 );
-                log("V3 timeline data-order network hook unavailable");
+                { if (Diagnostics.shouldLog("V3 timeline data-order network hook unavailable")) log("V3 timeline data-order network hook unavailable"); }
             }
 
             XposedHelpers.findAndHookMethod(actionClass, "doLoadCache",
@@ -4487,9 +4649,9 @@ public class WeiboLiteHook {
                 }
             );
 
-            log("V3 timeline data-order hooks installed");
+            { if (Diagnostics.shouldLog("V3 timeline data-order hooks installed")) log("V3 timeline data-order hooks installed"); }
         } catch (Throwable t) {
-            log("V3 timeline data-order hook error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("V3 timeline data-order hook error: ")) log("V3 timeline data-order hook error: " + t.getMessage()); }
         }
     }
 
@@ -4505,7 +4667,11 @@ public class WeiboLiteHook {
             return observable;
         }
         try {
+            if (!ensureTimelineAccount(action, true)) return observable;
+            final TimelineAccountFiles requestAccount = timelineAccount();
             final int probeId = nextTimelineNetworkProbeSeq();
+            final long diagnosticParent = Diagnostics.context();
+            final long diagnosticRequestedAt = System.nanoTime();
             final boolean[] seenNext = new boolean[]{false};
             final AtomicInteger activeSubscriptions = new AtomicInteger();
             Class<?> consumerClass = Class.forName("io.reactivex.functions.Consumer", false, cl);
@@ -4517,19 +4683,23 @@ public class WeiboLiteHook {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+                        Long previousDiagnostic = Diagnostics.enter(diagnosticParent);
+                        try {
                         if (isObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnSubscribe")) {
                             return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnSubscribe");
                         }
                         if ("accept".equals(method.getName())) {
                             activeSubscriptions.incrementAndGet();
                             sActiveTimelineObservableSubscriptions.incrementAndGet();
-                            log("Timeline v3 observable subscribe"
+                            { if (Diagnostics.shouldLog("Timeline v3 observable subscribe")) log("Timeline v3 observable subscribe"
                                 + " probe=" + probeId
                                 + " source=" + source
                                 + " loadNew=" + loadNew
-                                + describeTimelineActionState(action));
+                                + describeTimelineActionState(action)); }
                         }
                         return null;
+
+                        } finally { Diagnostics.leave(previousDiagnostic); }
                     }
                 }
             );
@@ -4541,26 +4711,34 @@ public class WeiboLiteHook {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+                        Long previousDiagnostic = Diagnostics.enter(diagnosticParent);
+                        try {
                         if (isObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnNext")) {
                             return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnNext");
                         }
                         if ("accept".equals(method.getName())) {
+                            if (requestAccount != sTimelineAccount
+                                || !isTimelineRequestAccountCurrent(requestAccount, cl)) return null;
+                            Diagnostics.network(diagnosticParent, source, probeId, "response", diagnosticRequestedAt, null);
                             seenNext[0] = true;
                             Object value = args != null && args.length > 0 ? args[0] : null;
-                            if (!loadNew && isTimelineEmptyNetworkValue(value, feedResultValues)) {
+                            if (!loadNew && hasActiveTimelineGapFill() && isTimelineEmptyNetworkValue(value, feedResultValues)) {
                                 recordTimelineGapFillEmptyResponse(source);
                             }
-                            if (!loadNew && isTimelineServerTerminalFeedResult(value, feedResultValues)) {
+                            if (!loadNew && feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)
+                                    && isTimelineServerTerminalFeedResult(value, feedResultValues)) {
                                 deferTimelineNoMoreContent(source + "-server-no-more-feedresult");
                             }
-                            log("Timeline v3 observable next"
+                            { if (Diagnostics.shouldLog("Timeline v3 observable next")) log("Timeline v3 observable next"
                                 + " probe=" + probeId
                                 + " source=" + source
                                 + " loadNew=" + loadNew
                                 + " value=" + describeTimelineObservableValue(value, feedResultValues)
-                                + describeTimelineActionState(action));
+                                + describeTimelineActionState(action)); }
                         }
                         return null;
+
+                        } finally { Diagnostics.leave(previousDiagnostic); }
                     }
                 }
             );
@@ -4572,25 +4750,32 @@ public class WeiboLiteHook {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+                        Long previousDiagnostic = Diagnostics.enter(diagnosticParent);
+                        try {
                         if (isObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnError")) {
                             return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnError");
                         }
                         if ("accept".equals(method.getName())) {
+                            if (requestAccount != sTimelineAccount
+                                || !isTimelineRequestAccountCurrent(requestAccount, cl)) return null;
                             Throwable throwable = args != null && args.length > 0 && args[0] instanceof Throwable
                                 ? (Throwable) args[0]
                                 : null;
+                            Diagnostics.network(diagnosticParent, source, probeId, "error", diagnosticRequestedAt, throwable);
                             if (!loadNew) {
                                 recordTimelineGapFillErrorResponse(source, throwable);
                             }
-                            log("Timeline v3 observable error"
+                            { if (Diagnostics.shouldLog("Timeline v3 observable error")) log("Timeline v3 observable error"
                                 + " probe=" + probeId
                                 + " source=" + source
                                 + " loadNew=" + loadNew
                                 + " seenNext=" + seenNext[0]
                                 + " error=" + describeThrowableForLog(throwable)
-                                + describeTimelineActionState(action));
+                                + describeTimelineActionState(action)); }
                         }
                         return null;
+
+                        } finally { Diagnostics.leave(previousDiagnostic); }
                     }
                 }
             );
@@ -4603,21 +4788,28 @@ public class WeiboLiteHook {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+                        Long previousDiagnostic = Diagnostics.enter(diagnosticParent);
+                        try {
                         if (isObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnComplete")) {
                             return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnComplete");
                         }
                         if ("run".equals(method.getName())) {
+                            if (requestAccount != sTimelineAccount
+                                || !isTimelineRequestAccountCurrent(requestAccount, cl)) return null;
+                            Diagnostics.network(diagnosticParent, source, probeId, "complete", diagnosticRequestedAt, null);
                             if (!loadNew && !seenNext[0] && isTimelineActionNoMoreCursor(action)) {
                                 markTimelineNoMoreContent(source + "-server-no-more-cursor");
                             }
-                            log("Timeline v3 observable complete"
+                            { if (Diagnostics.shouldLog("Timeline v3 observable complete")) log("Timeline v3 observable complete"
                                 + " probe=" + probeId
                                 + " source=" + source
                                 + " loadNew=" + loadNew
                                 + " seenNext=" + seenNext[0]
-                                + describeTimelineActionState(action));
+                                + describeTimelineActionState(action)); }
                         }
                         return null;
+
+                        } finally { Diagnostics.leave(previousDiagnostic); }
                     }
                 }
             );
@@ -4629,6 +4821,8 @@ public class WeiboLiteHook {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+                        Long previousDiagnostic = Diagnostics.enter(diagnosticParent);
+                        try {
                         if (isObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnFinally")) {
                             return handleObjectProxyMethod(proxy, method, args, "ReWeiboTimelineOnFinally");
                         }
@@ -4636,6 +4830,8 @@ public class WeiboLiteHook {
                             finishTimelineObservableSubscription(activeSubscriptions);
                         }
                         return null;
+
+                        } finally { Diagnostics.leave(previousDiagnostic); }
                     }
                 }
             );
@@ -4645,12 +4841,20 @@ public class WeiboLiteHook {
             }
             return wrapped;
         } catch (Throwable t) {
-            log("Timeline v3 observable probe wrap error"
+            { if (Diagnostics.shouldLog("Timeline v3 observable probe wrap error")) log("Timeline v3 observable probe wrap error"
                 + " source=" + source
                 + " observable=" + shortClassName(observable)
-                + " error=" + describeThrowableForLog(t));
+                + " error=" + describeThrowableForLog(t)); }
             return observable;
         }
+    }
+
+    private static boolean isTimelineRequestAccountCurrent(TimelineAccountFiles account, ClassLoader cl) {
+        if (account == null) return sTimelineAccount == null;
+        try {
+            Class<?> store = Class.forName("com.weico.international.manager.accounts.AccountsStore", false, cl);
+            return account.userId.equals(String.valueOf(callStaticNoArg(store, "getCurUserId")));
+        } catch (Throwable unavailable) { return false; }
     }
 
     private static boolean shouldLogTimelineNetworkProbe(Object owner) {
@@ -4740,12 +4944,12 @@ public class WeiboLiteHook {
             } else if (typeText.contains("load_more_error")) {
                 recordTimelineGapFillErrorResponse(source + "-" + typeText, null);
             }
-            log("Timeline " + source + " event"
+            { if (Diagnostics.shouldLog("Timeline ")) log("Timeline " + source + " event"
                 + " type=" + compactLogValue(type)
                 + " data=" + describeTimelineObservableValue(data, false)
-                + describeTimelineActionState(presenter));
+                + describeTimelineActionState(presenter)); }
         } catch (Throwable t) {
-            log("Timeline showData event probe error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline showData event probe error: ")) log("Timeline showData event probe error: " + t.getMessage()); }
         }
     }
 
@@ -4764,23 +4968,8 @@ public class WeiboLiteHook {
     }
 
     private static String describeTimelineFeedResult(Object feedResult) {
-        if (feedResult == null) return "FeedResult(null)";
         Object items = callMethodSafe(feedResult, "getItems");
-        Object allStatus = callMethodSafe(feedResult, "getAllStatus");
-        int allStatusCount = objectItemCount(allStatus);
-        int validStatusCount = allStatus instanceof List ? countTimelineStatuses((List) allStatus) : allStatusCount;
-        Object moreInfo = callMethodSafe(feedResult, "getMoreInfo");
-        Object refreshInfo = callMethodSafe(feedResult, "getRefreshInfo");
-        Object loadedInfo = callMethodSafe(feedResult, "getLoadedInfo");
-        Object pageData = callMethodSafe(feedResult, "getPageData");
-        return "FeedResult(items=" + objectItemCount(items)
-            + ",allStatus=" + allStatusCount
-            + ",validStatus=" + validStatusCount
-            + ",more=" + describeTimelineFeedMoreInfo(moreInfo)
-            + ",refresh=" + describeTimelineFeedParamsHolder(refreshInfo)
-            + ",loaded=" + shortClassName(loadedInfo)
-            + ",pageData=" + shortClassName(pageData)
-            + ")";
+        return "FeedResult(items=" + objectItemCount(items) + ")";
     }
 
     private static String describeTimelineFeedMoreInfo(Object moreInfo) {
@@ -4811,10 +5000,9 @@ public class WeiboLiteHook {
 
     private static String describeTimelineStatusList(List list) {
         if (list == null) return "List(null)";
-        Object first = findComparableStatus(list, true);
-        Object last = findComparableStatus(list, false);
+        Object first = list.isEmpty() ? null : unwrapStatus(list.get(0));
+        Object last = list.isEmpty() ? null : unwrapStatus(list.get(list.size() - 1));
         return "List(size=" + list.size()
-            + ",validStatus=" + countTimelineStatuses(list)
             + ",first=" + getStatusId(first)
             + ",last=" + getStatusId(last)
             + ")";
@@ -4884,9 +5072,9 @@ public class WeiboLiteHook {
             if (state.targetId > 0L && cursor <= state.targetId + 1L) {
                 state.boundaryEmptyProbed = true;
             }
-            log("Timeline gap-fill empty proof sample source=" + source
+            { if (Diagnostics.shouldLog("Timeline gap-fill empty proof sample source=")) log("Timeline gap-fill empty proof sample source=" + source
                 + " cursor=" + cursor
-                + " " + describeTimelineGapFillEmptyProofLocked(state));
+                + " " + describeTimelineGapFillEmptyProofLocked(state)); }
         }
     }
 
@@ -4899,10 +5087,10 @@ public class WeiboLiteHook {
             if (cursor > 0L && cursor == state.lastErrorCursorId) return;
             state.errorResponses++;
             state.lastErrorCursorId = cursor;
-            log("Timeline gap-fill server proof rejected source=" + source
+            { if (Diagnostics.shouldLog("Timeline gap-fill server proof rejected source=")) log("Timeline gap-fill server proof rejected source=" + source
                 + " cursor=" + cursor
                 + " error=" + describeThrowableForLog(throwable)
-                + " " + describeTimelineGapFillEmptyProofLocked(state));
+                + " " + describeTimelineGapFillEmptyProofLocked(state)); }
         }
     }
 
@@ -4982,7 +5170,7 @@ public class WeiboLiteHook {
 
         String groupId = getTimelineGroupId(action);
         if (!"-1".equals(groupId)) {
-            log("Timeline order skipped source=" + source + " group=" + groupId + " size=" + list.size());
+            { if (Diagnostics.shouldLog("Timeline order skipped source=")) log("Timeline order skipped source=" + source + " group=" + groupId + " size=" + list.size()); }
             return list;
         }
 
@@ -4991,32 +5179,35 @@ public class WeiboLiteHook {
         long firstId = getStatusId(first);
         long lastId = getStatusId(last);
         if (firstId <= 0 || lastId <= 0 || firstId == lastId) {
-            log("Timeline order unknown source=" + source + " group=" + groupId + " size=" + list.size()
-                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew);
+            { if (Diagnostics.shouldLog("Timeline order unknown source=")) log("Timeline order unknown source=" + source + " group=" + groupId + " size=" + list.size()
+                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew); }
             return list;
         }
 
         if (firstId > lastId) {
-            log("Timeline order kept source=" + source + " group=" + groupId + " size=" + list.size()
-                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew);
+            { if (Diagnostics.shouldLog("Timeline order kept source=")) log("Timeline order kept source=" + source + " group=" + groupId + " size=" + list.size()
+                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew); }
             return list;
         }
 
         try {
             Collections.reverse(list);
-            log("Timeline order reversed source=" + source + " group=" + groupId + " size=" + list.size()
-                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew);
+            { if (Diagnostics.shouldLog("Timeline order reversed source=")) log("Timeline order reversed source=" + source + " group=" + groupId + " size=" + list.size()
+                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew); }
             return list;
         } catch (Throwable t) {
             java.util.ArrayList copy = new java.util.ArrayList(list);
             Collections.reverse(copy);
-            log("Timeline order copied+reversed source=" + source + " group=" + groupId + " size=" + list.size()
-                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew);
+            { if (Diagnostics.shouldLog("Timeline order copied+reversed source=")) log("Timeline order copied+reversed source=" + source + " group=" + groupId + " size=" + list.size()
+                + " first=" + firstId + " last=" + lastId + " loadNew=" + loadNew); }
             return copy;
         }
     }
 
     private static void normalizePresenterTimeline(Object presenter, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("timeline", "normalizePresenterTimeline");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE) || feature(ModuleSettings.KEY_WEICO_FEED_REVERSE) || feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return;
         try {
             Object statusList = XposedHelpers.callMethod(presenter, "getStatusList");
@@ -5033,12 +5224,15 @@ public class WeiboLiteHook {
                 if (filtered != statusList || sorted != filtered) {
                     Object delegate = getFieldValue(presenter, "statusPresenterDelegate");
                     XposedHelpers.callMethod(delegate, "setData", sorted);
-                    log("Presenter timeline replaced sorted copy source=" + source + " size=" + sorted.size());
+                    { if (Diagnostics.shouldLog("Presenter timeline replaced sorted copy source=")) log("Presenter timeline replaced sorted copy source=" + source + " size=" + sorted.size()); }
                 }
             }
         } catch (Throwable t) {
-            log("Presenter timeline normalize error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Presenter timeline normalize error source=")) log("Presenter timeline normalize error source=" + source + ": " + t.getMessage()); }
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static void normalizeShowDataEvent(Object fragment, Object event) {
@@ -5073,7 +5267,7 @@ public class WeiboLiteHook {
                 }
             }
         } catch (Throwable t) {
-            log("ShowData timeline normalize error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("ShowData timeline normalize error: ")) log("ShowData timeline normalize error: " + t.getMessage()); }
         }
     }
 
@@ -5087,12 +5281,12 @@ public class WeiboLiteHook {
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) {
-                log("Timeline full cache persist skipped during manual clear source=" + source);
+                { if (Diagnostics.shouldLog("Timeline full cache persist skipped during manual clear source=")) log("Timeline full cache persist skipped during manual clear source=" + source); }
                 return;
             }
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             if (isTimelineCacheRestoreInFlight(presenter)) {
-                log("Timeline full cache persist deferred source=" + source + " restore-in-flight");
+                { if (Diagnostics.shouldLog("Timeline full cache persist deferred source=")) log("Timeline full cache persist deferred source=" + source + " restore-in-flight"); }
                 return;
             }
             rememberTimelinePresenter(presenter);
@@ -5112,7 +5306,7 @@ public class WeiboLiteHook {
             statuses = new ArrayList(sortTimelineNewestFirst(statuses, presenter, source + "-checkpoint", false));
             persistTimelineNativeCacheList(presenter, statuses, source, false);
         } catch (Throwable t) {
-            log("Timeline full cache persist error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline full cache persist error source=")) log("Timeline full cache persist error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -5121,12 +5315,12 @@ public class WeiboLiteHook {
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (sTimelineCacheClearInFlight) {
-                log("Timeline full cache list persist skipped during manual clear source=" + source);
+                { if (Diagnostics.shouldLog("Timeline full cache list persist skipped during manual clear source=")) log("Timeline full cache list persist skipped during manual clear source=" + source); }
                 return false;
             }
             if (presenter == null || list == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
             if (!force && isTimelineCacheRestoreInFlight(presenter)) {
-                log("Timeline full cache persist deferred source=" + source + " restore-in-flight");
+                { if (Diagnostics.shouldLog("Timeline full cache persist deferred source=")) log("Timeline full cache persist deferred source=" + source + " restore-in-flight"); }
                 return false;
             }
             rememberTimelinePresenter(presenter);
@@ -5157,7 +5351,7 @@ public class WeiboLiteHook {
 
             Object action = getTimelineAction(presenter);
             if (action == null) {
-                log("Timeline native cache persist skipped source=" + source + " count=" + count + " no action");
+                { if (Diagnostics.shouldLog("Timeline native cache persist skipped source=")) log("Timeline native cache persist skipped source=" + source + " count=" + count + " no action"); }
                 return false;
             }
 
@@ -5177,11 +5371,11 @@ public class WeiboLiteHook {
                 force,
                 buildTimelineCacheStats(statuses)
             ));
-            log("Timeline full cache queued source=" + source + " count=" + count
-                + " maxId=" + maxId + " force=" + force);
+            { if (Diagnostics.shouldLog("Timeline full cache queued source=")) log("Timeline full cache queued source=" + source + " count=" + count
+                + " maxId=" + maxId + " force=" + force); }
             return true;
         } catch (Throwable t) {
-            log("Timeline full cache persist error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline full cache persist error source=")) log("Timeline full cache persist error source=" + source + ": " + t.getMessage()); }
             return false;
         }
     }
@@ -5207,7 +5401,7 @@ public class WeiboLiteHook {
     ) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (sTimelineCacheClearInFlight) {
-            log("Timeline shadow cache persist skipped during manual clear source=" + source);
+            { if (Diagnostics.shouldLog("Timeline shadow cache persist skipped during manual clear source=")) log("Timeline shadow cache persist skipped during manual clear source=" + source); }
             return;
         }
         enqueueTimelineShadowCachePersist(new TimelineShadowPersistRequest(
@@ -5227,6 +5421,9 @@ public class WeiboLiteHook {
         TimelineCacheStats candidateStats,
         File expectedNativeFile
     ) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("cache", "persistTimelineShadowCacheNow");
+        Throwable diagnosticError = null;
+        try {
         try {
             if (!force) {
                 if (candidateStats != null) {
@@ -5234,11 +5431,11 @@ public class WeiboLiteHook {
                 } else if (!shouldRememberPreloadDone(source, 0, count)) return;
             }
 
-            int previousCount = Math.max(sTimelineShadowCacheCount, readTimelineShadowCacheCount());
+            int previousCount = Math.max(timelineAccount().shadowCount, readTimelineShadowCacheCount());
             int cacheDays = getTimelineCacheDaysSetting();
             if (previousCount >= TIMELINE_CACHE_MIN_ITEMS && !sTimelineCacheDaysSettingConfirmed) {
-                log("Timeline shadow cache persist skipped until setting is confirmed source=" + source
-                    + " count=" + count + " previous=" + previousCount);
+                { if (Diagnostics.shouldLog("Timeline shadow cache persist skipped until setting is confirmed source=")) log("Timeline shadow cache persist skipped until setting is confirmed source=" + source
+                    + " count=" + count + " previous=" + previousCount); }
                 return;
             }
             long previousOldestMs = readTimelineShadowCacheOldestMs();
@@ -5254,13 +5451,13 @@ public class WeiboLiteHook {
                 candidateNewestMs,
                 timelineCacheCutoffMs(System.currentTimeMillis(), cacheDays)
             )) {
-                log("Timeline shadow cache persist skipped older source=" + source
+                { if (Diagnostics.shouldLog("Timeline shadow cache persist skipped older source=")) log("Timeline shadow cache persist skipped older source=" + source
                     + " count=" + count + " previous=" + previousCount
                     + " oldestMs=" + candidateOldestMs
                     + " previousOldestMs=" + previousOldestMs
                     + " newestMs=" + candidateNewestMs
                     + " previousNewestMs=" + previousNewestMs
-                    + " force=" + force);
+                    + " force=" + force); }
                 return;
             }
 
@@ -5269,7 +5466,7 @@ public class WeiboLiteHook {
                 nativeFile = findTimelineNativeCacheFile();
             }
             if (nativeFile == null || !nativeFile.exists()) {
-                log("Timeline shadow cache persist skipped source=" + source + " count=" + count + " no native file");
+                { if (Diagnostics.shouldLog("Timeline shadow cache persist skipped source=")) log("Timeline shadow cache persist skipped source=" + source + " count=" + count + " no native file"); }
                 return;
             }
 
@@ -5282,11 +5479,11 @@ public class WeiboLiteHook {
                 count,
                 nativeFile.length()
             )) {
-                log("Timeline shadow cache persist skipped incomplete source=" + source
+                { if (Diagnostics.shouldLog("Timeline shadow cache persist skipped incomplete source=")) log("Timeline shadow cache persist skipped incomplete source=" + source
                     + " count=" + count
                     + " nativeSize=" + nativeFile.length()
                     + " previousCount=" + previousCount
-                    + " previousSize=" + previousSize);
+                    + " previousSize=" + previousSize); }
                 return;
             }
             File parent = shadow.getParentFile();
@@ -5300,33 +5497,37 @@ public class WeiboLiteHook {
                 shadow.length(),
                 candidateStats
             );
-            sTimelineShadowCacheCount = count;
-            log("Timeline shadow cache persisted source=" + source + " count=" + count
+            timelineAccount().shadowCount = count;
+            { if (Diagnostics.shouldLog("Timeline shadow cache persisted source=")) log("Timeline shadow cache persisted source=" + source + " count=" + count
                 + " newestMs=" + candidateNewestMs
-                + " file=" + nativeFile.getName() + " size=" + shadow.length());
+                + " file=" + nativeFile.getName() + " size=" + shadow.length()); }
         } catch (Throwable t) {
-            log("Timeline shadow cache persist error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline shadow cache persist error source=")) log("Timeline shadow cache persist error source=" + source + ": " + t.getMessage()); }
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static void enqueueTimelineNativeCachePersist(TimelineNativePersistRequest request) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
-        if (request == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
+        if (request == null || request.account != sTimelineAccount || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         if (sTimelineCacheClearInFlight) {
-            log("Timeline native cache enqueue skipped during manual clear source=" + request.source);
+            { if (Diagnostics.shouldLog("Timeline native cache enqueue skipped during manual clear source=")) log("Timeline native cache enqueue skipped during manual clear source=" + request.source); }
             return;
         }
         synchronized (sTimelinePersistQueueLock) {
+            if (request.account != sTimelineAccount) return;
             if (!shouldAcceptTimelinePersistEnqueue(
                 sHotReloadPreparing,
                 HotReloadRuntime.isAccepting()
             )) return;
             sTimelineCompletionGeneration.incrementAndGet();
             if (sPendingTimelineNativePersist != null) {
-                log("Timeline native cache write coalesced old=" + sPendingTimelineNativePersist.source
+                { if (Diagnostics.shouldLog("Timeline native cache write coalesced old=")) log("Timeline native cache write coalesced old=" + sPendingTimelineNativePersist.source
                     + " new=" + request.source
                     + " oldCount=" + sPendingTimelineNativePersist.count
-                    + " newCount=" + request.count);
+                    + " newCount=" + request.count); }
             }
             sPendingTimelineNativePersist = request;
             sPendingTimelineShadowPersist = null;
@@ -5336,12 +5537,13 @@ public class WeiboLiteHook {
 
     private static void enqueueTimelineShadowCachePersist(TimelineShadowPersistRequest request) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
-        if (request == null || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
+        if (request == null || request.account != sTimelineAccount || sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
         if (sTimelineCacheClearInFlight) {
-            log("Timeline shadow cache enqueue skipped during manual clear source=" + request.source);
+            { if (Diagnostics.shouldLog("Timeline shadow cache enqueue skipped during manual clear source=")) log("Timeline shadow cache enqueue skipped during manual clear source=" + request.source); }
             return;
         }
         synchronized (sTimelinePersistQueueLock) {
+            if (request.account != sTimelineAccount) return;
             if (!shouldAcceptTimelinePersistEnqueue(
                 sHotReloadPreparing,
                 HotReloadRuntime.isAccepting()
@@ -5382,29 +5584,29 @@ public class WeiboLiteHook {
             }
 
             if (nativeRequest != null) {
-                persistTimelineNativeCacheNow(nativeRequest);
+                final TimelineNativePersistRequest request = nativeRequest;
+                runTimelineTask(request.account, () -> persistTimelineNativeCacheNow(request));
             } else {
-                persistTimelineShadowCacheNow(
-                    shadowRequest.source,
-                    shadowRequest.count,
-                    shadowRequest.maxId,
-                    shadowRequest.force,
-                    shadowRequest.stats,
-                    null
-                );
+                final TimelineShadowPersistRequest request = shadowRequest;
+                runTimelineTask(request.account, () -> persistTimelineShadowCacheNow(
+                    request.source, request.count, request.maxId, request.force, request.stats,
+                    request.account == null ? null : request.account.nativeFile));
             }
         }
     }
 
     private static void persistTimelineNativeCacheNow(TimelineNativePersistRequest request) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("cache", "persistTimelineNativeCacheNow");
+        Throwable diagnosticError = null;
+        try {
         try {
             if (request.presenter != null
                 && shouldDeferTimelinePersist(
                     request.force,
                     isTimelineCacheRestoreInFlight(request.presenter)
                 )) {
-                log("Timeline queued cache persist dropped source=" + request.source
-                    + " restore-in-flight");
+                { if (Diagnostics.shouldLog("Timeline queued cache persist dropped source=")) log("Timeline queued cache persist dropped source=" + request.source
+                    + " restore-in-flight"); }
                 return;
             }
             writeTimelineNativeCacheStreaming(request.result, request.gson, request.nativeFile);
@@ -5413,8 +5615,8 @@ public class WeiboLiteHook {
                 newerWritePending = sPendingTimelineNativePersist != null;
             }
             if (newerWritePending) {
-                log("Timeline shadow cache write coalesced source=" + request.source
-                    + " count=" + request.count);
+                { if (Diagnostics.shouldLog("Timeline shadow cache write coalesced source=")) log("Timeline shadow cache write coalesced source=" + request.source
+                    + " count=" + request.count); }
             } else {
                 persistTimelineShadowCacheNow(
                     request.source,
@@ -5425,20 +5627,23 @@ public class WeiboLiteHook {
                     request.nativeFile
                 );
             }
-            if (request.presenter != null) {
+            if (request.presenter != null && request.account == sTimelineAccount) {
                 synchronized (sPersistedTimelineCacheCounts) {
                     sPersistedTimelineCacheCounts.put(request.presenter, Integer.valueOf(request.count));
                     sPersistedTimelineCacheNewestIds.put(request.presenter, Long.valueOf(request.newestId));
                 }
             }
-            log("Timeline full cache persisted source=" + request.source
+            { if (Diagnostics.shouldLog("Timeline full cache persisted source=")) log("Timeline full cache persisted source=" + request.source
                 + " count=" + request.count
                 + " maxId=" + request.maxId
                 + " force=" + request.force
-                + " streaming=true");
+                + " streaming=true"); }
         } catch (Throwable t) {
-            log("Timeline full cache persist error source=" + request.source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline full cache persist error source=")) log("Timeline full cache persist error source=" + request.source + ": " + t.getMessage()); }
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static int readTimelineShadowCacheCount() {
@@ -5543,13 +5748,13 @@ public class WeiboLiteHook {
 
             Object cached = XposedHelpers.callMethod(cache, "get", builder);
             if (cached != null) {
-                log("Timeline shadow cache restored source=" + source + " file=" + fileName
-                    + " size=" + shadow.length());
+                { if (Diagnostics.shouldLog("Timeline shadow cache restored source=")) log("Timeline shadow cache restored source=" + source + " file=" + fileName
+                    + " size=" + shadow.length()); }
                 return cached;
             }
-            log("Timeline shadow cache restored file but DiskCache missed source=" + source + " file=" + fileName);
+            { if (Diagnostics.shouldLog("Timeline shadow cache restored file but DiskCache missed source=")) log("Timeline shadow cache restored file but DiskCache missed source=" + source + " file=" + fileName); }
         } catch (Throwable t) {
-            log("Timeline shadow cache restore error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline shadow cache restore error source=")) log("Timeline shadow cache restore error source=" + source + ": " + t.getMessage()); }
         } finally {
             if (backup != null && backup.exists()) {
                 String name = backup.getName();
@@ -5559,11 +5764,11 @@ public class WeiboLiteHook {
                     copyFile(backup, new File(backup.getParentFile(), nativeName));
                     restored = true;
                 } catch (Throwable restoreError) {
-                    log("Timeline native cache backup restore error source=" + source
-                        + ": " + restoreError.getMessage());
+                    { if (Diagnostics.shouldLog("Timeline native cache backup restore error source=")) log("Timeline native cache backup restore error source=" + source
+                        + ": " + restoreError.getMessage()); }
                 }
                 if (restored && !backup.delete()) {
-                    log("Timeline native cache backup cleanup deferred source=" + source);
+                    { if (Diagnostics.shouldLog("Timeline native cache backup cleanup deferred source=")) log("Timeline native cache backup cleanup deferred source=" + source); }
                 }
             }
         }
@@ -5571,9 +5776,10 @@ public class WeiboLiteHook {
     }
 
     private static void restoreInterruptedTimelineNativeCacheBackups() {
-        File dir = getTimelineDataCacheDir();
-        File[] files = dir.listFiles();
-        if (files == null) return;
+        TimelineAccountFiles account = timelineAccount();
+        if (account == null) return;
+        File dir = account.nativeFile.getParentFile();
+        File[] files = { new File(dir, account.nativeFile.getName() + TIMELINE_NATIVE_CACHE_BACKUP_SUFFIX) };
         for (int i = 0; i < files.length; i++) {
             File backup = files[i];
             if (backup == null || !backup.isFile()
@@ -5585,38 +5791,19 @@ public class WeiboLiteHook {
             try {
                 copyFile(backup, new File(dir, nativeName));
                 if (!backup.delete()) {
-                    log("Timeline interrupted native backup cleanup deferred file=" + name);
+                    { if (Diagnostics.shouldLog("Timeline interrupted native backup cleanup deferred file=")) log("Timeline interrupted native backup cleanup deferred file=" + name); }
                 }
-                log("Timeline interrupted native cache backup restored file=" + nativeName);
+                { if (Diagnostics.shouldLog("Timeline interrupted native cache backup restored file=")) log("Timeline interrupted native cache backup restored file=" + nativeName); }
             } catch (Throwable t) {
-                log("Timeline interrupted native cache backup restore error file=" + name
-                    + ": " + t.getMessage());
+                { if (Diagnostics.shouldLog("Timeline interrupted native cache backup restore error file=")) log("Timeline interrupted native cache backup restore error file=" + name
+                    + ": " + t.getMessage()); }
             }
         }
     }
 
     private static File findTimelineNativeCacheFile() {
-        File dir = getTimelineDataCacheDir();
-        File[] files = dir.listFiles();
-        if (files == null || files.length == 0) return null;
-
-        File best = null;
-        long bestSize = 0L;
-        for (int i = 0; i < files.length; i++) {
-            File file = files[i];
-            if (file == null || !file.isFile()) continue;
-            String name = file.getName();
-            if (name.endsWith(TIMELINE_NATIVE_CACHE_BACKUP_SUFFIX)
-                || name.endsWith(".bak") || name.endsWith(".new")) continue;
-            long length = file.length();
-            if (name == null || !name.endsWith(".txt") || length < 100000L) continue;
-            if (!hasTimelineNativeCacheSignature(file)) continue;
-            if (best == null || length > bestSize || (length == bestSize && file.lastModified() > best.lastModified())) {
-                best = file;
-                bestSize = length;
-            }
-        }
-        return best;
+        TimelineAccountFiles account = timelineAccount();
+        return account == null ? null : account.nativeFile;
     }
 
     private static boolean hasTimelineNativeCacheSignature(File file) {
@@ -5659,7 +5846,7 @@ public class WeiboLiteHook {
             if (maxId != null) content.append("max_id=").append(maxId).append('\n');
             writeTextFileAtomically(file, content.toString());
         } catch (Throwable t) {
-            log("Timeline shadow cache meta write error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline shadow cache meta write error source=")) log("Timeline shadow cache meta write error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -5794,16 +5981,205 @@ public class WeiboLiteHook {
         } catch (Throwable ignored) {}
     }
 
+    private static TimelineAccountFiles timelineAccount() {
+        TimelineAccountFiles task = sTimelineTaskAccount.get();
+        return task == null ? sTimelineAccount : task;
+    }
+
+    private static File timelineAccountFile(String name) {
+        TimelineAccountFiles account = timelineAccount();
+        if (account == null) throw new IllegalStateException("timeline account is not ready");
+        return account.file(name);
+    }
+
+    private static boolean ensureTimelineAccount(Object owner) {
+        return ensureTimelineAccount(owner, false);
+    }
+
+    private static boolean ensureTimelineAccount(Object owner, boolean newRequest) {
+        if (owner == null || !"-1".equals(getTimelineGroupId(owner))) return true;
+        TimelineAccountFiles task = sTimelineTaskAccount.get();
+        if (task != null) return task == sTimelineAccount;
+        try {
+            Class<?> store = Class.forName("com.weico.international.manager.accounts.AccountsStore",
+                false, owner.getClass().getClassLoader());
+            String userId = String.valueOf(callStaticNoArg(store, "getCurUserId"));
+            Object action = isTimelineAction(owner) ? owner : getTimelineAction(owner);
+            synchronized (sTimelineOwnerAccounts) {
+                TimelineAccountFiles previousOwner = sTimelineOwnerAccounts.get(owner);
+                TimelineAccountFiles current = sTimelineAccount;
+                if (current == null || !current.userId.equals(userId)) {
+                    if (!userId.matches("[0-9]+") || "0".equals(userId)) {
+                        activateTimelineAccount(null);
+                        return false;
+                    }
+                    if (action == null) return false;
+                    File nativeFile = getTimelineNativeCacheFile(buildTimelineCacheBuilder(action));
+                    Context context = getWeicoContext();
+                    File filesDir = context == null
+                        ? new File("/data/data/com.weico.international/files") : context.getFilesDir();
+                    current = new TimelineAccountFiles(userId, nativeFile, filesDir);
+                    removeTimelineLastReadMarkers();
+                    removeTimelineTimeJumpButton("account-switch");
+                    activateTimelineAccount(current);
+                }
+                // Old responses cannot claim the newly selected account. A new outgoing request
+                // can rebind a presenter/action reused by the host during account switching.
+                if (previousOwner != null && previousOwner != current && !newRequest
+                    && (action == null || sTimelineOwnerAccounts.get(action) != current)) return false;
+                sTimelineOwnerAccounts.put(owner, current);
+                if (action != null) sTimelineOwnerAccounts.put(action, current);
+                return true;
+            }
+        } catch (Throwable error) {
+            // Before AccountsStore is ready, leave non-cache host behavior intact.
+            return sTimelineAccount == null;
+        }
+    }
+
+    static void activateTimelineAccount(TimelineAccountFiles account) {
+        if (sTimelineAccount == account) return;
+        TimelineAccountFiles previousAccount = sTimelineAccount;
+        sTimelineAccount = account;
+        synchronized (sCliOperationLock) {
+            if (sCliLastOperationAccount == previousAccount
+                && sCliLastOperationCommand.startsWith("cache.")
+                && ("accepted".equals(sCliLastOperationState) || "running".equals(sCliLastOperationState))) {
+                sCliLastOperationState = "error";
+                sCliLastOperationMessage = "account changed; timeline operation cancelled";
+                sCliLastOperationUpdatedAtMs = System.currentTimeMillis();
+            }
+        }
+        final AlertDialog oldProgress = sTimelineCacheClearProgressDialog;
+        sTimelineCacheClearProgressDialog = null;
+        if (oldProgress != null) HotReloadRuntime.post(() -> {
+            if (oldProgress.isShowing()) oldProgress.dismiss();
+        });
+        sTimelineCompletionGeneration.incrementAndGet();
+        sTimelineEdgeJumpGeneration++;
+        nextTimelineAdapterSyncGeneration();
+        synchronized (sTimelineCumulativeStatusesById) {
+            sTimelineDataGeneration.incrementAndGet();
+            sTimelineCumulativeStatusesById.clear();
+        }
+        synchronized (sTimelineRestoreLock) {
+            sTimelineRestoreStates.clear();
+            sRestoringTimelineCaches.clear();
+        }
+        synchronized (sTimelinePersistQueueLock) {
+            sPendingTimelineNativePersist = null;
+            sPendingTimelineShadowPersist = null;
+        }
+        synchronized (sPersistedTimelineCacheCounts) {
+            sPersistedTimelineCacheCounts.clear();
+            sPersistedTimelineCacheNewestIds.clear();
+        }
+        synchronized (sPreloadStates) { sPreloadStates.clear(); }
+        synchronized (sTimelineGapFillState) { resetTimelineGapFillLocked(sTimelineGapFillState); }
+        synchronized (sTopAnchorStates) {
+            sTopAnchorStates.clear();
+            sTimelineUserMovedAt.clear();
+            sHomeTimelineRecyclerOwners.clear();
+            sTimelineRecyclerViews.clear();
+        }
+        sLastTimelinePresenter = null;
+        sLastActiveHomeTimelinePresenter = new WeakReference<>(null);
+        sLastActiveHomeTimelineRecyclerView = new WeakReference<>(null);
+        sTimelineGapFillViewportAnchor = null;
+        sTimelineRefreshAnchorStatusId = 0L;
+        sTimelineRefreshAnchorGeneration++;
+        sHomeTabPendingAnchorStatusId = 0L;
+        sTimelinePreloadDone = null;
+        sTimelinePreloadDoneCacheDays = -1;
+        sTimelineRestoredCacheMode = false;
+        sTimelineOldestFirstMode = false;
+        sLastReadStatusId = null;
+        sLastReadPersistAtMs = 0L;
+        sLastReadMarkerShown = false;
+        sTimelineCacheClearInFlight = false;
+        sTimelineCacheClearDialogLoading = false;
+        sPendingTimelineNoMoreSource = null;
+        sPendingTimelineNoMoreGeneration++;
+        sTimelineNoMoreHandledAtMs = 0L;
+    }
+
+    private static void executeTimelineTask(ExecutorService executor, Runnable task) {
+        final TimelineAccountFiles account = timelineAccount();
+        executor.execute(() -> runTimelineTask(account, task));
+    }
+
+    static void runTimelineTask(TimelineAccountFiles account, Runnable task) {
+        if (account != sTimelineAccount) return;
+        TimelineAccountFiles previous = sTimelineTaskAccount.get();
+        sTimelineTaskAccount.set(account);
+        try { task.run(); }
+        finally {
+            if (previous == null) sTimelineTaskAccount.remove();
+            else sTimelineTaskAccount.set(previous);
+        }
+    }
+
+    private static void postTimelineResult(Runnable task) {
+        final TimelineAccountFiles account = timelineAccount();
+        HotReloadRuntime.post(() -> {
+            if (account == sTimelineAccount) task.run();
+        });
+    }
+
+    static boolean shouldApplyTimelineViewInitialization(
+        TimelineAccountFiles submitted, TimelineAccountFiles current, boolean currentView
+    ) {
+        return submitted == current || submitted == null && currentView;
+    }
+
+    private static void postTimelineViewInitialization(Object recyclerView, Runnable task, long delayMs) {
+        final TimelineAccountFiles account = timelineAccount();
+        HotReloadRuntime.postDelayed(() -> {
+            Object currentView = getCurrentHomeTimelineRecyclerView();
+            if (shouldApplyTimelineViewInitialization(account, sTimelineAccount,
+                currentView == null || currentView == recyclerView)) task.run();
+        }, delayMs);
+    }
+
+    private static void postTimelineResultDelayed(Runnable task, long delayMs) {
+        final TimelineAccountFiles account = timelineAccount();
+        HotReloadRuntime.postDelayed(() -> {
+            if (account == sTimelineAccount) task.run();
+        }, delayMs);
+    }
+
+    private static boolean isTimelineTaskCurrent() {
+        TimelineAccountFiles task = sTimelineTaskAccount.get();
+        return task == null || task == sTimelineAccount;
+    }
+
+    private static void migrateLegacyTimelineAccountFiles() throws Exception {
+        TimelineAccountFiles account = timelineAccount();
+        if (account == null || !account.canMigrateLegacyShadow(
+            TIMELINE_SHADOW_CACHE_FILE, TIMELINE_SHADOW_CACHE_META_FILE)) return;
+        // Legacy bookmarks/completion markers lack account ownership. Keep those originals;
+        // only the shadow's exact native filename proves which account may import its data.
+        String[] names = { TIMELINE_SHADOW_CACHE_FILE, TIMELINE_SHADOW_CACHE_META_FILE };
+        for (String name : names) {
+            File legacy = new File(account.filesDir, name);
+            File scoped = account.file(name);
+            if (legacy.isFile() && !scoped.exists()) {
+                copyFile(legacy, scoped);
+                account.migrated = true;
+            }
+        }
+    }
+
     private static File getTimelineDataCacheDir() {
         return new File("/data/data/com.weico.international/files/dataCache");
     }
 
     private static File getTimelineShadowCacheFile() {
-        return new File("/data/data/com.weico.international/files", TIMELINE_SHADOW_CACHE_FILE);
+        return timelineAccountFile(TIMELINE_SHADOW_CACHE_FILE);
     }
 
     private static File getTimelineShadowCacheMetaFile() {
-        return new File("/data/data/com.weico.international/files", TIMELINE_SHADOW_CACHE_META_FILE);
+        return timelineAccountFile(TIMELINE_SHADOW_CACHE_META_FILE);
     }
 
     private static File getTimelineVerifiedNaturalGapsFile(String scope) {
@@ -5822,11 +6198,11 @@ public class WeiboLiteHook {
             sTimelinePreloadDone = Boolean.FALSE;
             sTimelinePreloadDoneCacheDays = -1;
             sTimelineRestoredCacheMode = false;
-            log("Timeline preload marker cleared source=" + source);
+            { if (Diagnostics.shouldLog("Timeline preload marker cleared source=")) log("Timeline preload marker cleared source=" + source); }
         } catch (Throwable t) {
             sTimelinePreloadDone = Boolean.FALSE;
             sTimelinePreloadDoneCacheDays = -1;
-            log("Timeline preload marker clear error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline preload marker clear error source=")) log("Timeline preload marker clear error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -5836,10 +6212,10 @@ public class WeiboLiteHook {
             if (file != null && file.exists()) file.delete();
             sLastReadStatusId = Long.valueOf(0L);
             sLastReadMarkerShown = false;
-            log("Timeline last-read cleared source=" + source);
+            { if (Diagnostics.shouldLog("Timeline last-read cleared source=")) log("Timeline last-read cleared source=" + source); }
         } catch (Throwable t) {
             sLastReadStatusId = Long.valueOf(0L);
-            log("Timeline last-read clear error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline last-read clear error source=")) log("Timeline last-read clear error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -5854,10 +6230,11 @@ public class WeiboLiteHook {
         boolean preferCumulative
     ) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return false;
+        if (!ensureTimelineAccount(presenter)) return false;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return false;
             if (sTimelineCacheClearInFlight) {
-                log("Timeline cache restore skipped during manual clear source=" + source);
+                { if (Diagnostics.shouldLog("Timeline cache restore skipped during manual clear source=")) log("Timeline cache restore skipped during manual clear source=" + source); }
                 return false;
             }
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return false;
@@ -5875,9 +6252,9 @@ public class WeiboLiteHook {
                 if (state.inFlight) {
                     state.pendingLiveStatuses = liveStatuses;
                     state.pendingSource = source;
-                    log("Timeline cache restore coalesced source=" + source
+                    { if (Diagnostics.shouldLog("Timeline cache restore coalesced source=")) log("Timeline cache restore coalesced source=" + source
                         + " live=" + liveStatuses.size()
-                        + " generation=" + state.generation);
+                        + " generation=" + state.generation); }
                     return true;
                 }
                 cumulative = preferCumulative || state.diskRestoreResolved;
@@ -5906,12 +6283,12 @@ public class WeiboLiteHook {
                 cumulative,
                 generation
             );
-            log("Timeline cache restore queued source=" + source
+            { if (Diagnostics.shouldLog("Timeline cache restore queued source=")) log("Timeline cache restore queued source=" + source
                 + " kind=" + (cumulative ? "cumulative" : "disk")
                 + " live=" + liveStatuses.size()
                 + " cached=" + (cumulativeStatuses == null ? -1 : cumulativeStatuses.size())
-                + " generation=" + generation);
-            sTimelineRestoreExecutor.execute(new Runnable() {
+                + " generation=" + generation); }
+            executeTimelineTask(sTimelineRestoreExecutor, new Runnable() {
                 @Override
                 public void run() {
                     executeTimelineCacheRestore(request);
@@ -5919,7 +6296,7 @@ public class WeiboLiteHook {
             });
             return true;
         } catch (Throwable t) {
-            log("Timeline cache restore schedule error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline cache restore schedule error source=")) log("Timeline cache restore schedule error source=" + source + ": " + t.getMessage()); }
             return false;
         }
     }
@@ -5927,7 +6304,9 @@ public class WeiboLiteHook {
     private static ArrayList snapshotTimelineStatuses(Object presenter, List incomingData) {
         try {
             Object statusList = XposedHelpers.callMethod(presenter, "getStatusList");
-            if (statusList instanceof List) return new ArrayList((List) statusList);
+            if (statusList instanceof List) {
+                return mergeTimelineStatusLists(incomingData, (List) statusList, null);
+            }
         } catch (Throwable ignored) {
         }
         if (incomingData != null) return new ArrayList(incomingData);
@@ -5958,12 +6337,12 @@ public class WeiboLiteHook {
                 result = prepareTimelineRestore(effectiveRequest, action, builder, load);
             }
             long preparedAt = SystemClock.elapsedRealtime();
-            log("Timeline cache restore prepared source=" + effectiveRequest.source
+            { if (Diagnostics.shouldLog("Timeline cache restore prepared source=")) log("Timeline cache restore prepared source=" + effectiveRequest.source
                 + " cacheSource=" + load.source
                 + " count=" + result.statuses.size()
                 + " loadMs=" + (loadedAt - startedAt)
                 + " prepareMs=" + (preparedAt - loadedAt)
-                + " totalMs=" + (preparedAt - startedAt));
+                + " totalMs=" + (preparedAt - startedAt)); }
         } catch (Throwable t) {
             error = t;
         }
@@ -5971,7 +6350,7 @@ public class WeiboLiteHook {
         final TimelineRestoreRequest completedRequest = effectiveRequest;
         final TimelineRestoreResult prepared = result;
         final Throwable failure = error;
-        HotReloadRuntime.post(new Runnable() {
+        postTimelineResult(new Runnable() {
             @Override
             public void run() {
                 applyTimelineCacheRestore(completedRequest, prepared, failure);
@@ -5992,9 +6371,9 @@ public class WeiboLiteHook {
             String pendingSource = state.pendingSource;
             state.pendingLiveStatuses = null;
             state.pendingSource = null;
-            log("Timeline cache restore adopted coalesced input source=" + pendingSource
+            { if (Diagnostics.shouldLog("Timeline cache restore adopted coalesced input source=")) log("Timeline cache restore adopted coalesced input source=" + pendingSource
                 + " live=" + pending.size()
-                + " generation=" + current.generation);
+                + " generation=" + current.generation); }
             return new TimelineRestoreRequest(
                 current.presenter,
                 pending,
@@ -6013,50 +6392,48 @@ public class WeiboLiteHook {
         Object builder,
         String source
     ) throws Exception {
+        migrateLegacyTimelineAccountFiles();
         File nativeFile = getTimelineNativeCacheFile(builder);
         File shadowFile = getTimelineShadowCacheFile();
         int shadowCount = readTimelineShadowCacheCount();
         long nativeSize = nativeFile != null && nativeFile.exists() ? nativeFile.length() : 0L;
         long shadowSize = shadowFile != null && shadowFile.exists() ? shadowFile.length() : 0L;
-        boolean shadowFirst = shouldReadTimelineShadowFirst(nativeSize, shadowSize, shadowCount);
-
-        if (shadowFirst) {
-            List shadowStatuses = readTimelineShadowStatusesDirect(builder, action, source + "-shadow-first");
+        List nativeStatuses = null;
+        try {
+            Class<?> diskCacheClass = Class.forName(
+                "com.weico.diskcache.DiskCache", false, action.getClass().getClassLoader());
+            Object cache = callStaticNoArg(diskCacheClass, "getInstance");
+            restoreInterruptedTimelineNativeCacheBackups();
+            nativeStatuses = extractTimelineStatuses(XposedHelpers.callMethod(cache, "get", builder));
+        } catch (Throwable error) {
+            if (Diagnostics.shouldLog("Timeline native cache read error")) {
+                log("Timeline native cache read error: " + error.getClass().getSimpleName());
+            }
+        }
+        int nativeCount = nativeStatuses == null ? 0 : nativeStatuses.size();
+        int cacheDays = getTimelineCacheDaysSetting();
+        long cutoff = sTimelineCacheDaysSettingConfirmed
+            ? timelineCacheCutoffMs(System.currentTimeMillis(), cacheDays) : Long.MIN_VALUE;
+        if (shouldSupplementTimelineCache(nativeCount, nativeSize, shadowSize, shadowCount,
+            readTimelineShadowCacheNewestMs(), cutoff)) {
+            List shadowStatuses = readTimelineShadowStatusesDirect(builder, action, source + "-supplement");
             if (shadowStatuses != null && !shadowStatuses.isEmpty()) {
-                return new TimelineCacheLoad(shadowStatuses, "shadow");
+                // Native contains the newest checkpoint. Never discard it just because an older
+                // shadow is larger; keep its versions of duplicate IDs and supplement missing IDs.
+                return new TimelineCacheLoad(
+                    mergeTimelineStatusLists(nativeStatuses, shadowStatuses, null),
+                    nativeCount > 0 ? "native+shadow" : "shadow");
             }
         }
+        return nativeCount > 0 ? new TimelineCacheLoad(nativeStatuses, "native") : null;
+    }
 
-        Class<?> diskCacheClass = Class.forName(
-            "com.weico.diskcache.DiskCache",
-            false,
-            action.getClass().getClassLoader()
-        );
-        Object cache = callStaticNoArg(diskCacheClass, "getInstance");
-        restoreInterruptedTimelineNativeCacheBackups();
-        Object nativeCached = XposedHelpers.callMethod(cache, "get", builder);
-        List nativeStatuses = extractTimelineStatuses(nativeCached);
-        if (nativeStatuses != null && !nativeStatuses.isEmpty()) {
-            if (shadowCount >= 100 && nativeStatuses.size() * 4L < shadowCount) {
-                List shadowStatuses = readTimelineShadowStatusesDirect(
-                    builder,
-                    action,
-                    source + "-native-fragment"
-                );
-                if (shadowStatuses != null && !shadowStatuses.isEmpty()) {
-                    return new TimelineCacheLoad(shadowStatuses, "shadow");
-                }
-            }
-            return new TimelineCacheLoad(nativeStatuses, "native");
-        }
-
-        if (!shadowFirst) {
-            List shadowStatuses = readTimelineShadowStatusesDirect(builder, action, source + "-native-miss");
-            if (shadowStatuses != null && !shadowStatuses.isEmpty()) {
-                return new TimelineCacheLoad(shadowStatuses, "shadow");
-            }
-        }
-        return null;
+    static boolean shouldSupplementTimelineCache(int nativeCount, long nativeSize, long shadowSize,
+        int shadowCount, long shadowNewestMs, long cutoffMs) {
+        if (nativeCount <= 0) return true;
+        if (shadowNewestMs > 0L && shadowNewestMs < cutoffMs) return false;
+        return shouldReadTimelineShadowFirst(nativeSize, shadowSize, shadowCount)
+            || shadowCount >= 100 && nativeCount * 4L < shadowCount;
     }
 
     static boolean shouldReadTimelineShadowFirst(long nativeSize, long shadowSize, int shadowCount) {
@@ -6085,12 +6462,12 @@ public class WeiboLiteHook {
             Object cached = fromJson.invoke(gson, reader, resultClass);
             List statuses = extractTimelineStatuses(cached);
             if (statuses != null) {
-                log("Timeline shadow cache read directly source=" + source
-                    + " count=" + statuses.size() + " size=" + shadow.length());
+                { if (Diagnostics.shouldLog("Timeline shadow cache read directly source=")) log("Timeline shadow cache read directly source=" + source
+                    + " count=" + statuses.size() + " size=" + shadow.length()); }
             }
             return statuses;
         } catch (Throwable t) {
-            log("Timeline shadow cache direct read error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline shadow cache direct read error source=")) log("Timeline shadow cache direct read error source=" + source + ": " + t.getMessage()); }
             return null;
         } finally {
             closeQuietly(reader);
@@ -6197,7 +6574,16 @@ public class WeiboLiteHook {
         TimelineRestoreResult result,
         Throwable failure
     ) {
-        if (sTimelineCacheClearInFlight) return;
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("cache", "applyTimelineCacheRestore");
+        Throwable diagnosticError = null;
+        try {
+        if (sTimelineCacheClearInFlight || request.account != sTimelineAccount
+            || !ensureTimelineAccount(request.presenter)) return;
+        if (request.account != null && request.account.migrated) {
+            sLastReadStatusId = null;
+            sTimelinePreloadDone = null;
+            request.account.migrated = false;
+        }
         ArrayList lateLiveStatuses = null;
         String lateSource = null;
         synchronized (sTimelineRestoreLock) {
@@ -6215,13 +6601,27 @@ public class WeiboLiteHook {
             String detail = failure == null
                 ? "prepared cache is empty"
                 : failure.getClass().getSimpleName() + ": " + failure.getMessage();
-            log("Timeline cache restore unavailable source=" + request.source + " " + detail);
+            { if (Diagnostics.shouldLog("Timeline cache restore unavailable source=")) log("Timeline cache restore unavailable source=" + request.source + " " + detail); }
             if (!request.cumulative) forgetTimelinePreloadDone("restore-miss");
             scheduleTimelinePreload(request.presenter, request.source + "-restore-unavailable");
             return;
         }
         if (sLastTimelinePresenter != null && sLastTimelinePresenter != request.presenter) {
-            log("Timeline cache restore dropped stale presenter source=" + request.source);
+            { if (Diagnostics.shouldLog("Timeline cache restore dropped stale presenter source=")) log("Timeline cache restore dropped stale presenter source=" + request.source); }
+            return;
+        }
+
+        if (lateLiveStatuses != null) {
+            final TimelineRestoreRequest retry = new TimelineRestoreRequest(
+                request.presenter, mergeTimelineStatusLists(lateLiveStatuses, result.statuses, null),
+                result.statuses, lateSource == null ? request.source : lateSource,
+                request.cacheDays, request.settingConfirmed, true, request.generation);
+            synchronized (sTimelineRestoreLock) {
+                TimelineRestoreState state = sTimelineRestoreStates.get(request.presenter);
+                if (state == null || state.generation != request.generation) return;
+                state.inFlight = true;
+            }
+            executeTimelineTask(sTimelineRestoreExecutor, () -> executeTimelineCacheRestore(retry));
             return;
         }
 
@@ -6285,10 +6685,10 @@ public class WeiboLiteHook {
                 true,
                 adapterSyncGeneration
             );
-            log("Timeline full cache restored source=" + request.source
+            { if (Diagnostics.shouldLog("Timeline full cache restored source=")) log("Timeline full cache restored source=" + request.source
                 + " cacheSource=" + result.cacheSource
                 + " count=" + result.statuses.size()
-                + " complete=" + completeRestore);
+                + " complete=" + completeRestore); }
             if (!scheduleTimelineRefreshAnchorForKnownRecyclerViews("presenter-cache-restore")) {
                 beginTimelineTopAnchorForKnownRecyclerViews("presenter-cache-restore", true);
             }
@@ -6296,19 +6696,14 @@ public class WeiboLiteHook {
                 scheduleTimelineGapFill(request.presenter, request.source + "-resume");
             }
             scheduleTimelinePreload(request.presenter, request.source + "-restore");
-            if (lateLiveStatuses != null) {
-                scheduleTimelineCacheRestore(
-                    request.presenter,
-                    lateLiveStatuses,
-                    (lateSource == null ? request.source : lateSource) + "-late-coalesced",
-                    true
-                );
-            }
         } catch (Throwable t) {
             setTimelineCacheRestoring(request.presenter, false);
-            log("Timeline cache restore apply error source=" + request.source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline cache restore apply error source=")) log("Timeline cache restore apply error source=" + request.source + ": " + t.getMessage()); }
             scheduleTimelinePreload(request.presenter, request.source + "-restore-apply-error");
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static void replaceTimelineCumulativeStatusesPrepared(
@@ -6316,13 +6711,14 @@ public class WeiboLiteHook {
         String source
     ) {
         synchronized (sTimelineCumulativeStatusesById) {
+            if (!isTimelineTaskCurrent()) return;
             sTimelineDataGeneration.incrementAndGet();
             sTimelineCumulativeStatusesById.clear();
             for (Map.Entry<Long, Object> entry : prepared.entrySet()) {
                 sTimelineCumulativeStatusesById.put(entry.getKey(), entry.getValue());
             }
-            log("Timeline cumulative cache replaced prepared source=" + source
-                + " count=" + sTimelineCumulativeStatusesById.size());
+            { if (Diagnostics.shouldLog("Timeline cumulative cache replaced prepared source=")) log("Timeline cumulative cache replaced prepared source=" + source
+                + " count=" + sTimelineCumulativeStatusesById.size()); }
         }
     }
 
@@ -6352,12 +6748,12 @@ public class WeiboLiteHook {
                 true,
                 stats
             ));
-            log("Timeline restored cache checkpoint queued source=" + source
+            { if (Diagnostics.shouldLog("Timeline restored cache checkpoint queued source=")) log("Timeline restored cache checkpoint queued source=" + source
                 + " count=" + statuses.size()
                 + " newestMs=" + stats.newestMs
-                + " maxId=" + maxId);
+                + " maxId=" + maxId); }
         } catch (Throwable t) {
-            log("Timeline restored cache checkpoint error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline restored cache checkpoint error source=")) log("Timeline restored cache checkpoint error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -6384,7 +6780,7 @@ public class WeiboLiteHook {
                 throw new Exception(t);
             }
         }
-        log("Presenter timeline restored from cache source=" + source + " size=" + data.size());
+        { if (Diagnostics.shouldLog("Presenter timeline restored from cache source=")) log("Presenter timeline restored from cache source=" + source + " size=" + data.size()); }
     }
 
     private static ArrayList buildTimelineStatusModels(List statuses, Object owner, String source) {
@@ -6412,13 +6808,13 @@ public class WeiboLiteHook {
                 if ((i & 0xff) == 0xff) Thread.yield();
             }
             if (models.size() != statuses.size()) {
-                log("Timeline adapter model preparation incomplete source=" + source
-                    + " statuses=" + statuses.size() + " models=" + models.size());
+                { if (Diagnostics.shouldLog("Timeline adapter model preparation incomplete source=")) log("Timeline adapter model preparation incomplete source=" + source
+                    + " statuses=" + statuses.size() + " models=" + models.size()); }
                 return null;
             }
             return models;
         } catch (Throwable t) {
-            log("Timeline adapter model preparation error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline adapter model preparation error source=")) log("Timeline adapter model preparation error source=" + source + ": " + t.getMessage()); }
             return null;
         }
     }
@@ -6465,11 +6861,11 @@ public class WeiboLiteHook {
             final Object targetPresenter = presenter;
             final boolean complete = sTimelineRestoredCacheMode && isTimelinePreloadDone();
             final int generation = nextTimelineAdapterSyncGeneration();
-            log("Timeline adapter self-heal scheduled source=" + source
+            { if (Diagnostics.shouldLog("Timeline adapter self-heal scheduled source=")) log("Timeline adapter self-heal scheduled source=" + source
                 + " canonical=" + snapshot.size() + " adapter=" + adapterCount
                 + " adapterValid=" + adapterValidCount
-                + " generation=" + generation);
-            sTimelineRestoreExecutor.execute(new Runnable() {
+                + " generation=" + generation); }
+            executeTimelineTask(sTimelineRestoreExecutor, new Runnable() {
                 @Override
                 public void run() {
                     final ArrayList models = buildTimelineStatusModels(
@@ -6477,7 +6873,7 @@ public class WeiboLiteHook {
                         targetPresenter,
                         source + "-self-heal"
                     );
-                    HotReloadRuntime.post(new Runnable() {
+                    postTimelineResult(new Runnable() {
                         @Override
                         public void run() {
                             applyPreparedHomeTimelineAdapters(
@@ -6493,7 +6889,7 @@ public class WeiboLiteHook {
                 }
             });
         } catch (Throwable t) {
-            log("Timeline adapter self-heal schedule error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline adapter self-heal schedule error source=")) log("Timeline adapter self-heal schedule error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -6517,6 +6913,9 @@ public class WeiboLiteHook {
         boolean force,
         int generation
     ) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("ui", "applyPreparedHomeTimelineAdapters");
+        Throwable diagnosticError = null;
+        try {
         if (models == null || !isTimelineAdapterSyncGenerationCurrent(generation)) return;
         if (sTimelineCacheClearInFlight && !source.contains("manual-range-clear")) return;
         ArrayList recyclerViews = getKnownHomeTimelineRecyclerViews(null);
@@ -6562,19 +6961,22 @@ public class WeiboLiteHook {
                 int validAfter = getTimelineAdapterValidStatusCount(adapter, after);
                 updated++;
                 scheduleTimelineGapFillViewportAnchorRestore(source + "-adapter-sync");
-                log("Timeline adapter synchronized source=" + source
+                { if (Diagnostics.shouldLog("Timeline adapter synchronized source=")) log("Timeline adapter synchronized source=" + source
                     + " recycler=" + identityText(recyclerView)
                     + " before=" + before + " validBefore=" + validBefore
                     + " after=" + after + " validAfter=" + validAfter
-                    + " complete=" + complete + " current=" + (recyclerView == current));
+                    + " complete=" + complete + " current=" + (recyclerView == current)); }
             } catch (Throwable t) {
-                log("Timeline adapter synchronize error source=" + source
-                    + " recycler=" + identityText(recyclerView) + ": " + t.getMessage());
+                { if (Diagnostics.shouldLog("Timeline adapter synchronize error source=")) log("Timeline adapter synchronize error source=" + source
+                    + " recycler=" + identityText(recyclerView) + ": " + t.getMessage()); }
             }
         }
-        log("Timeline adapter synchronization finished source=" + source
+        { if (Diagnostics.shouldLog("Timeline adapter synchronization finished source=")) log("Timeline adapter synchronization finished source=" + source
             + " models=" + models.size() + " updated=" + updated
-            + " candidates=" + recyclerViews.size() + " generation=" + generation);
+            + " candidates=" + recyclerViews.size() + " generation=" + generation); }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     static boolean shouldReplaceTimelineAdapterData(
@@ -6708,7 +7110,7 @@ public class WeiboLiteHook {
             if (key == null || directory == null) return null;
             return new File(String.valueOf(directory), String.valueOf(key) + ".txt");
         } catch (Throwable t) {
-            log("Timeline native cache path resolve error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline native cache path resolve error: ")) log("Timeline native cache path resolve error: " + t.getMessage()); }
             return null;
         }
     }
@@ -6747,7 +7149,8 @@ public class WeiboLiteHook {
         String groupId = getTimelineGroupId(action);
         if (groupId == null) groupId = "-1";
         Class<?> accountsStoreClass = Class.forName("com.weico.international.manager.accounts.AccountsStore", false, cl);
-        Object userId = callStaticNoArg(accountsStoreClass, "getCurUserId");
+        TimelineAccountFiles captured = sTimelineTaskAccount.get();
+        Object userId = captured == null ? callStaticNoArg(accountsStoreClass, "getCurUserId") : captured.userId;
         Object builder = callStatic(
             diskCacheClass,
             "fastGetBuilder",
@@ -6831,9 +7234,9 @@ public class WeiboLiteHook {
         }
 
         if (changed) {
-            log("Timeline cursor synced source=" + source + " maxId=" + maxId);
+            { if (Diagnostics.shouldLog("Timeline cursor synced source=")) log("Timeline cursor synced source=" + source + " maxId=" + maxId); }
         } else {
-            log("Timeline cursor sync skipped source=" + source + " maxId=" + maxId);
+            { if (Diagnostics.shouldLog("Timeline cursor sync skipped source=")) log("Timeline cursor sync skipped source=" + source + " maxId=" + maxId); }
             dumpTimelineCursorFieldsOnce(action, source);
         }
     }
@@ -6871,7 +7274,7 @@ public class WeiboLiteHook {
         sTimelineCursorActionDumped = true;
 
         try {
-            log("Timeline cursor field dump source=" + source + " class=" + target.getClass().getName());
+            { if (Diagnostics.shouldLog("Timeline cursor field dump source=")) log("Timeline cursor field dump source=" + source + " class=" + target.getClass().getName()); }
             Class<?> clazz = target.getClass();
             int emitted = 0;
             while (clazz != null && emitted < 80) {
@@ -6895,14 +7298,14 @@ public class WeiboLiteHook {
                     try {
                         value = field.get(target);
                     } catch (Throwable ignored) {}
-                    log("Timeline cursor field source=" + source + " field=" + clazz.getSimpleName()
-                        + "." + name + " type=" + type.getName() + " value=" + value);
+                    { if (Diagnostics.shouldLog("Timeline cursor field source=")) log("Timeline cursor field source=" + source + " field=" + clazz.getSimpleName()
+                        + "." + name + " type=" + type.getName() + " value=" + value); }
                     emitted++;
                 }
                 clazz = clazz.getSuperclass();
             }
         } catch (Throwable t) {
-            log("Timeline cursor field dump error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline cursor field dump error source=")) log("Timeline cursor field dump error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -6923,6 +7326,7 @@ public class WeiboLiteHook {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return;
         if (list == null || !"-1".equals(getTimelineGroupId(owner))) return;
         synchronized (sTimelineCumulativeStatusesById) {
+            if (!isTimelineTaskCurrent()) return;
             sTimelineDataGeneration.incrementAndGet();
             int before = sTimelineCumulativeStatusesById.size();
             for (int i = 0; i < list.size(); i++) {
@@ -6944,8 +7348,8 @@ public class WeiboLiteHook {
             if (after != before && after >= PRELOAD_DONE_MIN_ITEMS
                 && after / TIMELINE_GAP_FILL_CHECKPOINT_ITEMS
                     != before / TIMELINE_GAP_FILL_CHECKPOINT_ITEMS) {
-                log("Timeline cumulative cache incremented source=" + source
-                    + " count=" + after + " previous=" + before);
+                { if (Diagnostics.shouldLog("Timeline cumulative cache incremented source=")) log("Timeline cumulative cache incremented source=" + source
+                    + " count=" + after + " previous=" + before); }
             }
         }
     }
@@ -6963,9 +7367,13 @@ public class WeiboLiteHook {
     }
 
     private static ArrayList mergeTimelineCumulativeStatuses(List list, Object owner, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("cache", "mergeTimelineCumulativeStatuses");
+        Throwable diagnosticError = null;
+        try {
         ArrayList incoming = collectTimelineStatuses(list);
         if (!"-1".equals(getTimelineGroupId(owner))) return incoming;
         synchronized (sTimelineCumulativeStatusesById) {
+            if (!isTimelineTaskCurrent()) return incoming;
             int before = sTimelineCumulativeStatusesById.size();
             for (int i = 0; i < incoming.size(); i++) {
                 Object status = unwrapStatus(incoming.get(i));
@@ -6979,20 +7387,24 @@ public class WeiboLiteHook {
             replaceTimelineCumulativeStatusesLocked(trimmed);
             int after = sTimelineCumulativeStatusesById.size();
             if (after != before && (source.contains("addData") || after >= PRELOAD_DONE_MIN_ITEMS)) {
-                log("Timeline cumulative cache merged source=" + source + " incoming=" + incoming.size()
-                    + " count=" + after + " previous=" + before);
+                { if (Diagnostics.shouldLog("Timeline cumulative cache merged source=")) log("Timeline cumulative cache merged source=" + source + " incoming=" + incoming.size()
+                    + " count=" + after + " previous=" + before); }
             }
             return new ArrayList(sTimelineCumulativeStatusesById.values());
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static void replaceTimelineCumulativeStatuses(List list, Object owner, String source) {
         if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return;
         if (!"-1".equals(getTimelineGroupId(owner))) return;
         synchronized (sTimelineCumulativeStatusesById) {
+            if (!isTimelineTaskCurrent()) return;
             replaceTimelineCumulativeStatusesLocked(list);
-            log("Timeline cumulative cache replaced source=" + source
-                + " count=" + sTimelineCumulativeStatusesById.size());
+            { if (Diagnostics.shouldLog("Timeline cumulative cache replaced source=")) log("Timeline cumulative cache replaced source=" + source
+                + " count=" + sTimelineCumulativeStatusesById.size()); }
         }
     }
 
@@ -7066,13 +7478,16 @@ public class WeiboLiteHook {
     }
 
     private static List trimTimelineStatusesToCacheDays(List list, Object owner, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("cache", "trimTimelineStatusesToCacheDays");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE))) return list;
         if (list == null || list.isEmpty()) return list;
         if (!"-1".equals(getTimelineGroupId(owner))) return list;
 
         int days = getTimelineCacheDaysSetting();
         if (!sTimelineCacheDaysSettingConfirmed) {
-            log("Timeline cache window trim skipped until setting is confirmed source=" + source);
+            { if (Diagnostics.shouldLog("Timeline cache window trim skipped until setting is confirmed source=")) log("Timeline cache window trim skipped until setting is confirmed source=" + source); }
             return list;
         }
 
@@ -7094,12 +7509,15 @@ public class WeiboLiteHook {
         }
         if (removed == 0) return list;
 
-        log("Timeline cache window trimmed source=" + source
+        { if (Diagnostics.shouldLog("Timeline cache window trimmed source=")) log("Timeline cache window trimmed source=" + source
             + " days=" + days
             + " removed=" + removed
             + " kept=" + copy.size()
-            + " spanDays=" + formatTimelineCacheSpanDays(stats.spanMs()));
+            + " spanDays=" + formatTimelineCacheSpanDays(stats.spanMs())); }
         return copy;
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     static long timelineCacheCutoffMs(long nowMs, int days) {
@@ -7133,6 +7551,7 @@ public class WeiboLiteHook {
     }
 
     private static TimelineCacheStats buildBestTimelineCacheStats(Object presenter) {
+        if (!isTimelineTaskCurrent()) return new TimelineCacheStats();
         TimelineCacheStats best = null;
         try {
             if (presenter != null) {
@@ -7174,7 +7593,7 @@ public class WeiboLiteHook {
         if (stats == null || stats.count < TIMELINE_CACHE_MIN_ITEMS) return false;
         int days = getTimelineCacheDaysSetting();
         if (!sTimelineCacheDaysSettingConfirmed) {
-            log("Timeline cache duration deferred until setting is confirmed source=" + source);
+            { if (Diagnostics.shouldLog("Timeline cache duration deferred until setting is confirmed source=")) log("Timeline cache duration deferred until setting is confirmed source=" + source); }
             return false;
         }
         long spanMs = stats.spanMs();
@@ -7189,13 +7608,13 @@ public class WeiboLiteHook {
             true
         );
         if (!ready) {
-            log("Timeline cache duration not ready source=" + source
+            { if (Diagnostics.shouldLog("Timeline cache duration not ready source=")) log("Timeline cache duration not ready source=" + source
                 + " count=" + stats.count
                 + " dated=" + stats.datedCount
                 + " days=" + days
                 + " spanDays=" + formatTimelineCacheSpanDays(spanMs)
                 + " headFresh=" + headFresh
-                + " newestMs=" + stats.newestMs);
+                + " newestMs=" + stats.newestMs); }
         }
         return ready;
     }
@@ -7232,6 +7651,9 @@ public class WeiboLiteHook {
     }
 
     private static List filterTimelineAds(List list, Object owner, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("ads", "filterTimelineAds");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_AD_REMOVAL))) return list;
         if (list == null || list.isEmpty()) return list;
 
@@ -7254,9 +7676,12 @@ public class WeiboLiteHook {
         if (copy == null) return list;
         int removed = list.size() - copy.size();
 
-        log("Timeline ads filtered source=" + source + " group=" + groupId + " removed=" + removed
-            + " size=" + list.size() + " kept=" + copy.size());
+        { if (Diagnostics.shouldLog("Timeline ads filtered source=")) log("Timeline ads filtered source=" + source + " group=" + groupId + " removed=" + removed
+            + " size=" + list.size() + " kept=" + copy.size()); }
         return copy;
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static List filterTimelineDisplayArtifacts(List list, Object owner, String source) {
@@ -7305,15 +7730,18 @@ public class WeiboLiteHook {
         }
         if (copy == null) return list;
 
-        log("Timeline display artifacts filtered source=" + source + " group=" + groupId
+        { if (Diagnostics.shouldLog("Timeline display artifacts filtered source=")) log("Timeline display artifacts filtered source=" + source + " group=" + groupId
             + " removed=" + (list.size() - copy.size())
             + " invalid=" + invalid + " loadMore=" + loadMore
             + " duplicate=" + duplicate + " ads=" + ads
-            + " size=" + list.size() + " kept=" + copy.size());
+            + " size=" + list.size() + " kept=" + copy.size()); }
         return copy;
     }
 
     private static List filterTimelineContentless(List list, Object owner, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("filter", "filterTimelineContentless");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_CONTENTLESS_FILTER))) return list;
         if (list == null || list.isEmpty()) return list;
 
@@ -7342,13 +7770,19 @@ public class WeiboLiteHook {
         if (copy == null) return list;
         int removed = list.size() - copy.size();
 
-        log("Timeline empty statuses filtered source=" + source + " group=" + groupId
+        { if (Diagnostics.shouldLog("Timeline empty statuses filtered source=")) log("Timeline empty statuses filtered source=" + source + " group=" + groupId
             + " removed=" + removed + " size=" + list.size() + " kept=" + copy.size()
-            + " sample=" + sampleIds);
+            + " sample=" + sampleIds); }
         return copy;
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static int hydrateTimelineStatusText(List list, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("hydrate", "hydrateTimelineStatusText");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_STATUS_HYDRATION))) return 0;
         if (list == null || list.isEmpty()) return 0;
         int changed = 0;
@@ -7356,9 +7790,12 @@ public class WeiboLiteHook {
             changed += hydrateStatusText(unwrapStatus(list.get(i)), 0);
         }
         if (changed > 0) {
-            log("Timeline text hydrated source=" + source + " count=" + changed);
+            { if (Diagnostics.shouldLog("Timeline text hydrated source=")) log("Timeline text hydrated source=" + source + " count=" + changed); }
         }
         return changed + hydrateTimelineStatusMedia(list, source);
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static int hydrateStatusText(Object status, int depth) {
@@ -7395,7 +7832,7 @@ public class WeiboLiteHook {
             changed += hydrateStatusMedia(unwrapStatus(list.get(i)), 0);
         }
         if (changed > 0) {
-            log("Timeline media hydrated source=" + source + " count=" + changed);
+            { if (Diagnostics.shouldLog("Timeline media hydrated source=")) log("Timeline media hydrated source=" + source + " count=" + changed); }
         }
         return changed;
     }
@@ -7472,7 +7909,7 @@ public class WeiboLiteHook {
             target.addAll(replacement);
             return true;
         } catch (Throwable t) {
-            log("Timeline ads filtered copy could not replace source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline ads filtered copy could not replace source=")) log("Timeline ads filtered copy could not replace source=" + source + ": " + t.getMessage()); }
             return false;
         }
     }
@@ -7491,16 +7928,16 @@ public class WeiboLiteHook {
         try {
             Object presenter = callMethodSafe(fragment, "getPresenter");
             if (presenter == null) {
-                log("Timeline home recycler unresolved presenter source=" + source);
+                { if (Diagnostics.shouldLog("Timeline home recycler unresolved presenter source=")) log("Timeline home recycler unresolved presenter source=" + source); }
                 return;
             }
-            if (!"-1".equals(getTimelineGroupId(presenter))) return;
+            if (!"-1".equals(getTimelineGroupId(presenter)) || !ensureTimelineAccount(presenter)) return;
             Object recyclerView = getHomeTimelineInnerRecyclerView(fragment);
             if (!isTimelineRecyclerView(recyclerView)) {
                 Object outerRecycler = getFieldValueOrNull(fragment, "mIndexRecycler");
-                log("Timeline home recycler unresolved view source=" + source
+                { if (Diagnostics.shouldLog("Timeline home recycler unresolved view source=")) log("Timeline home recycler unresolved view source=" + source
                     + " outer=" + identityText(outerRecycler)
-                    + " inner=" + identityText(recyclerView));
+                    + " inner=" + identityText(recyclerView)); }
                 return;
             }
 
@@ -7524,16 +7961,16 @@ public class WeiboLiteHook {
                 sLastTimelinePresenter = presenter;
                 ensureTimelineTimeJumpButton(recyclerView, source);
                 if (newOwner || previous != recyclerView) {
-                    log("Timeline active home recycler selected source=" + source
+                    { if (Diagnostics.shouldLog("Timeline active home recycler selected source=")) log("Timeline active home recycler selected source=" + source
                         + " recycler=" + identityText(recyclerView)
-                        + " data=" + getTimelineRecyclerViewDataScore(recyclerView));
+                        + " data=" + getTimelineRecyclerViewDataScore(recyclerView)); }
                 }
             } else if (newOwner) {
-                log("Timeline home recycler registered inactive source=" + source
-                    + " recycler=" + identityText(recyclerView));
+                { if (Diagnostics.shouldLog("Timeline home recycler registered inactive source=")) log("Timeline home recycler registered inactive source=" + source
+                    + " recycler=" + identityText(recyclerView)); }
             }
         } catch (Throwable t) {
-            log("Timeline home recycler remember error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline home recycler remember error source=")) log("Timeline home recycler remember error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -7794,10 +8231,10 @@ public class WeiboLiteHook {
             sHomeTabPendingAnchorPosition = viewport[0];
             sHomeTabPendingAnchorFirst = viewport[1];
             sHomeTabPendingAnchorLast = viewport[2];
-            log("Timeline refresh pending anchor captured source=home-tab-tap"
+            { if (Diagnostics.shouldLog("Timeline refresh pending anchor captured source=home-tab-tap")) log("Timeline refresh pending anchor captured source=home-tab-tap"
                 + " id=" + statusId
                 + " position=" + viewport[0]
-                + " visible=" + viewport[1] + ".." + viewport[2]);
+                + " visible=" + viewport[1] + ".." + viewport[2]); }
         } catch (Throwable ignored) {}
     }
 
@@ -7832,10 +8269,10 @@ public class WeiboLiteHook {
         sTimelineRefreshAnchorPosition = position;
         sTimelineRefreshAnchorGeneration++;
         cancelTimelineTopAnchorsForRefresh(source);
-        log("Timeline refresh anchor captured source=" + source
+        { if (Diagnostics.shouldLog("Timeline refresh anchor captured source=")) log("Timeline refresh anchor captured source=" + source
             + " id=" + statusId
             + " position=" + position
-            + " visible=" + first + ".." + last);
+            + " visible=" + first + ".." + last); }
         return true;
     }
 
@@ -7852,12 +8289,12 @@ public class WeiboLiteHook {
             sTimelineRefreshAnchorUntilMs = SystemClock.elapsedRealtime() + REFRESH_ANCHOR_WINDOW_MS;
             sTimelineRefreshAnchorPosition = -1;
             sTimelineRefreshAnchorGeneration++;
-            log("Timeline refresh anchor advanced source=" + source
+            { if (Diagnostics.shouldLog("Timeline refresh anchor advanced source=")) log("Timeline refresh anchor advanced source=" + source
                 + " from=" + activeId
                 + " to=" + incomingNewestId
-                + " reason=newer-incoming");
+                + " reason=newer-incoming"); }
         } catch (Throwable t) {
-            log("Timeline refresh anchor advance error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline refresh anchor advance error source=")) log("Timeline refresh anchor advance error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -7884,8 +8321,8 @@ public class WeiboLiteHook {
             if (incoming > 1) return false;
 
             int count = mergedData == null ? getTimelineStatusCount(presenter) : countTimelineStatuses(mergedData);
-            log("Timeline gap-fill empty page paused source=" + source
-                + " incoming=" + incoming + " count=" + count);
+            { if (Diagnostics.shouldLog("Timeline gap-fill empty page paused source=")) log("Timeline gap-fill empty page paused source=" + source
+                + " incoming=" + incoming + " count=" + count); }
             suppressTimelineGapFillShowData();
             postTimelineGapFillProgress(
                 "正在补齐中间微博\n当前游标空页，改用备用位置",
@@ -7904,7 +8341,7 @@ public class WeiboLiteHook {
             stopTimelineGapFill(source + "-empty-page");
             return true;
         } catch (Throwable t) {
-            log("Timeline gap-fill empty-page pause error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill empty-page pause error source=")) log("Timeline gap-fill empty-page pause error source=" + source + ": " + t.getMessage()); }
             return false;
         }
     }
@@ -7929,17 +8366,20 @@ public class WeiboLiteHook {
     }
 
     private static void completeTimelineGapFillFromServerEmpty(Object presenter, int count, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("gap", "completeTimelineGapFillFromServerEmpty");
+        Throwable diagnosticError = null;
+        try {
         int pages;
         String proof;
         synchronized (sTimelineGapFillState) {
             GapFillState state = sTimelineGapFillState;
             pages = state.requestedPages;
             proof = describeTimelineGapFillEmptyProofLocked(state);
-            log("Timeline gap-fill completed source=" + source
+            { if (Diagnostics.shouldLog("Timeline gap-fill completed source=")) log("Timeline gap-fill completed source=" + source
                 + " reason=server-empty"
                 + " pages=" + pages
                 + " count=" + count
-                + " " + proof);
+                + " " + proof); }
             suppressTimelineGapFillShowData();
             postTimelineGapFillProgress(
                 "已加载完成\n服务器确认没有更多可补齐",
@@ -7951,6 +8391,9 @@ public class WeiboLiteHook {
         if (presenter != null) {
             scheduleTimelineCompletion(presenter, "gap-fill-server-empty", pages, count);
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     /** Capture target-owned containers on the caller, then prepare only private copies off the UI thread. */
@@ -7963,7 +8406,7 @@ public class WeiboLiteHook {
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             final int days = getTimelineCacheDaysSetting();
             if (!sTimelineCacheDaysSettingConfirmed) {
-                log("Timeline completion deferred until setting is confirmed source=" + source);
+                { if (Diagnostics.shouldLog("Timeline completion deferred until setting is confirmed source=")) log("Timeline completion deferred until setting is confirmed source=" + source); }
                 return;
             }
             Object data = XposedHelpers.callMethod(presenter, "getStatusList");
@@ -7980,9 +8423,9 @@ public class WeiboLiteHook {
             final File nativeFile = builder == null ? null : getTimelineNativeCacheFile(builder);
             final int generation = sTimelineCompletionGeneration.incrementAndGet();
             final long queuedAt = SystemClock.elapsedRealtime();
-            log("Timeline completion queued source=" + source + " generation=" + generation
-                + " live=" + live.size() + " cumulative=" + cumulative.size());
-            sTimelineRestoreExecutor.execute(new Runnable() {
+            { if (Diagnostics.shouldLog("Timeline completion queued source=")) log("Timeline completion queued source=" + source + " generation=" + generation
+                + " live=" + live.size() + " cumulative=" + cumulative.size()); }
+            executeTimelineTask(sTimelineRestoreExecutor, new Runnable() {
                 @Override public void run() {
                     try {
                         if (generation != sTimelineCompletionGeneration.get() || sTimelineCacheClearInFlight) return;
@@ -8013,11 +8456,11 @@ public class WeiboLiteHook {
                             ? liveStats : stats;
                         final long newestId = getNewestTimelineStatusId(retained);
                         final String maxId = action == null ? "0" : getTimelineCacheMaxId(action, retained);
-                        log("Timeline completion prepared source=" + source + " generation=" + generation
+                        { if (Diagnostics.shouldLog("Timeline completion prepared source=")) log("Timeline completion prepared source=" + source + " generation=" + generation
                             + " queueMs=" + (started - queuedAt)
                             + " prepareMs=" + (SystemClock.elapsedRealtime() - started)
-                            + " retained=" + retained.size() + " expired=" + expired.size());
-                        HotReloadRuntime.post(new Runnable() {
+                            + " retained=" + retained.size() + " expired=" + expired.size()); }
+                        postTimelineResult(new Runnable() {
                             @Override public void run() {
                                 try {
                                     if (generation != sTimelineCompletionGeneration.get()
@@ -8025,12 +8468,12 @@ public class WeiboLiteHook {
                                         || sTimelineCacheClearInFlight || isTimelineCacheRestoreInFlight(presenter)
                                         || !"-1".equals(getTimelineGroupId(presenter))
                                         || days != getTimelineCacheDaysSetting()) {
-                                        log("Timeline completion superseded source=" + source
-                                            + " generation=" + generation);
+                                        { if (Diagnostics.shouldLog("Timeline completion superseded source=")) log("Timeline completion superseded source=" + source
+                                            + " generation=" + generation); }
                                         return;
                                     }
                                     if (dataGeneration != sTimelineDataGeneration.get()) {
-                                        log("Timeline completion refreshing snapshot source=" + source);
+                                        { if (Diagnostics.shouldLog("Timeline completion refreshing snapshot source=")) log("Timeline completion refreshing snapshot source=" + source); }
                                         scheduleTimelineCompletion(presenter, source, pages, getTimelineStatusCount(presenter));
                                         return;
                                     }
@@ -8057,7 +8500,7 @@ public class WeiboLiteHook {
                                             maxId, source + "-complete", false, stats));
                                     }
                                     final int markerGeneration = sTimelineCompletionGeneration.get();
-                                    sTimelinePersistExecutor.execute(new Runnable() {
+                                    executeTimelineTask(sTimelinePersistExecutor, new Runnable() {
                                         @Override public void run() {
                                             if (markerGeneration != sTimelineCompletionGeneration.get()
                                                 || sTimelineCacheClearInFlight) return;
@@ -8065,17 +8508,17 @@ public class WeiboLiteHook {
                                         }
                                     });
                                 } catch (Throwable t) {
-                                    log("Timeline completion apply error source=" + source + ": " + t.getMessage());
+                                    { if (Diagnostics.shouldLog("Timeline completion apply error source=")) log("Timeline completion apply error source=" + source + ": " + t.getMessage()); }
                                 }
                             }
                         });
                     } catch (Throwable t) {
-                        log("Timeline completion prepare error source=" + source + ": " + t.getMessage());
+                        { if (Diagnostics.shouldLog("Timeline completion prepare error source=")) log("Timeline completion prepare error source=" + source + ": " + t.getMessage()); }
                     }
                 }
             });
         } catch (Throwable t) {
-            log("Timeline completion schedule error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline completion schedule error source=")) log("Timeline completion schedule error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -8083,13 +8526,13 @@ public class WeiboLiteHook {
         if (state == null || !state.active) return false;
         if (state.requestedPages >= getTimelinePreloadMaxPages()) return false;
         if (state.fallbackAttempts >= TIMELINE_GAP_FILL_MAX_FALLBACKS) {
-            log("Timeline gap-fill fallback exhausted source=" + source
+            { if (Diagnostics.shouldLog("Timeline gap-fill fallback exhausted source=")) log("Timeline gap-fill fallback exhausted source=" + source
                 + " attempts=" + state.fallbackAttempts
                 + " gapCursor=" + state.gapCursorId
                 + " cursor=" + state.cursorId
                 + " target=" + state.targetId
                 + " count=" + count
-                + " " + describeTimelineGapFillEmptyProofLocked(state));
+                + " " + describeTimelineGapFillEmptyProofLocked(state)); }
             return false;
         }
 
@@ -8101,13 +8544,13 @@ public class WeiboLiteHook {
             nextAttempt
         );
         if (nextCursor <= 0L || nextCursor == state.cursorId || nextCursor <= state.targetId) {
-            log("Timeline gap-fill fallback unavailable source=" + source
+            { if (Diagnostics.shouldLog("Timeline gap-fill fallback unavailable source=")) log("Timeline gap-fill fallback unavailable source=" + source
                 + " attempt=" + nextAttempt
                 + " gapCursor=" + state.gapCursorId
                 + " cursor=" + state.cursorId
                 + " target=" + state.targetId
                 + " count=" + count
-                + " " + describeTimelineGapFillEmptyProofLocked(state));
+                + " " + describeTimelineGapFillEmptyProofLocked(state)); }
             return false;
         }
 
@@ -8118,12 +8561,12 @@ public class WeiboLiteHook {
         state.scheduled = false;
         state.untilElapsedMs = SystemClock.elapsedRealtime() + TIMELINE_GAP_FILL_WINDOW_MS;
         suppressTimelineGapFillShowData();
-        log("Timeline gap-fill fallback retry source=" + source
+        { if (Diagnostics.shouldLog("Timeline gap-fill fallback retry source=")) log("Timeline gap-fill fallback retry source=" + source
             + " attempt=" + nextAttempt
             + " nextCursor=" + nextCursor
             + " gapCursor=" + state.gapCursorId
             + " target=" + state.targetId
-            + " count=" + count);
+            + " count=" + count); }
         postTimelineGapFillProgress(
             "正在补齐中间微博\n备用位置第 " + nextAttempt + " 次 · 已缓存 " + count + " 条",
             false,
@@ -8183,7 +8626,7 @@ public class WeiboLiteHook {
             }
             scheduleTimelineGapFill(presenter, source + "-gap-fill");
         } catch (Throwable t) {
-            log("Timeline gap-fill continue error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill continue error source=")) log("Timeline gap-fill continue error source=" + source + ": " + t.getMessage()); }
             stopTimelineGapFill(source + "-error");
         }
     }
@@ -8213,7 +8656,7 @@ public class WeiboLiteHook {
                 }
             }
         } catch (Throwable t) {
-            log("Timeline gap-fill checkpoint error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill checkpoint error source=")) log("Timeline gap-fill checkpoint error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -8235,7 +8678,7 @@ public class WeiboLiteHook {
                 scanTimelineGap(sorted, getTimelineVerifiedNaturalGapKeys(presenter))
             );
         } catch (Throwable t) {
-            log("Timeline gap-fill scan error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill scan error source=")) log("Timeline gap-fill scan error source=" + source + ": " + t.getMessage()); }
             return null;
         }
     }
@@ -8256,8 +8699,8 @@ public class WeiboLiteHook {
                 GapFillState state = sTimelineGapFillState;
                 long now = SystemClock.elapsedRealtime();
                 if (state.active && now > state.untilElapsedMs) {
-                    log("Timeline gap-fill expired source=" + source
-                        + " cursor=" + state.cursorId + " target=" + state.targetId);
+                    { if (Diagnostics.shouldLog("Timeline gap-fill expired source=")) log("Timeline gap-fill expired source=" + source
+                        + " cursor=" + state.cursorId + " target=" + state.targetId); }
                     postTimelineGapFillProgress(
                         "补齐已暂停\n微博轻享版回到前台后可继续刷新补齐",
                         true,
@@ -8271,8 +8714,8 @@ public class WeiboLiteHook {
                 }
                 if (gap == null) {
                     if (state.active) {
-                        log("Timeline gap-fill completed source=" + source
-                            + " pages=" + state.requestedPages + " count=" + count);
+                        { if (Diagnostics.shouldLog("Timeline gap-fill completed source=")) log("Timeline gap-fill completed source=" + source
+                            + " pages=" + state.requestedPages + " count=" + count); }
                         postTimelineGapFillProgress(
                             "中间微博已补齐\n已缓存 " + count + " 条",
                             true,
@@ -8286,11 +8729,11 @@ public class WeiboLiteHook {
                 if (responseArrived && state.active
                     && state.gapCursorId == gap.cursorId
                     && state.targetId == gap.targetId) {
-                    log("Timeline gap-fill stalled source=" + source
+                    { if (Diagnostics.shouldLog("Timeline gap-fill stalled source=")) log("Timeline gap-fill stalled source=" + source
                         + " cursor=" + gap.cursorId
                         + " target=" + gap.targetId
                         + " gap=" + gap.distance
-                        + " count=" + count);
+                        + " count=" + count); }
                     if (prepareTimelineGapFillFallbackLocked(state, count, source + "-stalled")) {
                         return copyTimelineGapForRequest(gap, state.cursorId);
                     }
@@ -8318,11 +8761,11 @@ public class WeiboLiteHook {
                 } else if (state.fallbackAttempts > 0 && state.targetId != gap.targetId) {
                     state.cursorId = gap.targetId;
                     resetTimelineGapFillEmptyProofLocked(state);
-                    log("Timeline gap-fill fallback advanced source=" + source
+                    { if (Diagnostics.shouldLog("Timeline gap-fill fallback advanced source=")) log("Timeline gap-fill fallback advanced source=" + source
                         + " gapCursor=" + gap.cursorId
                         + " nextCursor=" + state.cursorId
                         + " target=" + gap.targetId
-                        + " attempts=" + state.fallbackAttempts);
+                        + " attempts=" + state.fallbackAttempts); }
                 } else if (state.fallbackAttempts <= 0) {
                     state.cursorId = gap.cursorId;
                 }
@@ -8333,7 +8776,7 @@ public class WeiboLiteHook {
                 state.lastCount = count;
                 state.untilElapsedMs = now + TIMELINE_GAP_FILL_WINDOW_MS;
                 suppressTimelineGapFillShowData();
-                log("Timeline gap-fill active source=" + source
+                { if (Diagnostics.shouldLog("Timeline gap-fill active source=")) log("Timeline gap-fill active source=" + source
                     + " cursor=" + gap.cursorId
                     + " requestCursor=" + state.cursorId
                     + " target=" + gap.targetId
@@ -8341,7 +8784,7 @@ public class WeiboLiteHook {
                     + " index=" + gap.index
                     + " count=" + count
                     + " pages=" + state.requestedPages
-                    + " fallback=" + state.fallbackAttempts);
+                    + " fallback=" + state.fallbackAttempts); }
                 postTimelineGapFillProgress(
                     buildTimelineGapFillProgressText(state.requestedPages, count, gap.distance),
                     false,
@@ -8350,7 +8793,7 @@ public class WeiboLiteHook {
                 return copyTimelineGapForRequest(gap, state.cursorId);
             }
         } catch (Throwable t) {
-            log("Timeline gap-fill update error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill update error source=")) log("Timeline gap-fill update error source=" + source + ": " + t.getMessage()); }
             return null;
         }
     }
@@ -8481,7 +8924,7 @@ public class WeiboLiteHook {
         }
 
         boolean added = rememberTimelineVerifiedNaturalGap(presenter, gapCursorId, targetId);
-        log("Timeline gap-fill boundary crossed source=" + source
+        { if (Diagnostics.shouldLog("Timeline gap-fill boundary crossed source=")) log("Timeline gap-fill boundary crossed source=" + source
             + " gapCursor=" + gapCursorId
             + " target=" + targetId
             + " requestCursor=" + requestedCursorId
@@ -8489,7 +8932,7 @@ public class WeiboLiteHook {
             + " returnedMin=" + returnedMinId
             + " returned=" + returnedCount
             + " containsTarget=" + containsTarget
-            + " remembered=" + added);
+            + " remembered=" + added); }
     }
 
     private static Map<String, Boolean> getTimelineVerifiedNaturalGapKeys(Object presenter) {
@@ -8522,7 +8965,7 @@ public class WeiboLiteHook {
         try {
             writeTextFileAtomically(getTimelineVerifiedNaturalGapsFile(scope), content);
         } catch (Throwable t) {
-            log("Timeline verified natural gap persist error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline verified natural gap persist error: ")) log("Timeline verified natural gap persist error: " + t.getMessage()); }
         }
         return true;
     }
@@ -8562,7 +9005,7 @@ public class WeiboLiteHook {
                 if (sTimelineVerifiedNaturalGaps.size() >= TIMELINE_VERIFIED_NATURAL_GAP_LIMIT) break;
             }
         } catch (Throwable t) {
-            log("Timeline verified natural gaps read error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline verified natural gaps read error: ")) log("Timeline verified natural gaps read error: " + t.getMessage()); }
         } finally {
             closeQuietly(reader);
         }
@@ -8606,6 +9049,7 @@ public class WeiboLiteHook {
 
     private static void scheduleTimelineGapFill(final Object presenter, final String source) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
+        if (!ensureTimelineAccount(presenter)) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
             if (sTimelineCacheClearInFlight) return;
@@ -8617,10 +9061,10 @@ public class WeiboLiteHook {
                 GapFillState state = sTimelineGapFillState;
                 if (!state.active || state.scheduled || state.inFlight) return;
                 if (state.requestedPages >= getTimelinePreloadMaxPages()) {
-                    log("Timeline gap-fill safety stop source=" + source
+                    { if (Diagnostics.shouldLog("Timeline gap-fill safety stop source=")) log("Timeline gap-fill safety stop source=" + source
                         + " pages=" + state.requestedPages
                         + " cursor=" + state.cursorId
-                        + " target=" + state.targetId);
+                        + " target=" + state.targetId); }
                     postTimelineGapFillProgress(
                         "补齐已暂停\n已到安全页数上限",
                         true,
@@ -8633,21 +9077,21 @@ public class WeiboLiteHook {
                 requestToken = state.requestToken;
                 delayMs = getTimelineGapFillDelayMsLocked(state);
             }
-            HotReloadRuntime.postDelayed(new Runnable() {
+            postTimelineResultDelayed(new Runnable() {
                 @Override
                 public void run() {
                     synchronized (sTimelineGapFillState) {
                         if (!sTimelineGapFillState.active || !sTimelineGapFillState.scheduled
                             || sTimelineGapFillState.requestToken != requestToken) return;
                     }
-                    log("Timeline gap-fill request dispatched source=" + source
+                    { if (Diagnostics.shouldLog("Timeline gap-fill request dispatched source=")) log("Timeline gap-fill request dispatched source=" + source
                         + " plannedDelayMs=" + delayMs
-                        + " actualDelayMs=" + (SystemClock.elapsedRealtime() - queuedAt));
+                        + " actualDelayMs=" + (SystemClock.elapsedRealtime() - queuedAt)); }
                     requestTimelineGapFill(presenter, source);
                 }
             }, delayMs);
         } catch (Throwable t) {
-            log("Timeline gap-fill schedule error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill schedule error source=")) log("Timeline gap-fill schedule error source=" + source + ": " + t.getMessage()); }
             stopTimelineGapFill(source + "-schedule-error");
         }
     }
@@ -8660,6 +9104,7 @@ public class WeiboLiteHook {
 
     private static void requestTimelineGapFill(final Object presenter, String source) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_GAP_FILL))) return;
+        if (!ensureTimelineAccount(presenter)) return;
         final int token;
         long cursorId;
         long targetId;
@@ -8676,10 +9121,10 @@ public class WeiboLiteHook {
                 state.scheduled = false;
                 if (!state.active || state.inFlight) return;
                 if (state.requestedPages >= getTimelinePreloadMaxPages()) {
-                    log("Timeline gap-fill safety stop source=" + source
+                    { if (Diagnostics.shouldLog("Timeline gap-fill safety stop source=")) log("Timeline gap-fill safety stop source=" + source
                         + " pages=" + state.requestedPages
                         + " cursor=" + state.cursorId
-                        + " target=" + state.targetId);
+                        + " target=" + state.targetId); }
                     postTimelineGapFillProgress(
                         "补齐已暂停\n已到安全页数上限",
                         true,
@@ -8702,27 +9147,27 @@ public class WeiboLiteHook {
 
             Object action = getTimelineAction(presenter);
             if (action == null) {
-                log("Timeline gap-fill skipped source=" + source + " no action");
+                { if (Diagnostics.shouldLog("Timeline gap-fill skipped source=")) log("Timeline gap-fill skipped source=" + source + " no action"); }
                 stopTimelineGapFill(source + "-no-action");
                 return;
             }
             syncTimelineActionMaxId(action, String.valueOf(cursorId), source + "-request");
-            log("Timeline gap-fill loadMore page=" + page
+            { if (Diagnostics.shouldLog("Timeline gap-fill loadMore page=")) log("Timeline gap-fill loadMore page=" + page
                 + " cursor=" + cursorId
                 + " target=" + targetId
                 + " count=" + count
                 + " source=" + source
-                + (fallbackAttempts > 0 ? " fallback=" + fallbackAttempts : ""));
+                + (fallbackAttempts > 0 ? " fallback=" + fallbackAttempts : "")); }
             suppressTimelineGapFillShowData();
             XposedHelpers.callMethod(presenter, "loadMore");
-            HotReloadRuntime.postDelayed(new Runnable() {
+            postTimelineResultDelayed(new Runnable() {
                 @Override
                 public void run() {
                     finishTimelineGapFillWatchdog(presenter, token);
                 }
             }, TIMELINE_GAP_FILL_WATCHDOG_MS);
         } catch (Throwable t) {
-            log("Timeline gap-fill loadMore error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill loadMore error source=")) log("Timeline gap-fill loadMore error source=" + source + ": " + t.getMessage()); }
             stopTimelineGapFill(source + "-error");
         }
     }
@@ -8740,10 +9185,10 @@ public class WeiboLiteHook {
                 state.inFlight = false;
                 state.scheduled = false;
                 if (count <= state.lastCount) {
-                    log("Timeline gap-fill stalled watchdog cursor=" + state.cursorId
+                    { if (Diagnostics.shouldLog("Timeline gap-fill stalled watchdog cursor=")) log("Timeline gap-fill stalled watchdog cursor=" + state.cursorId
                         + " target=" + state.targetId
                         + " pages=" + state.requestedPages
-                        + " count=" + count);
+                        + " count=" + count); }
                     shouldRetryFallback = prepareTimelineGapFillFallbackLocked(
                         state,
                         count,
@@ -8784,7 +9229,7 @@ public class WeiboLiteHook {
                 }
             }
         } catch (Throwable t) {
-            log("Timeline gap-fill watchdog error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill watchdog error: ")) log("Timeline gap-fill watchdog error: " + t.getMessage()); }
             stopTimelineGapFill("gap-fill-watchdog-error");
         }
     }
@@ -8793,10 +9238,10 @@ public class WeiboLiteHook {
         synchronized (sTimelineGapFillState) {
             GapFillState state = sTimelineGapFillState;
             if (state.active || state.scheduled || state.inFlight) {
-                log("Timeline gap-fill stopped source=" + source
+                { if (Diagnostics.shouldLog("Timeline gap-fill stopped source=")) log("Timeline gap-fill stopped source=" + source
                     + " pages=" + state.requestedPages
                     + " cursor=" + state.cursorId
-                    + " target=" + state.targetId);
+                    + " target=" + state.targetId); }
                 suppressTimelineGapFillShowData();
                 postTimelineGapFillProgress(
                     "补齐已暂停\n已补 " + state.requestedPages + " 页",
@@ -8849,9 +9294,9 @@ public class WeiboLiteHook {
                 }
             };
             if (Looper.myLooper() == Looper.getMainLooper()) update.run();
-            else HotReloadRuntime.post(update);
+            else postTimelineResult(update);
         } catch (Throwable t) {
-            log("Timeline gap-fill progress post error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill progress post error source=")) log("Timeline gap-fill progress post error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -8865,8 +9310,8 @@ public class WeiboLiteHook {
             if (sTimelineGapFillProgressText != null) {
                 sTimelineGapFillProgressText.setText(text);
             }
-            log("Timeline gap-fill progress updated source=" + source
-                + " generation=" + generation + " terminal=" + hideSoon);
+            { if (Diagnostics.shouldLog("Timeline gap-fill progress updated source=")) log("Timeline gap-fill progress updated source=" + source
+                + " generation=" + generation + " terminal=" + hideSoon); }
             if (sTimelineGapFillProgressBar != null) {
                 sTimelineGapFillProgressBar.setVisibility(hideSoon ? View.GONE : View.VISIBLE);
             }
@@ -8876,7 +9321,7 @@ public class WeiboLiteHook {
             }
             if (hideSoon) {
                 final int hideGeneration = generation;
-                HotReloadRuntime.postDelayed(new Runnable() {
+                postTimelineResultDelayed(new Runnable() {
                     @Override
                     public void run() {
                         if (hideGeneration == sTimelineGapFillProgressGeneration) {
@@ -8886,7 +9331,7 @@ public class WeiboLiteHook {
                 }, TIMELINE_GAP_FILL_PROGRESS_HIDE_MS);
             }
         } catch (Throwable t) {
-            log("Timeline gap-fill progress update error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill progress update error source=")) log("Timeline gap-fill progress update error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -8958,10 +9403,10 @@ public class WeiboLiteHook {
             sTimelineGapFillProgressView = card;
             sTimelineGapFillProgressText = label;
             sTimelineGapFillProgressBar = progress;
-            log("Timeline gap-fill progress shown source=" + source);
+            { if (Diagnostics.shouldLog("Timeline gap-fill progress shown source=")) log("Timeline gap-fill progress shown source=" + source); }
             return true;
         } catch (Throwable t) {
-            log("Timeline gap-fill progress create error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill progress create error source=")) log("Timeline gap-fill progress create error source=" + source + ": " + t.getMessage()); }
             return false;
         }
     }
@@ -9024,10 +9469,10 @@ public class WeiboLiteHook {
                 if (parent instanceof ViewGroup) {
                     ((ViewGroup) parent).removeView(sTimelineGapFillProgressView);
                 }
-                log("Timeline gap-fill progress removed source=" + source);
+                { if (Diagnostics.shouldLog("Timeline gap-fill progress removed source=")) log("Timeline gap-fill progress removed source=" + source); }
             }
         } catch (Throwable t) {
-            log("Timeline gap-fill progress remove error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill progress remove error source=")) log("Timeline gap-fill progress remove error source=" + source + ": " + t.getMessage()); }
         } finally {
             sTimelineGapFillProgressView = null;
             sTimelineGapFillProgressText = null;
@@ -9054,14 +9499,21 @@ public class WeiboLiteHook {
             sTimelineCacheClearButton.setVisibility(showClearButton ? View.VISIBLE : View.GONE);
             if (showJumpButton) sTimelineTimeJumpButton.bringToFront();
             if (showClearButton) sTimelineCacheClearButton.bringToFront();
-            log("Timeline shortcut button visibility updated source=" + source
-                + " jump=" + showJumpButton + " clear=" + showClearButton);
+            { if (Diagnostics.shouldLog("Timeline shortcut button visibility updated source=")) log("Timeline shortcut button visibility updated source=" + source
+                + " jump=" + showJumpButton + " clear=" + showClearButton); }
             return;
         }
         Object recyclerView = getCurrentHomeTimelineRecyclerView();
         if (recyclerView != null) {
             ensureTimelineTimeJumpButton(recyclerView, source + "-create");
         }
+    }
+
+    static boolean useTimelineShortcutPanel(int keyboard, int navigation) {
+        return (keyboard == android.content.res.Configuration.KEYBOARD_NOKEYS
+                || keyboard == android.content.res.Configuration.KEYBOARD_UNDEFINED)
+            && (navigation == android.content.res.Configuration.NAVIGATION_NONAV
+                || navigation == android.content.res.Configuration.NAVIGATION_UNDEFINED);
     }
 
     private static boolean ensureTimelineTimeJumpButton(Object recyclerView, String source) {
@@ -9072,6 +9524,8 @@ public class WeiboLiteHook {
             FrameLayout parent = findTimelineOverlayParent(anchor);
             if (parent == null) return false;
             Activity activity = findHostActivity(anchor.getContext());
+            android.content.res.Configuration input = anchor.getResources().getConfiguration();
+            boolean panelMode = useTimelineShortcutPanel(input.keyboard, input.navigation);
             boolean showJumpButton = feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP) && isModuleOptionEnabled(
                 ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON,
                 ModuleSettings.defaultFor(ModuleSettings.KEY_WEICO_TIMELINE_JUMP_BUTTON)
@@ -9086,7 +9540,8 @@ public class WeiboLiteHook {
             }
             if (sTimelineTimeJumpButton != null
                 && sTimelineCacheClearButton != null
-                && sTimelineTimeJumpActivity == activity) {
+                && sTimelineTimeJumpActivity == activity
+                && sTimelineShortcutPanelMode == panelMode) {
                 sTimelineTimeJumpRecyclerView = recyclerView;
                 sTimelineTimeJumpButton.setVisibility(showJumpButton ? View.VISIBLE : View.GONE);
                 sTimelineCacheClearButton.setVisibility(showClearButton ? View.VISIBLE : View.GONE);
@@ -9121,31 +9576,9 @@ public class WeiboLiteHook {
             button.setAlpha(0.96f);
             button.setElevation(dpToPx(anchor, 6));
             button.setVisibility(showJumpButton ? View.VISIBLE : View.GONE);
-            button.setOnTouchListener(new View.OnTouchListener() {
-                @Override
-                public boolean onTouch(View v, MotionEvent event) {
-                    int action = event.getActionMasked();
-                    if (action == MotionEvent.ACTION_DOWN) {
-                        v.setAlpha(0.76f);
-                        return true;
-                    }
-                    if (action == MotionEvent.ACTION_UP) {
-                        v.setAlpha(0.96f);
-                        Object currentRecyclerView = getCurrentHomeTimelineRecyclerView();
-                        if (currentRecyclerView == null) {
-                            log("Timeline time-jump button ignored no active home recycler");
-                            return true;
-                        }
-                        log("Timeline time-jump button tapped");
-                        showTimelineTimeJumpDialog(currentRecyclerView);
-                        return true;
-                    }
-                    if (action == MotionEvent.ACTION_CANCEL) {
-                        v.setAlpha(0.96f);
-                        return true;
-                    }
-                    return true;
-                }
+            button.setOnClickListener(v -> {
+                Object currentRecyclerView = getCurrentHomeTimelineRecyclerView();
+                if (currentRecyclerView != null) showTimelineTimeJumpDialog(currentRecyclerView);
             });
 
             TextView clearButton = new TextView(context);
@@ -9167,35 +9600,13 @@ public class WeiboLiteHook {
             clearButton.setAlpha(0.96f);
             clearButton.setElevation(dpToPx(anchor, 6));
             clearButton.setVisibility(showClearButton ? View.VISIBLE : View.GONE);
-            clearButton.setOnTouchListener(new View.OnTouchListener() {
-                @Override
-                public boolean onTouch(View v, MotionEvent event) {
-                    int action = event.getActionMasked();
-                    if (action == MotionEvent.ACTION_DOWN) {
-                        v.setAlpha(0.76f);
-                        return true;
-                    }
-                    if (action == MotionEvent.ACTION_UP) {
-                        v.setAlpha(0.96f);
-                        Activity currentActivity = findHostActivity(v.getContext());
-                        if (currentActivity == null || currentActivity.isFinishing()
-                            || currentActivity.isDestroyed()) {
-                            log("Timeline cache-clear button skipped no activity");
-                            return true;
-                        }
-                        log("Timeline cache-clear button tapped");
-                        showTimelineCacheClearRangeDialog(currentActivity);
-                        return true;
-                    }
-                    if (action == MotionEvent.ACTION_CANCEL) {
-                        v.setAlpha(0.96f);
-                        return true;
-                    }
-                    return true;
-                }
+            clearButton.setOnClickListener(v -> {
+                Activity currentActivity = findHostActivity(v.getContext());
+                if (currentActivity != null && !currentActivity.isFinishing()
+                    && !currentActivity.isDestroyed()) showTimelineCacheClearRangeDialog(currentActivity);
             });
 
-            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
+            if (panelMode && activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
                 try {
                     WindowManager.LayoutParams wparams = new WindowManager.LayoutParams(
                         shortcutButtonWidth,
@@ -9232,10 +9643,11 @@ public class WeiboLiteHook {
                     wm.addView(clearButton, clearWparams);
                     sTimelineCacheClearButton = clearButton;
                     sTimelineCacheClearWindowManager = wm;
-                    log("Timeline shortcut buttons shown source=" + source + " via WindowManager");
+                    sTimelineShortcutPanelMode = panelMode;
+                    { if (Diagnostics.shouldLog("Timeline shortcut buttons shown source=")) log("Timeline shortcut buttons shown source=" + source + " via WindowManager"); }
                     return true;
                 } catch (Throwable t) {
-                    log("Timeline time-jump WindowManager failed source=" + source + ": " + t.getMessage());
+                    { if (Diagnostics.shouldLog("Timeline time-jump WindowManager failed source=")) log("Timeline time-jump WindowManager failed source=" + source + ": " + t.getMessage()); }
                     removeTimelineTimeJumpButton("window-fallback");
                 }
             }
@@ -9263,10 +9675,11 @@ public class WeiboLiteHook {
             parent.addView(clearButton, clearLp);
             sTimelineCacheClearButton = clearButton;
             sTimelineCacheClearWindowManager = null;
-            log("Timeline shortcut buttons shown source=" + source + " via parent");
+            sTimelineShortcutPanelMode = panelMode;
+            { if (Diagnostics.shouldLog("Timeline shortcut buttons shown source=")) log("Timeline shortcut buttons shown source=" + source + " via parent"); }
             return true;
         } catch (Throwable t) {
-            log("Timeline time-jump button error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline time-jump button error source=")) log("Timeline time-jump button error source=" + source + ": " + t.getMessage()); }
             removeTimelineTimeJumpButton("create-error");
             return false;
         }
@@ -9276,12 +9689,12 @@ public class WeiboLiteHook {
         try {
             removeTimelineShortcutView(sTimelineTimeJumpButton, sTimelineTimeJumpWindowManager);
         } catch (Throwable t) {
-            log("Timeline jump button remove error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline jump button remove error source=")) log("Timeline jump button remove error source=" + source + ": " + t.getMessage()); }
         }
         try {
             removeTimelineShortcutView(sTimelineCacheClearButton, sTimelineCacheClearWindowManager);
         } catch (Throwable t) {
-            log("Timeline clear button remove error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline clear button remove error source=")) log("Timeline clear button remove error source=" + source + ": " + t.getMessage()); }
         } finally {
             sTimelineTimeJumpButton = null;
             sTimelineTimeJumpWindowManager = null;
@@ -9311,7 +9724,7 @@ public class WeiboLiteHook {
             View anchor = (View) recyclerView;
             final Activity activity = findHostActivity(anchor.getContext());
             if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-                log("Timeline time-jump dialog skipped no activity");
+                { if (Diagnostics.shouldLog("Timeline time-jump dialog skipped no activity")) log("Timeline time-jump dialog skipped no activity"); }
                 return;
             }
 
@@ -9430,11 +9843,11 @@ public class WeiboLiteHook {
             dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setTextColor(0xFFFF5A63);
             dialog.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).setTextColor(0xFFFF5A63);
             input.requestFocus();
-            log("Timeline time-jump dialog range count=" + cacheStats.datedCount
+            { if (Diagnostics.shouldLog("Timeline time-jump dialog range count=")) log("Timeline time-jump dialog range count=" + cacheStats.datedCount
                 + " oldest=" + formatTimelineJumpRangeTime(cacheStats.oldestMs)
-                + " newest=" + formatTimelineJumpRangeTime(cacheStats.newestMs));
+                + " newest=" + formatTimelineJumpRangeTime(cacheStats.newestMs)); }
         } catch (Throwable t) {
-            log("Timeline time-jump dialog error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline time-jump dialog error: ")) log("Timeline time-jump dialog error: " + t.getMessage()); }
         }
     }
 
@@ -9464,8 +9877,8 @@ public class WeiboLiteHook {
                     if (activity != null) {
                         Intent intent = activity.getIntent();
                         return activity.getClass().getName() + " action="
-                            + (intent == null ? "" : intent.getAction()) + " data="
-                            + (intent == null || intent.getData() == null ? "" : intent.getData());
+                            + (intent == null ? "" : intent.getAction()) + " has_data="
+                            + (intent != null && intent.getData() != null);
                     }
                 }
                 type = type.getSuperclass();
@@ -9619,7 +10032,17 @@ public class WeiboLiteHook {
         final String source,
         final int attempt
     ) {
-        if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return false;
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP)) return false;
+        return jumpTimelineToTime(recyclerView, targetMs, dayStartMs, dayEndMs, source, attempt,
+            ++sTimelineEdgeJumpGeneration);
+    }
+
+    private static boolean jumpTimelineToTime(
+        final Object recyclerView, final long targetMs, final long dayStartMs,
+        final long dayEndMs, final String source, final int attempt, final int navigationGeneration
+    ) {
+        if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP)
+            || navigationGeneration != sTimelineEdgeJumpGeneration) return false;
         try {
             if (!isCurrentHomeTimelineRecyclerView(recyclerView)) return false;
             final TimelineTimeJumpTarget target = findTimelineTimeJumpTarget(
@@ -9633,19 +10056,19 @@ public class WeiboLiteHook {
                     recyclerView,
                     dayStartMs > 0L ? "当前缓存中没有这一天的微博" : "当前已加载/缓存中没有可跳转的微博"
                 );
-                log("Timeline time-jump missed source=" + source + " target=" + targetMs
+                { if (Diagnostics.shouldLog("Timeline time-jump missed source=")) log("Timeline time-jump missed source=" + source + " target=" + targetMs
                     + " dayRange=" + dayStartMs + ".." + dayEndMs
-                    + " " + describeTimelineTimeJumpSearch(recyclerView));
+                    + " " + describeTimelineTimeJumpSearch(recyclerView)); }
                 return false;
             }
             if (target.diffMs > TIME_JUMP_MAX_ACCEPT_DIFF_MS) {
                 showTimelineToast(recyclerView, "当前没有这个时间附近的微博");
-                log("Timeline time-jump rejected stale target source=" + source
+                { if (Diagnostics.shouldLog("Timeline time-jump rejected stale target source=")) log("Timeline time-jump rejected stale target source=" + source
                     + " id=" + target.statusId
                     + " input=" + formatTimelineJumpTime(targetMs)
                     + " actual=" + formatTimelineJumpTime(target.createdMs)
                     + " diffMin=" + (target.diffMs / 60000L)
-                    + " " + describeTimelineTimeJumpSearch(recyclerView));
+                    + " " + describeTimelineTimeJumpSearch(recyclerView)); }
                 return false;
             }
             final Object targetRecyclerView = isTimelineRecyclerView(target.recyclerView)
@@ -9657,7 +10080,7 @@ public class WeiboLiteHook {
                         restoreTimelineCumulativeCache(sLastTimelinePresenter, null, source + "-restore");
                         showTimelineToast(targetRecyclerView, "正在恢复缓存后跳转");
                     }
-                    HotReloadRuntime.postDelayed(new Runnable() {
+                    postTimelineResultDelayed(new Runnable() {
                         @Override
                         public void run() {
                             jumpTimelineToTime(
@@ -9666,17 +10089,18 @@ public class WeiboLiteHook {
                                 dayStartMs,
                                 dayEndMs,
                                 source + "-retry",
-                                attempt + 1
+                                attempt + 1,
+                                navigationGeneration
                             );
                         }
                     }, TIME_JUMP_RETRY_MS * 3);
                     return true;
                 }
                 showTimelineToast(targetRecyclerView, "命中缓存，但当前列表还没恢复");
-                log("Timeline time-jump target not in adapter source=" + source
+                { if (Diagnostics.shouldLog("Timeline time-jump target not in adapter source=")) log("Timeline time-jump target not in adapter source=" + source
                     + " id=" + target.statusId
                     + " created=" + target.createdMs
-                    + " searched=" + target.searchedCount);
+                    + " searched=" + target.searchedCount); }
                 return false;
             }
 
@@ -9705,7 +10129,7 @@ public class WeiboLiteHook {
             }
 
             boolean visible = isTimelineTargetVisible(layoutManager, target.adapterPosition);
-            log("Timeline time-jumped source=" + source
+            { if (Diagnostics.shouldLog("Timeline time-jumped source=")) log("Timeline time-jumped source=" + source
                 + " id=" + target.statusId
                 + " input=" + formatTimelineJumpTime(targetMs)
                 + " actual=" + formatTimelineJumpTime(target.createdMs)
@@ -9716,9 +10140,9 @@ public class WeiboLiteHook {
                 + " offset=" + offset
                 + " usedOffset=" + usedOffset
                 + " visible=" + visible + " "
-                + describeTimelineViewport(targetRecyclerView, layoutManager));
+                + describeTimelineViewport(targetRecyclerView, layoutManager)); }
             if (!visible && attempt < TIME_JUMP_MAX_ATTEMPTS) {
-                HotReloadRuntime.postDelayed(new Runnable() {
+                postTimelineResultDelayed(new Runnable() {
                     @Override
                     public void run() {
                         jumpTimelineToTime(
@@ -9727,7 +10151,8 @@ public class WeiboLiteHook {
                             dayStartMs,
                             dayEndMs,
                             source,
-                            attempt + 1
+                            attempt + 1,
+                            navigationGeneration
                         );
                     }
                 }, TIME_JUMP_RETRY_MS);
@@ -9737,7 +10162,7 @@ public class WeiboLiteHook {
             }
             return true;
         } catch (Throwable t) {
-            log("Timeline time-jump error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline time-jump error source=")) log("Timeline time-jump error source=" + source + ": " + t.getMessage()); }
             return false;
         }
     }
@@ -9985,7 +10410,7 @@ public class WeiboLiteHook {
         try {
             if (!(recyclerView instanceof View) || !hasMeaningfulString(text)) return;
             final Context context = ((View) recyclerView).getContext();
-            HotReloadRuntime.post(new Runnable() {
+            postTimelineResult(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -10105,15 +10530,15 @@ public class WeiboLiteHook {
                     SystemClock.elapsedRealtime() + 3500L
                 );
             }
-            log("Timeline gap-fill viewport anchor captured source=" + source
+            { if (Diagnostics.shouldLog("Timeline gap-fill viewport anchor captured source=")) log("Timeline gap-fill viewport anchor captured source=" + source
                 + " id=" + anchorStatusId
                 + " position=" + anchorPosition
                 + " top=" + topOffset
                 + " layoutOffset=" + layoutOffset
                 + " visible=" + min + ".." + max
-                + " generation=" + generation);
+                + " generation=" + generation); }
         } catch (Throwable t) {
-            log("Timeline gap-fill viewport anchor capture error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline gap-fill viewport anchor capture error source=")) log("Timeline gap-fill viewport anchor capture error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -10133,7 +10558,7 @@ public class WeiboLiteHook {
         long[] delays = {0L, 80L, 300L, 900L};
         for (int i = 0; i < delays.length; i++) {
             final int attempt = i;
-            HotReloadRuntime.postDelayed(new Runnable() {
+            postTimelineResultDelayed(new Runnable() {
                 @Override
                 public void run() {
                     restoreTimelineGapFillViewportAnchor(anchor, source, attempt);
@@ -10169,18 +10594,18 @@ public class WeiboLiteHook {
                 anchor.layoutOffset
             );
             if (attempt == 0 || attempt == 3) {
-                log("Timeline gap-fill viewport anchor restored source=" + source
+                { if (Diagnostics.shouldLog("Timeline gap-fill viewport anchor restored source=")) log("Timeline gap-fill viewport anchor restored source=" + source
                     + " id=" + anchor.statusId
                     + " target=" + target
                     + " top=" + anchor.topOffset
                     + " layoutOffset=" + anchor.layoutOffset
                     + " attempt=" + attempt
-                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+                    + " " + describeTimelineViewport(recyclerView, layoutManager)); }
             }
         } catch (Throwable t) {
             if (attempt == 3) {
-                log("Timeline gap-fill viewport anchor restore error source=" + source
-                    + ": " + t.getMessage());
+                { if (Diagnostics.shouldLog("Timeline gap-fill viewport anchor restore error source=")) log("Timeline gap-fill viewport anchor restore error source=" + source
+                    + ": " + t.getMessage()); }
             }
         }
     }
@@ -10195,7 +10620,7 @@ public class WeiboLiteHook {
             }
         }
         if (cancelled) {
-            log("Timeline gap-fill viewport anchor cancelled source=" + source);
+            { if (Diagnostics.shouldLog("Timeline gap-fill viewport anchor cancelled source=")) log("Timeline gap-fill viewport anchor cancelled source=" + source); }
         }
     }
 
@@ -10215,7 +10640,7 @@ public class WeiboLiteHook {
             scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, 2, 900L);
         }
         if (!scheduled) {
-            log("Timeline refresh anchor pending source=" + source + " id=" + statusId + " no recycler");
+            { if (Diagnostics.shouldLog("Timeline refresh anchor pending source=")) log("Timeline refresh anchor pending source=" + source + " id=" + statusId + " no recycler"); }
         }
         return scheduled;
     }
@@ -10229,7 +10654,7 @@ public class WeiboLiteHook {
         long delayMs
     ) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ))) return;
-        HotReloadRuntime.postDelayed(new Runnable() {
+        postTimelineResultDelayed(new Runnable() {
             @Override
             public void run() {
                 anchorTimelineRefreshPosition(recyclerView, statusId, generation, source, attempt);
@@ -10255,7 +10680,7 @@ public class WeiboLiteHook {
                 if (attempt < REFRESH_ANCHOR_MAX_ATTEMPTS) {
                     scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, attempt + 1, 180L);
                 } else {
-                    log("Timeline refresh anchor target missing source=" + source + " id=" + statusId);
+                    { if (Diagnostics.shouldLog("Timeline refresh anchor target missing source=")) log("Timeline refresh anchor target missing source=" + source + " id=" + statusId); }
                 }
                 return;
             }
@@ -10280,26 +10705,26 @@ public class WeiboLiteHook {
             if (isTimelineTargetVisible(layoutManager, target)) {
                 consumeTimelineRefreshAnchor(statusId);
                 cancelTimelineTopAnchorsForRefresh(source + "-done");
-                log("Timeline refresh anchor restored source=" + source
+                { if (Diagnostics.shouldLog("Timeline refresh anchor restored source=")) log("Timeline refresh anchor restored source=" + source
                     + " id=" + statusId
                     + " target=" + target
                     + " attempt=" + attempt
                     + " offset=" + offset
                     + " usedOffset=" + usedOffset
-                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+                    + " " + describeTimelineViewport(recyclerView, layoutManager)); }
                 return;
             }
 
             if (attempt < REFRESH_ANCHOR_MAX_ATTEMPTS) {
                 scheduleTimelineRefreshAnchor(recyclerView, statusId, generation, source, attempt + 1, 180L);
             } else {
-                log("Timeline refresh anchor not visible source=" + source
+                { if (Diagnostics.shouldLog("Timeline refresh anchor not visible source=")) log("Timeline refresh anchor not visible source=" + source
                     + " id=" + statusId
                     + " target=" + target
-                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+                    + " " + describeTimelineViewport(recyclerView, layoutManager)); }
             }
         } catch (Throwable t) {
-            log("Timeline refresh anchor error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline refresh anchor error source=")) log("Timeline refresh anchor error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -10401,7 +10826,7 @@ public class WeiboLiteHook {
         Object recyclerView = getCurrentHomeTimelineRecyclerView();
         boolean jumped = jumpTimelineToAbsoluteTop(recyclerView, source, 0);
         if (!jumped) {
-            log("Timeline absolute top jump skipped source=" + source + " no active home recycler");
+            { if (Diagnostics.shouldLog("Timeline absolute top jump skipped source=")) log("Timeline absolute top jump skipped source=" + source + " no active home recycler"); }
         }
     }
 
@@ -10409,7 +10834,7 @@ public class WeiboLiteHook {
         Object recyclerView = getCurrentHomeTimelineRecyclerView();
         boolean jumped = jumpTimelineToAbsoluteBottom(recyclerView, source, 0);
         if (!jumped) {
-            log("Timeline absolute bottom jump skipped source=" + source + " no active home recycler");
+            { if (Diagnostics.shouldLog("Timeline absolute bottom jump skipped source=")) log("Timeline absolute bottom jump skipped source=" + source + " no active home recycler"); }
         }
     }
 
@@ -10427,17 +10852,26 @@ public class WeiboLiteHook {
         final int attempt,
         final boolean top
     ) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("navigation", "jumpTimelineToAbsoluteEdge");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return false;
         int generation = ++sTimelineEdgeJumpGeneration;
         HotReloadRuntime.removeCallbacks(sTimelineEdgeJumpRetry);
         sTimelineEdgeJumpRetry = null;
         return jumpTimelineToAbsoluteEdge(recyclerView, source, attempt, top, generation, -1, 0L);
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static boolean jumpTimelineToAbsoluteEdge(
         final Object recyclerView, final String source, final int attempt, final boolean top,
         final int generation, final int previousTarget, final long previousId
     ) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("navigation", "jumpTimelineToAbsoluteEdge");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_JUMP))) return false;
         try {
             if (generation != sTimelineEdgeJumpGeneration) return false;
@@ -10452,7 +10886,7 @@ public class WeiboLiteHook {
                 : getTimelineAbsoluteBottomAdapterPosition(recyclerView));
             String edge = top ? "top" : "bottom";
             if (target < 0) {
-                log("Timeline absolute " + edge + " jump skipped source=" + source + " no target");
+                { if (Diagnostics.shouldLog("Timeline absolute ")) log("Timeline absolute " + edge + " jump skipped source=" + source + " no target"); }
                 return false;
             }
 
@@ -10479,11 +10913,11 @@ public class WeiboLiteHook {
                 state.untilElapsedMs = 0L;
                 state.attempts = TOP_ANCHOR_MAX_ATTEMPTS;
             }
-            log("Timeline absolute " + edge + " jumped source=" + source + " target=" + target
+            { if (Diagnostics.shouldLog("Timeline absolute ")) log("Timeline absolute " + edge + " jumped source=" + source + " target=" + target
                 + " attempt=" + attempt + " generation=" + generation
                 + " elapsedMs=" + (SystemClock.elapsedRealtime() - started)
                 + " reusedTarget=" + reusable + " offset=" + offset + " usedOffset=" + usedOffset + " "
-                + describeTimelineViewport(recyclerView, layoutManager));
+                + describeTimelineViewport(recyclerView, layoutManager)); }
             if (!isTimelineTargetVisible(layoutManager, target) && attempt < TOP_BAR_JUMP_MAX_ATTEMPTS) {
                 final long targetId = getTimelineAdapterDataStatusId(adapter, target - headers);
                 sTimelineEdgeJumpRetry = new Runnable() {
@@ -10495,14 +10929,17 @@ public class WeiboLiteHook {
                             generation, target, targetId);
                     }
                 };
-                HotReloadRuntime.postDelayed(sTimelineEdgeJumpRetry, TOP_BAR_JUMP_RETRY_MS);
+                postTimelineResultDelayed(sTimelineEdgeJumpRetry, TOP_BAR_JUMP_RETRY_MS);
             }
             return true;
         } catch (Throwable t) {
-            log("Timeline absolute " + (top ? "top" : "bottom")
-                + " jump error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline absolute ")) log("Timeline absolute " + (top ? "top" : "bottom")
+                + " jump error source=" + source + ": " + t.getMessage()); }
             return false;
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static int getTimelineAbsoluteTopAdapterPosition(Object recyclerView) {
@@ -10583,7 +11020,7 @@ public class WeiboLiteHook {
             state.finishing = false;
         }
         beginTimelineLoadMoreSuppression(source);
-        log("Timeline top anchor begin source=" + source);
+        { if (Diagnostics.shouldLog("Timeline top anchor begin source=")) log("Timeline top anchor begin source=" + source); }
         scheduleTimelineTopAnchor(recyclerView, source, 50L);
         scheduleTimelineTopAnchor(recyclerView, source, 350L);
         scheduleTimelineTopAnchor(recyclerView, source, 900L);
@@ -10606,7 +11043,7 @@ public class WeiboLiteHook {
             }
         }
         sSuppressTimelineLoadMoreUntilMs = 0L;
-        log("Timeline top anchors suspended source=" + source);
+        { if (Diagnostics.shouldLog("Timeline top anchors suspended source=")) log("Timeline top anchors suspended source=" + source); }
     }
 
     private static void finishTimelineTopAnchor(Object recyclerView, String source) {
@@ -10622,7 +11059,7 @@ public class WeiboLiteHook {
             state.finishing = true;
         }
         beginTimelineLoadMoreSuppression(source);
-        log("Timeline top anchor finish source=" + source);
+        { if (Diagnostics.shouldLog("Timeline top anchor finish source=")) log("Timeline top anchor finish source=" + source); }
         scheduleTimelineTopAnchor(recyclerView, source, 120L);
     }
 
@@ -10637,7 +11074,7 @@ public class WeiboLiteHook {
             generation = state.generation;
             state.attempts++;
         }
-        HotReloadRuntime.postDelayed(new Runnable() {
+        postTimelineResultDelayed(new Runnable() {
             @Override
             public void run() {
                 anchorTimelineTop(recyclerView, source, generation);
@@ -10726,15 +11163,15 @@ public class WeiboLiteHook {
                 showTimelineLastReadMarker(recyclerView);
             }
             if (logTarget) {
-                log("Timeline top anchored source=" + source + " target=" + target + " offset=" + offset
+                { if (Diagnostics.shouldLog("Timeline top anchored source=")) log("Timeline top anchored source=" + source + " target=" + target + " offset=" + offset
                     + " usedOffset=" + usedOffset
-                    + " " + describeTimelineViewport(recyclerView, layoutManager));
+                    + " " + describeTimelineViewport(recyclerView, layoutManager)); }
             }
             if (shouldRepeat) {
                 scheduleTimelineTopAnchor(recyclerView, source, 250L);
             }
         } catch (Throwable t) {
-            log("Timeline top anchor error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline top anchor error source=")) log("Timeline top anchor error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -10808,8 +11245,8 @@ public class WeiboLiteHook {
             }
             if (bestPosition >= 0 && bestStatusId != getLastReadStatusId()) {
                 sLastReadStatusId = Long.valueOf(bestStatusId);
-                log("Timeline last-read history fallback selected id=" + bestStatusId
-                    + " rank=" + bestRank + " position=" + bestPosition);
+                { if (Diagnostics.shouldLog("Timeline last-read history fallback selected id=")) log("Timeline last-read history fallback selected id=" + bestStatusId
+                    + " rank=" + bestRank + " position=" + bestPosition); }
             }
             return bestPosition;
         } catch (Throwable ignored) {}
@@ -10881,7 +11318,7 @@ public class WeiboLiteHook {
     private static void schedulePersistTimelineLastRead(final Object recyclerView, final String source, long delayMs) {
         if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_LAST_READ)) return;
         if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
-        HotReloadRuntime.postDelayed(new Runnable() {
+        postTimelineResultDelayed(new Runnable() {
             @Override
             public void run() {
                 persistTimelineLastRead(recyclerView, source);
@@ -10895,7 +11332,7 @@ public class WeiboLiteHook {
             if (!isCurrentHomeTimelineRecyclerView(recyclerView) || !hasTimelineLastReadTouch(recyclerView)) return;
             if (!shouldUseTimelineLastRead(sTimelineRestoredCacheMode, isTimelinePreloadDone())) return;
             if (getActiveTimelineRefreshAnchorStatusId() > 0L) {
-                log("Timeline last-read save skipped source=" + source + " reason=refresh-anchor");
+                { if (Diagnostics.shouldLog("Timeline last-read save skipped source=")) log("Timeline last-read save skipped source=" + source + " reason=refresh-anchor"); }
                 return;
             }
             long now = SystemClock.elapsedRealtime();
@@ -10934,10 +11371,10 @@ public class WeiboLiteHook {
 
             sLastReadPersistAtMs = now;
             sLastReadStatusId = Long.valueOf(statusId);
-            log("Timeline last-read saved source=" + source + " id=" + statusId
-                + " position=" + position + " visible=" + first + ".." + last);
+            { if (Diagnostics.shouldLog("Timeline last-read saved source=")) log("Timeline last-read saved source=" + source + " id=" + statusId
+                + " position=" + position + " visible=" + first + ".." + last); }
         } catch (Throwable t) {
-            log("Timeline last-read save error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline last-read save error source=")) log("Timeline last-read save error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -11057,7 +11494,7 @@ public class WeiboLiteHook {
             }
             writeTextFileAtomically(history, content.toString());
         } catch (Throwable t) {
-            log("Timeline last-read history write error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline last-read history write error: ")) log("Timeline last-read history write error: " + t.getMessage()); }
         }
     }
 
@@ -11076,11 +11513,11 @@ public class WeiboLiteHook {
     }
 
     private static File getLastReadFile() {
-        return new File("/data/data/com.weico.international/files", LAST_READ_FILE);
+        return timelineAccountFile(LAST_READ_FILE);
     }
 
     private static File getLastReadHistoryFile() {
-        return new File("/data/data/com.weico.international/files", LAST_READ_HISTORY_FILE);
+        return timelineAccountFile(LAST_READ_HISTORY_FILE);
     }
 
     private static void showTimelineLastReadMarker(Object recyclerView) {
@@ -11113,9 +11550,9 @@ public class WeiboLiteHook {
                 sTimelineLastReadMarkerViews.put(marker, Boolean.TRUE);
             }
             sLastReadMarkerShown = true;
-            log("Timeline last-read marker shown");
+            { if (Diagnostics.shouldLog("Timeline last-read marker shown")) log("Timeline last-read marker shown"); }
 
-            HotReloadRuntime.postDelayed(new Runnable() {
+            postTimelineResultDelayed(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -11127,7 +11564,7 @@ public class WeiboLiteHook {
                 }
             }, 6000L);
         } catch (Throwable t) {
-            log("Timeline last-read marker error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline last-read marker error: ")) log("Timeline last-read marker error: " + t.getMessage()); }
         }
     }
 
@@ -11201,8 +11638,8 @@ public class WeiboLiteHook {
             }
             XposedHelpers.callMethod(recyclerView, "scrollBy", 0, dy);
             if (sTimelineRestoredCacheMode) {
-                log("Timeline restored scroll step target=" + target + " visible=" + min + ".." + max
-                    + " reverse=" + reverseLayout + " dy=" + dy);
+                { if (Diagnostics.shouldLog("Timeline restored scroll step target=")) log("Timeline restored scroll step target=" + target + " visible=" + min + ".." + max
+                    + " reverse=" + reverseLayout + " dy=" + dy); }
             }
         } catch (Throwable ignored) {}
     }
@@ -11251,17 +11688,19 @@ public class WeiboLiteHook {
 
     private static void markTimelineTopAnchorTouched(Object recyclerView) {
         if (!isTimelineRecyclerView(recyclerView)) return;
+        sTimelineEdgeJumpGeneration++;
         synchronized (sTopAnchorStates) {
             TopAnchorState state = sTopAnchorStates.get(recyclerView);
             if (state == null || state.userTouched) return;
             state.userTouched = true;
         }
         sSuppressTimelineLoadMoreUntilMs = 0L;
-        log("Timeline top anchor cancelled by touch");
+        { if (Diagnostics.shouldLog("Timeline top anchor cancelled by touch")) log("Timeline top anchor cancelled by touch"); }
     }
 
     private static void rememberTimelinePresenter(Object presenter) {
         if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
+        if (!ensureTimelineAccount(presenter)) return;
         Object pinned = sLastActiveHomeTimelinePresenter.get();
         if (pinned != null && pinned != presenter && isKnownHomeTimelinePresenter(pinned)) {
             return;
@@ -11286,14 +11725,14 @@ public class WeiboLiteHook {
             if (presenter == null || !"-1".equals(getTimelineGroupId(presenter))) return;
             int count = getTimelineStatusCount(presenter);
             if (count < TIMELINE_CACHE_MIN_ITEMS) {
-                log("Timeline no-more ignored source=" + source + " count=" + count);
+                { if (Diagnostics.shouldLog("Timeline no-more ignored source=")) log("Timeline no-more ignored source=" + source + " count=" + count); }
                 return;
             }
 
             long nowMs = SystemClock.elapsedRealtime();
             if (sTimelineNoMoreHandledAtMs > 0L
                 && nowMs - sTimelineNoMoreHandledAtMs < TIMELINE_NO_MORE_DEDUP_MS) {
-                log("Timeline no-more duplicate ignored source=" + source + " count=" + count);
+                { if (Diagnostics.shouldLog("Timeline no-more duplicate ignored source=")) log("Timeline no-more duplicate ignored source=" + source + " count=" + count); }
                 return;
             }
             sTimelineNoMoreHandledAtMs = nowMs;
@@ -11302,9 +11741,9 @@ public class WeiboLiteHook {
             persistTimelineNativeCache(presenter, "no-more-content");
             TimelineCacheStats stats = buildBestTimelineCacheStats(presenter);
             if (!isTimelineCacheDurationReady(stats, source + "-no-more")) {
-                log("Timeline no-more kept incomplete source=" + source
+                { if (Diagnostics.shouldLog("Timeline no-more kept incomplete source=")) log("Timeline no-more kept incomplete source=" + source
                     + " count=" + count
-                    + " spanDays=" + formatTimelineCacheSpanDays(stats.spanMs()));
+                    + " spanDays=" + formatTimelineCacheSpanDays(stats.spanMs())); }
                 return;
             }
             synchronized (sPreloadStates) {
@@ -11317,9 +11756,9 @@ public class WeiboLiteHook {
             }
             markTimelinePreloadDone("no-more-content", 0, count);
             finishTimelineTopAnchorForKnownRecyclerViews("preload-complete");
-            log("Timeline no-more marker detected source=" + source + " count=" + count);
+            { if (Diagnostics.shouldLog("Timeline no-more marker detected source=")) log("Timeline no-more marker detected source=" + source + " count=" + count); }
         } catch (Throwable t) {
-            log("Timeline no-more marker error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline no-more marker error source=")) log("Timeline no-more marker error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -11330,8 +11769,8 @@ public class WeiboLiteHook {
             sPendingTimelineNoMoreSource = source;
             generation = ++sPendingTimelineNoMoreGeneration;
         }
-        log("Timeline no-more deferred until page applied source=" + source);
-        HotReloadRuntime.postDelayed(new Runnable() {
+        { if (Diagnostics.shouldLog("Timeline no-more deferred until page applied source=")) log("Timeline no-more deferred until page applied source=" + source); }
+        postTimelineResultDelayed(new Runnable() {
             @Override
             public void run() {
                 synchronized (WeiboLiteHook.class) {
@@ -11365,11 +11804,11 @@ public class WeiboLiteHook {
             int count = getTimelineStatusCount(presenter);
             if (incoming == 0 && count >= TIMELINE_CACHE_MIN_ITEMS) {
                 rememberTimelinePresenter(presenter);
-                log("Timeline no-more empty page source=" + source + " incoming=" + incoming + " count=" + count);
+                { if (Diagnostics.shouldLog("Timeline no-more empty page source=")) log("Timeline no-more empty page source=" + source + " incoming=" + incoming + " count=" + count); }
                 markTimelineNoMoreContent(source + "-empty");
             }
         } catch (Throwable t) {
-            log("Timeline no-more empty-page error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline no-more empty-page error source=")) log("Timeline no-more empty-page error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -11385,11 +11824,12 @@ public class WeiboLiteHook {
         synchronized (sPreloadStates) {
             sPreloadStates.put(presenter, new PreloadState());
         }
-        log("Timeline preload reset source=" + source);
+        { if (Diagnostics.shouldLog("Timeline preload reset source=")) log("Timeline preload reset source=" + source); }
     }
 
     private static void scheduleTimelinePreload(final Object presenter, final String source) {
         if (!(feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD))) return;
+        if (!ensureTimelineAccount(presenter)) return;
         if (presenter == null) return;
         try {
             if (sHotReloadPreparing || !HotReloadRuntime.isAccepting()) return;
@@ -11404,7 +11844,7 @@ public class WeiboLiteHook {
             }
             if (isTimelinePreloadReady(presenter, source + "-schedule")) {
                 persistTimelineShadowCache(source + "-ready", count, null, true);
-                log("Timeline preload skipped warmed source=" + source + " count=" + count);
+                { if (Diagnostics.shouldLog("Timeline preload skipped warmed source=")) log("Timeline preload skipped warmed source=" + source + " count=" + count); }
                 return;
             }
 
@@ -11424,8 +11864,8 @@ public class WeiboLiteHook {
                 if (state.requestedPages >= getTimelinePreloadMaxPages()
                     || count >= getTimelinePreloadMaxItems()) {
                     state.stopped = true;
-                    log("Timeline preload safety stop source=" + source + " pages=" + state.requestedPages
-                        + " count=" + count);
+                    { if (Diagnostics.shouldLog("Timeline preload safety stop source=")) log("Timeline preload safety stop source=" + source + " pages=" + state.requestedPages
+                        + " count=" + count); }
                     return;
                 }
                 state.scheduled = true;
@@ -11439,19 +11879,20 @@ public class WeiboLiteHook {
                 suspendTimelineTopAnchorsForPreload(source);
             }
 
-            HotReloadRuntime.postDelayed(new Runnable() {
+            postTimelineResultDelayed(new Runnable() {
                 @Override
                 public void run() {
                     requestTimelinePreload(presenter, source);
                 }
             }, PRELOAD_DELAY_MS);
         } catch (Throwable t) {
-            log("Timeline preload schedule error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline preload schedule error source=")) log("Timeline preload schedule error source=" + source + ": " + t.getMessage()); }
         }
     }
 
     private static void requestTimelinePreload(final Object presenter, String source) {
         if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_PRELOAD)) return;
+        if (!ensureTimelineAccount(presenter)) return;
         final int token;
         int count;
         int page;
@@ -11473,8 +11914,8 @@ public class WeiboLiteHook {
                 if (state.requestedPages >= getTimelinePreloadMaxPages()
                     || count >= getTimelinePreloadMaxItems()) {
                     state.stopped = true;
-                    log("Timeline preload safety stop source=" + source + " pages=" + state.requestedPages
-                        + " count=" + count);
+                    { if (Diagnostics.shouldLog("Timeline preload safety stop source=")) log("Timeline preload safety stop source=" + source + " pages=" + state.requestedPages
+                        + " count=" + count); }
                     return;
                 }
                 state.inFlight = true;
@@ -11484,9 +11925,9 @@ public class WeiboLiteHook {
                 page = state.requestedPages;
             }
 
-            log("Timeline preload loadMore page=" + page + " count=" + count + " source=" + source);
+            { if (Diagnostics.shouldLog("Timeline preload loadMore page=")) log("Timeline preload loadMore page=" + page + " count=" + count + " source=" + source); }
             XposedHelpers.callMethod(presenter, "loadMore");
-            HotReloadRuntime.postDelayed(new Runnable() {
+            postTimelineResultDelayed(new Runnable() {
                 @Override
                 public void run() {
                     finishTimelinePreloadWatchdog(presenter, token);
@@ -11499,7 +11940,7 @@ public class WeiboLiteHook {
                 state.inFlight = false;
                 state.stableRounds++;
             }
-            log("Timeline preload loadMore error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline preload loadMore error source=")) log("Timeline preload loadMore error source=" + source + ": " + t.getMessage()); }
         }
     }
 
@@ -11537,18 +11978,18 @@ public class WeiboLiteHook {
                     state.stopped = true;
                     pages = state.requestedPages;
                     shouldMarkDone = durationReady;
-                    log("Timeline preload watchdog stop pages=" + state.requestedPages
+                    { if (Diagnostics.shouldLog("Timeline preload watchdog stop pages=")) log("Timeline preload watchdog stop pages=" + state.requestedPages
                         + " stable=" + state.stableRounds
                         + " durationReady=" + durationReady
-                        + " count=" + count);
+                        + " count=" + count); }
                     shouldContinue = false;
                 } else if (state.stableRounds >= PRELOAD_STABLE_DONE_ROUNDS) {
                     retryDelayMs = timelinePreloadRetryDelayMs(state.stableRounds);
                     pages = state.requestedPages;
-                    log("Timeline preload watchdog retry pages=" + state.requestedPages
+                    { if (Diagnostics.shouldLog("Timeline preload watchdog retry pages=")) log("Timeline preload watchdog retry pages=" + state.requestedPages
                         + " stable=" + state.stableRounds
                         + " durationReady=false count=" + count
-                        + " delayMs=" + retryDelayMs);
+                        + " delayMs=" + retryDelayMs); }
                     shouldContinue = false;
                 } else {
                     shouldContinue = true;
@@ -11565,7 +12006,7 @@ public class WeiboLiteHook {
                 finishTimelineTopAnchorForKnownRecyclerViews("preload-watchdog-stop");
             }
         } catch (Throwable t) {
-            log("Timeline preload watchdog error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline preload watchdog error: ")) log("Timeline preload watchdog error: " + t.getMessage()); }
         }
     }
 
@@ -11595,7 +12036,7 @@ public class WeiboLiteHook {
             state.retryScheduled = true;
             retryToken = ++state.retryToken;
         }
-        HotReloadRuntime.postDelayed(new Runnable() {
+        postTimelineResultDelayed(new Runnable() {
             @Override
             public void run() {
                 synchronized (sPreloadStates) {
@@ -11679,6 +12120,9 @@ public class WeiboLiteHook {
 
     private static boolean isTimelinePreloadDone() {
         if (!feature(ModuleSettings.KEY_WEICO_TIMELINE_CACHE)) return false;
+        if (sTimelineTaskAccount.get() != null) {
+            return readPreloadDoneSatisfied(getPreloadDoneFile());
+        }
         int cacheDays = getTimelineCacheDaysSetting();
         if (!sTimelineCacheDaysSettingConfirmed) {
             return false;
@@ -11693,7 +12137,7 @@ public class WeiboLiteHook {
             sTimelinePreloadDoneCacheDays = cacheDays;
             if (!done && marker != null && marker.exists()) {
                 marker.delete();
-                log("Timeline preload marker ignored because stale or cache-days changed");
+                { if (Diagnostics.shouldLog("Timeline preload marker ignored because stale or cache-days changed")) log("Timeline preload marker ignored because stale or cache-days changed"); }
             }
         } catch (Throwable ignored) {
             sTimelinePreloadDone = Boolean.FALSE;
@@ -11801,13 +12245,22 @@ public class WeiboLiteHook {
     }
 
     private static void markTimelinePreloadDone(String source, int pages, int count) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("preload", "markTimelinePreloadDone");
+        Throwable diagnosticError = null;
+        try {
         markTimelinePreloadDone(source, pages, count, buildBestTimelineCacheStats(sLastTimelinePresenter));
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static void markTimelinePreloadDone(String source, int pages, int count, TimelineCacheStats stats) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("preload", "markTimelinePreloadDone");
+        Throwable diagnosticError = null;
+        try {
         getTimelineCacheDaysSetting();
         if (!sTimelineCacheDaysSettingConfirmed) {
-            log("Timeline preload marker deferred until setting is confirmed source=" + source);
+            { if (Diagnostics.shouldLog("Timeline preload marker deferred until setting is confirmed source=")) log("Timeline preload marker deferred until setting is confirmed source=" + source); }
             return;
         }
         if (count < TIMELINE_CACHE_MIN_ITEMS || !isTimelineCacheDurationReady(stats, source)) return;
@@ -11819,10 +12272,10 @@ public class WeiboLiteHook {
                 > existingNewestMs + TIMELINE_CACHE_RECENCY_TOLERANCE_MS;
             if (!candidateNewer && existingCount >= count) {
                 persistTimelineShadowCache(source, count, null, true, stats);
-                log("Timeline preload marker kept current source=" + source
+                { if (Diagnostics.shouldLog("Timeline preload marker kept current source=")) log("Timeline preload marker kept current source=" + source
                     + " count=" + count + " existing=" + existingCount
                     + " newestMs=" + stats.newestMs
-                    + " existingNewestMs=" + existingNewestMs);
+                    + " existingNewestMs=" + existingNewestMs); }
                 return;
             }
         }
@@ -11844,20 +12297,27 @@ public class WeiboLiteHook {
             content.append("newest_ms=").append(stats.newestMs).append('\n');
             content.append("terminal_done=").append(terminalDone).append('\n');
             writeTextFileAtomically(marker, content.toString());
-            sTimelinePreloadDone = Boolean.TRUE;
-            sTimelinePreloadDoneCacheDays = cacheDays;
+            synchronized (sTimelineOwnerAccounts) {
+                if (timelineAccount() == sTimelineAccount) {
+                    sTimelinePreloadDone = Boolean.TRUE;
+                    sTimelinePreloadDoneCacheDays = cacheDays;
+                }
+            }
             persistTimelineShadowCache(source, count, null, true, stats);
-            log("Timeline preload remembered source=" + source + " pages=" + pages
+            { if (Diagnostics.shouldLog("Timeline preload remembered source=")) log("Timeline preload remembered source=" + source + " pages=" + pages
                 + " count=" + count + " cacheDays=" + cacheDays
                 + " spanDays=" + formatTimelineCacheSpanDays(stats.spanMs())
-                + " terminal=" + terminalDone);
+                + " terminal=" + terminalDone); }
         } catch (Throwable t) {
-            log("Timeline preload remember error source=" + source + ": " + t.getMessage());
+            { if (Diagnostics.shouldLog("Timeline preload remember error source=")) log("Timeline preload remember error source=" + source + ": " + t.getMessage()); }
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static File getPreloadDoneFile() {
-        return new File("/data/data/com.weico.international/files", PRELOAD_DONE_FILE);
+        return timelineAccountFile(PRELOAD_DONE_FILE);
     }
 
     private static int getTimelineStatusCount(Object presenter) {
@@ -11901,6 +12361,9 @@ public class WeiboLiteHook {
     }
 
     private static List sortTimelineNewestFirst(List list, Object owner, String source, boolean loadNew) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("order", "sortTimelineNewestFirst");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_FEED_REVERSE))) return list;
         if (list == null || list.size() < 2) return list;
 
@@ -11946,11 +12409,11 @@ public class WeiboLiteHook {
             }
             long afterFirst = getStatusId(unwrapStatus(items.get(0)));
             long afterLast = getStatusId(unwrapStatus(items.get(items.size() - 1)));
-            log("Timeline order sorted newest-first source=" + source + " group=" + groupId + " size=" + list.size()
+            { if (Diagnostics.shouldLog("Timeline order sorted newest-first source=")) log("Timeline order sorted newest-first source=" + source + " group=" + groupId + " size=" + list.size()
                 + " statuses=" + items.size()
                 + " beforeFirst=" + beforeFirst + " beforeLast=" + beforeLast
                 + " first=" + afterFirst + " last=" + afterLast
-                + " loadNew=" + loadNew);
+                + " loadNew=" + loadNew); }
             return list;
         } catch (Throwable t) {
             ArrayList copy = new ArrayList(list);
@@ -11960,16 +12423,22 @@ public class WeiboLiteHook {
             }
             long afterFirst = getStatusId(unwrapStatus(items.get(0)));
             long afterLast = getStatusId(unwrapStatus(items.get(items.size() - 1)));
-            log("Timeline order copied+sorted newest-first source=" + source + " group=" + groupId + " size=" + list.size()
+            { if (Diagnostics.shouldLog("Timeline order copied+sorted newest-first source=")) log("Timeline order copied+sorted newest-first source=" + source + " group=" + groupId + " size=" + list.size()
                 + " statuses=" + items.size()
                 + " beforeFirst=" + beforeFirst + " beforeLast=" + beforeLast
                 + " first=" + afterFirst + " last=" + afterLast
-                + " loadNew=" + loadNew);
+                + " loadNew=" + loadNew); }
             return copy;
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static List sortTimelineOldestFirst(List list, Object owner, String source) {
+        Diagnostics.Span diagnosticSpan = Diagnostics.begin("order", "sortTimelineOldestFirst");
+        Throwable diagnosticError = null;
+        try {
         if (!(feature(ModuleSettings.KEY_WEICO_FEED_REVERSE))) return list;
         if (list == null || list.size() < 2) return list;
 
@@ -11988,8 +12457,8 @@ public class WeiboLiteHook {
                     return leftId < rightId ? -1 : 1;
                 }
             });
-            log("Timeline order sorted oldest-first source=" + source + " group=" + groupId + " size=" + list.size()
-                + " first=" + beforeFirst + " last=" + beforeLast);
+            { if (Diagnostics.shouldLog("Timeline order sorted oldest-first source=")) log("Timeline order sorted oldest-first source=" + source + " group=" + groupId + " size=" + list.size()
+                + " first=" + beforeFirst + " last=" + beforeLast); }
             return list;
         } catch (Throwable t) {
             ArrayList copy = new ArrayList(list);
@@ -12002,10 +12471,13 @@ public class WeiboLiteHook {
                     return leftId < rightId ? -1 : 1;
                 }
             });
-            log("Timeline order copied+sorted oldest-first source=" + source + " group=" + groupId + " size=" + list.size()
-                + " first=" + beforeFirst + " last=" + beforeLast);
+            { if (Diagnostics.shouldLog("Timeline order copied+sorted oldest-first source=")) log("Timeline order copied+sorted oldest-first source=" + source + " group=" + groupId + " size=" + list.size()
+                + " first=" + beforeFirst + " last=" + beforeLast); }
             return copy;
         }
+
+        } catch (RuntimeException | Error error) { diagnosticError = error; throw error; }
+        finally { Diagnostics.end(diagnosticSpan, diagnosticError); }
     }
 
     private static Object findComparableStatus(List list, boolean fromStart) {
@@ -12530,9 +13002,9 @@ public class WeiboLiteHook {
                     }
                 }
             );
-            log("Native reverse-order forced");
+            { if (Diagnostics.shouldLog("Native reverse-order forced")) log("Native reverse-order forced"); }
         } catch (Throwable t) {
-            log("forceNativeReverseOrder error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("forceNativeReverseOrder error: ")) log("forceNativeReverseOrder error: " + t.getMessage()); }
         }
     }
 
@@ -12543,32 +13015,56 @@ public class WeiboLiteHook {
             java.lang.reflect.Field field = appClass.getDeclaredField("mReverseOrder");
             field.setAccessible(true);
             field.setBoolean(null, true);
-            log("WApplication.mReverseOrder=true");
+            { if (Diagnostics.shouldLog("WApplication.mReverseOrder=true")) log("WApplication.mReverseOrder=true"); }
         } catch (Throwable t) {
-            log("setNativeReverseOrder error: " + t.getMessage());
+            { if (Diagnostics.shouldLog("setNativeReverseOrder error: ")) log("setNativeReverseOrder error: " + t.getMessage()); }
         }
+    }
+
+    static Method findSplashDecisionMethod(Class<?> logoClass) throws NoSuchMethodException {
+        try {
+            Method current = logoClass.getDeclaredMethod("shouldShowSplashAd");
+            if (current.getReturnType() == boolean.class) return current;
+        } catch (NoSuchMethodException ignored) {}
+        Method legacy = logoClass.getDeclaredMethod("doWhatNext");
+        if (legacy.getReturnType() != String.class) throw new NoSuchMethodException("unsupported splash decision");
+        return legacy;
+    }
+
+    static XC_MethodHook splashDecisionHook(boolean booleanDecision) {
+        return new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
+            @Override protected void beforeEnabled(MethodHookParam param) {
+                param.setResult(booleanDecision ? Boolean.FALSE : "main");
+            }
+        };
     }
 
     private static void removeSplashAd(ClassLoader cl) {
         try {
-            XposedHelpers.findAndHookMethod("com.weico.international.activity.LogoActivity", cl, "doWhatNext",
-                new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
-                    @Override
-                    protected void beforeEnabled(MethodHookParam param) {
-                        param.setResult("main");
-                    }
-                });
+            Class<?> logo = Class.forName("com.weico.international.activity.LogoActivity", false, cl);
+            Method decision = findSplashDecisionMethod(logo);
+            XposedBridge.hookMethod(decision, splashDecisionHook(decision.getReturnType() == boolean.class));
+        } catch (Throwable error) {
+            XposedBridge.markCurrentRegistrationGroupIncomplete("splash decision hook unavailable", error);
+            XposedBridge.log(error);
+        }
+        // Compatibility helpers are independent: a removed helper must not prevent the main hook.
+        XposedBridge.beginOptionalRegistrationLookup();
+        try {
             XposedHelpers.findAndHookMethod("com.weico.international.activity.LogoActivity", cl, "triggerPermission", boolean.class,
                 new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
-                    @Override
-                    protected void beforeEnabled(MethodHookParam param) { param.args[0] = true; }
+                    @Override protected void beforeEnabled(MethodHookParam param) { param.args[0] = true; }
                 });
+        } catch (Throwable ignored) {
+        } finally { XposedBridge.endOptionalRegistrationLookup(); }
+        XposedBridge.beginOptionalRegistrationLookup();
+        try {
             XposedHelpers.findAndHookMethod("com.weico.international.manager.ProcessMonitor", cl, "attach", Application.class,
                 new FeatureHook(ModuleSettings.KEY_WEICO_SPLASH_AD_REMOVAL) {
-                    @Override
-                    protected void beforeEnabled(MethodHookParam param) { param.setResult(null); }
+                    @Override protected void beforeEnabled(MethodHookParam param) { param.setResult(null); }
                 });
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        } finally { XposedBridge.endOptionalRegistrationLookup(); }
     }
 
     private interface TimelineAdHookInstaller {
@@ -12731,7 +13227,7 @@ public class WeiboLiteHook {
                 "UveAdHelper query hook installation failed",
                 error
             );
-            log("UveAdHelper query hook error: " + error.getMessage());
+            { if (Diagnostics.shouldLog("UveAdHelper query hook error: ")) log("UveAdHelper query hook error: " + error.getMessage()); }
             return 0;
         }
     }
@@ -12791,7 +13287,7 @@ public class WeiboLiteHook {
                 addTimelineAdStrategy(strategies, "legacy-rxapi-" + name.substring(name.lastIndexOf('$') + 1));
                 installed++;
             } catch (Throwable error) {
-                log("Legacy RxApi ad hook error method=" + name + ": " + error.getMessage());
+                { if (Diagnostics.shouldLog("Legacy RxApi ad hook error method=")) log("Legacy RxApi ad hook error method=" + name + ": " + error.getMessage()); }
             }
         }
         return installed;
@@ -12808,8 +13304,8 @@ public class WeiboLiteHook {
             addTimelineAdStrategy(strategies, strategy);
             return true;
         } catch (Throwable optionalMiss) {
-            log("Optional timeline-ad hook unavailable strategy=" + strategy
-                + ": " + optionalMiss.getMessage());
+            { if (Diagnostics.shouldLog("Optional timeline-ad hook unavailable strategy=")) log("Optional timeline-ad hook unavailable strategy=" + strategy
+                + ": " + optionalMiss.getMessage()); }
             return false;
         } finally {
             XposedBridge.endOptionalRegistrationLookup();
@@ -12826,8 +13322,8 @@ public class WeiboLiteHook {
                 null
             );
         }
-        log("Timeline ad hooks installed count=" + sTimelineAdHookCount
-            + " strategy=" + sTimelineAdHookStrategy);
+        { if (Diagnostics.shouldLog("Timeline ad hooks installed count=")) log("Timeline ad hooks installed count=" + sTimelineAdHookCount
+            + " strategy=" + sTimelineAdHookStrategy); }
     }
 
     private static void addTimelineAdStrategy(ArrayList<String> strategies, String strategy) {

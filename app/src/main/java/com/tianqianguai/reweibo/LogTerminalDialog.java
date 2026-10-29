@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -61,6 +62,20 @@ final class LogTerminalDialog {
         hint.setPadding(0, dp(activity, 5), 0, dp(activity, 10));
         root.addView(hint);
 
+        LinearLayout diagnostics = new LinearLayout(activity);
+        TextView detailStart = terminalButton(activity, "详细诊断 10 分钟");
+        TextView detailStop = terminalButton(activity, "停止详细诊断");
+        diagnostics.addView(detailStart, weightedButtonParams(activity, false));
+        diagnostics.addView(detailStop, weightedButtonParams(activity, true));
+        root.addView(diagnostics);
+        detailStart.setOnClickListener(view -> Toast.makeText(activity,
+            Diagnostics.startDetailed() ? "详细诊断已开启，10 分钟后自动停止"
+                : "请开启持久诊断日志并重启微博轻享版", Toast.LENGTH_LONG).show());
+        detailStop.setOnClickListener(view -> {
+            Diagnostics.stopDetailed();
+            Toast.makeText(activity, "已停止详细诊断，继续保留慢操作和异常记录", Toast.LENGTH_SHORT).show();
+        });
+
         EditText startInput = terminalInput(activity, "开始时间（留空=最早）");
         EditText endInput = terminalInput(activity, "结束时间（留空=最新）");
         root.addView(startInput, inputParams(activity));
@@ -113,7 +128,7 @@ final class LogTerminalDialog {
             .setView(root)
             .setNegativeButton("关闭", null)
             .setNeutralButton("复制当前", null)
-            .setPositiveButton("导出 TXT", null)
+            .setPositiveButton("导出并分享", null)
             .create();
         final int[] loadToken = new int[] {0};
 
@@ -178,9 +193,11 @@ final class LogTerminalDialog {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 LogFileTools.Range range = parseRange(startInput, endInput);
                 if (range == null) return;
+                view.setEnabled(false);
                 status.setText("$ exporting " + range.describe());
                 boolean accepted = taskRunner.execute(() -> {
                     try {
+                        Diagnostics.flushOnWorker();
                         LogFileTools.Snapshot snapshot;
                         synchronized (fileLock) {
                             snapshot = LogFileTools.snapshot(logFile);
@@ -193,19 +210,29 @@ final class LogTerminalDialog {
                         LogExportManager.ExportResult result = exported;
                         HotReloadRuntime.post(() -> {
                             if (!isUsable(activity, dialog)) return;
+                            view.setEnabled(true);
                             status.setText("$ exported " + result.log.matchedLines
                                 + " lines -> " + result.location);
-                            Toast.makeText(
-                                activity,
-                                "已导出到 " + result.location,
-                                Toast.LENGTH_LONG
-                            ).show();
+                            try {
+                                Intent send = LogExportManager.shareIntent(activity, result);
+                                activity.startActivity(Intent.createChooser(send, "分享 ReWeibo 日志"));
+                            } catch (Exception unavailable) {
+                                status.setText("! 已导出，但无法打开分享：" + result.location);
+                                Toast.makeText(activity, "分享不可用，文件已保留在 " + result.location,
+                                    Toast.LENGTH_LONG).show();
+                            }
                         });
                     } catch (Throwable error) {
+                        HotReloadRuntime.post(() -> {
+                            if (isUsable(activity, dialog)) view.setEnabled(true);
+                        });
                         postError(activity, dialog, status, "export failed", error);
                     }
                 });
-                if (!accepted) status.setText("! hot reload is preparing; retry export");
+                if (!accepted) {
+                    view.setEnabled(true);
+                    status.setText("! hot reload is preparing; retry export");
+                }
             });
             loadPreview(
                 activity,
@@ -244,6 +271,7 @@ final class LogTerminalDialog {
         status.setText("$ reading " + range.describe());
         boolean accepted = taskRunner.execute(() -> {
             try {
+                Diagnostics.flushOnWorker();
                 LogFileTools.Snapshot snapshot;
                 synchronized (fileLock) {
                     snapshot = LogFileTools.snapshot(logFile);

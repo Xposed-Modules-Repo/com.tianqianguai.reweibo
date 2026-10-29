@@ -117,9 +117,10 @@ public final class CliCommandBridge {
 
         IntentFilter filter = new IntentFilter(CliContract.ACTION_COMMAND);
         if (Build.VERSION.SDK_INT >= 33) {
-            appContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+            appContext.registerReceiver(receiver, filter, IpcAccess.COMMAND_PERMISSION, null,
+                Context.RECEIVER_EXPORTED);
         } else {
-            appContext.registerReceiver(receiver, filter);
+            appContext.registerReceiver(receiver, filter, IpcAccess.COMMAND_PERMISSION, null);
         }
         sReceiver = receiver;
         sRegisteredContext = appContext;

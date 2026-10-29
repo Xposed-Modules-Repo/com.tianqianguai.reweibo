@@ -25,7 +25,7 @@ class LogTerminalContractTest {
             "app/src/main/java/com/tianqianguai/reweibo/WeiboLiteHook.java"
         ).readText()
 
-        assertTrue(source.contains("LogFileTools.formatLogTimestamp"))
+        assertTrue(source.contains("Diagnostics.legacy(msg)"))
         assertTrue(source.contains("log-io-pending="))
         assertTrue(source.contains("sPendingLogIoTasks.incrementAndGet()"))
         assertTrue(source.contains("LogTerminalDialog.show"))

@@ -107,7 +107,7 @@ public final class ModuleSettings {
         if (KEY_WEICO_DISABLE_PULL_REFRESH.equals(key)) return "阻止微博轻享版首页的下拉刷新行为";
         if (KEY_WEICO_TIMELINE_JUMP_BUTTON.equals(key)) return "在首页显示按时间跳转快捷入口";
         if (KEY_WEICO_TIMELINE_CACHE_CLEAR_BUTTON.equals(key)) return "在首页显示指定日期缓存清理入口";
-        if (KEY_WEICO_PERSISTENT_LOGS.equals(key)) return "将模块详细运行记录保存到微博轻享版的私有文件";
+        if (KEY_WEICO_PERSISTENT_LOGS.equals(key)) return "后台保存异常、慢操作和界面性能摘要；日志页可开启限时 10 分钟的详细诊断";
         return key;
     }
 

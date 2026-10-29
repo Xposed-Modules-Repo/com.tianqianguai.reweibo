@@ -9,7 +9,8 @@ public class CliContractTest {
     @Test public void allCommandsRouteToScopedTargetAndKeepExistingNames() {
         String[] legacy = {"status", "logs.status", "logs.read", "logs.export", "timeline.top",
             "timeline.bottom", "timeline.jump", "cache.stats", "cache.clear", "preload.restart", "settings.reload"};
-        String[] added = {"timeline.status", "timeline.refresh", "timeline.load_more", "preload.status", "gap.status"};
+        String[] added = {"timeline.status", "timeline.refresh", "timeline.load_more", "preload.status", "gap.status",
+            "diagnostics.status", "diagnostics.start", "diagnostics.stop"};
         for (String[] commands : new String[][] {legacy, added}) {
             for (String local : commands) {
                 CliContract.Command command = CliContract.commandFor("weico." + local);
@@ -18,7 +19,7 @@ public class CliContractTest {
                 assertEquals("com.weico.international", command.targetPackage);
             }
         }
-        assertEquals(16, new HashSet<>(Arrays.asList(CliContract.allCommandNames())).size());
+        assertEquals(19, new HashSet<>(Arrays.asList(CliContract.allCommandNames())).size());
         assertNull(CliContract.commandFor("weico.unknown"));
         assertNull(CliContract.commandFor("weibo.timeline.refresh"));
     }

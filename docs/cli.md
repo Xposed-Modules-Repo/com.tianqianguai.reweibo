@@ -122,4 +122,12 @@ The added commands expose native refresh/load-more and structured viewport, prel
 
 ## 功能开关与生效时机
 
+日志诊断新增 `weico.diagnostics.status/start/stop`，分别查询记录器健康状态、开启十分钟详细诊断、停止详细诊断。日志预览与导出包含当前进程的轮转分段和旧档案；细节见 [diagnostics.md](diagnostics.md)。
+
 所有功能开关可通过现有 `settings.list/get/set/reset` 操作，完整功能列表见 [features.md](features.md)。布尔功能开关在目标进程下次启动时读取；`weico.settings.reload` 同步配置但不会切换当前进程的功能快照，修改开关后需要重启微博轻享版。缓存天数保留原有重载行为。禁用导航或预加载时，对应动作返回禁用原因，不会绕过开关执行。
+
+## 调用权限与重置语义
+
+设置 Provider 只接受模块自身、微博轻享版、root 和 shell 的调用。宿主命令广播要求模块签名权限；自动化继续使用本文的 `adb shell content call` 接口。
+
+`settings.reset` 写入明确的默认值（`is_set=true`），避免宿主重载或重启时把旧设置当作待迁移数据回写。未迁移的旧安装仍保留原迁移路径。

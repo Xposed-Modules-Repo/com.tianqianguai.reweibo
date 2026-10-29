@@ -3,6 +3,9 @@ package com.tianqianguai.reweibo;
 import java.lang.reflect.Array;
 import java.util.Collection;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+import io.github.libxposed.api.XposedInterface;
 
 /** Builds a saved-state payload containing only boot-classpath containers and target objects. */
 public final class HotReloadState {
@@ -13,7 +16,9 @@ public final class HotReloadState {
     private static final int OWNER_FRAGMENT = 4;
     private static final int ACTIVITY = 5;
     private static final int GENERATION = 6;
-    private static final int SIZE = 7;
+    private static final int BASE_SIZE = 7;
+    private static final int FEATURES = 7;
+    private static final int ROUTES = 8;
 
     private HotReloadState() {}
 
@@ -39,7 +44,8 @@ public final class HotReloadState {
     public static boolean isValid(Object state, ClassLoader moduleClassLoader) {
         if (!(state instanceof Object[])) return false;
         Object[] values = (Object[]) state;
-        if ((values.length != SIZE && values.length != SIZE + 1) || !MAGIC.equals(values[0])) return false;
+        if ((values.length < BASE_SIZE || values.length > ROUTES + 1)
+            || !MAGIC.equals(values[0])) return false;
         return isClassLoaderNeutral(state, moduleClassLoader);
     }
 
@@ -61,6 +67,11 @@ public final class HotReloadState {
                 if (!isClassLoaderNeutral(entry.getKey(), moduleClassLoader)
                     || !isClassLoaderNeutral(entry.getValue(), moduleClassLoader)) return false;
             }
+        } else if (value instanceof AtomicReference<?>) {
+            return isClassLoaderNeutral(
+                ((AtomicReference<?>) value).get(),
+                moduleClassLoader
+            );
         }
         return true;
     }
@@ -70,13 +81,32 @@ public final class HotReloadState {
     }
 
     public static Object withFeatures(Object state, boolean[] features) {
-        Object[] copy = java.util.Arrays.copyOf((Object[]) state, SIZE + 1);
-        copy[SIZE] = features.clone();
+        Object[] values = (Object[]) state;
+        Object[] copy = java.util.Arrays.copyOf(values, Math.max(values.length, FEATURES + 1));
+        copy[FEATURES] = features.clone();
         return copy;
     }
 
+    public static Object withRoutes(
+            Object state,
+            Map<String, AtomicReference<XposedInterface.Hooker>> routes
+    ) {
+        Object[] values = (Object[]) state;
+        Object[] copy = java.util.Arrays.copyOf(values, Math.max(values.length, ROUTES + 1));
+        copy[ROUTES] = routes;
+        return copy;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, AtomicReference<XposedInterface.Hooker>> routes(Object state) {
+        Object stored = value(state, ROUTES);
+        return stored instanceof Map<?, ?>
+            ? (Map<String, AtomicReference<XposedInterface.Hooker>>) stored
+            : java.util.Collections.emptyMap();
+    }
+
     public static boolean[] features(Object state) {
-        Object stored = value(state, SIZE);
+        Object stored = value(state, FEATURES);
         return stored instanceof boolean[] ? ((boolean[]) stored).clone() : null;
     }
 

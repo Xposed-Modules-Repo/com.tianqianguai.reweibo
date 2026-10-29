@@ -72,6 +72,7 @@ public final class HotReloadRuntime {
 
     private static boolean schedule(Runnable task, long delayMs) {
         if (task == null) return false;
+        final Runnable measured = Diagnostics.wrap(task, delayMs);
         final long ownerGeneration;
         final Handler handler;
         synchronized (LOCK) {
@@ -92,7 +93,7 @@ public final class HotReloadRuntime {
                     synchronized (LOCK) {
                         if (!sAccepting || sGeneration != ownerGeneration) return;
                     }
-                    task.run();
+                    measured.run();
                 } finally {
                     synchronized (LOCK) {
                         sActiveMainCallbacks--;
@@ -296,6 +297,7 @@ public final class HotReloadRuntime {
         @Override
         public void execute(Runnable command) {
             if (command == null) throw new NullPointerException("command");
+            final Runnable measured = Diagnostics.wrap(command, 0);
             final long ownerGeneration;
             final ThreadPoolExecutor executor;
             synchronized (LOCK) {
@@ -313,7 +315,7 @@ public final class HotReloadRuntime {
                             synchronized (LOCK) {
                                 if (!sAccepting || sGeneration != ownerGeneration) return;
                             }
-                            command.run();
+                            measured.run();
                         } finally {
                             synchronized (LOCK) {
                                 sActiveBackgroundTasks--;

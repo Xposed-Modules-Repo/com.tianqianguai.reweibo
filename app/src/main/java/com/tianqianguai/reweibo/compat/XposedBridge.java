@@ -4,6 +4,7 @@ import android.util.Log;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.error.HookFailedError;
 
 import java.lang.reflect.Executable;
 import java.lang.reflect.Member;
@@ -17,6 +18,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Modern API 102 bridge preserving ReWeibo's existing before/after callback behavior. */
 public final class XposedBridge {
@@ -27,6 +29,8 @@ public final class XposedBridge {
     private static final ThreadLocal<MutableRegistration> REGISTRATION = new ThreadLocal<>();
     private static final ConcurrentHashMap<String, AtomicInteger> RUNTIME_SLOTS =
         new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, AtomicReference<XposedInterface.Hooker>>
+        CURRENT_ROUTES = new ConcurrentHashMap<>();
 
     private XposedBridge() {}
 
@@ -94,10 +98,33 @@ public final class XposedBridge {
     }
 
     public static void beginRegistration(List<OldHookSnapshot> oldHooks) {
+        beginRegistration(oldHooks, Collections.emptyMap(), null);
+    }
+
+    public static void beginRegistration(
+            List<OldHookSnapshot> oldHooks,
+            Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes
+    ) {
+        beginRegistration(oldHooks, oldRoutes, null);
+    }
+
+    static void beginRegistrationForTest(
+            List<OldHookSnapshot> oldHooks,
+            Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes,
+            HookInstaller installer
+    ) {
+        beginRegistration(oldHooks, oldRoutes, installer);
+    }
+
+    private static void beginRegistration(
+            List<OldHookSnapshot> oldHooks,
+            Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes,
+            HookInstaller installer
+    ) {
         if (REGISTRATION.get() != null) {
             throw new IllegalStateException("A hook registration session is already active");
         }
-        REGISTRATION.set(new MutableRegistration(oldHooks));
+        REGISTRATION.set(new MutableRegistration(oldHooks, oldRoutes, installer));
     }
 
     public static void beginRegistrationGroup(String name) {
@@ -143,12 +170,15 @@ public final class XposedBridge {
     public static RegistrationReport finishRegistration(boolean dispatchCompleted) {
         MutableRegistration mutable = REGISTRATION.get();
         REGISTRATION.remove();
-        if (mutable == null) mutable = new MutableRegistration(Collections.emptyList());
+        if (mutable == null) {
+            mutable = new MutableRegistration(Collections.emptyList(), Collections.emptyMap(), null);
+        }
         mutable.finishOpenGroup();
         boolean groupsComplete = mutable.allGroupsCompleted();
         return new RegistrationReport(
             mutable.attempted,
             mutable.successful,
+            mutable.forwarded,
             mutable.failures,
             dispatchCompleted && mutable.failures.isEmpty() && groupsComplete,
             groupsComplete
@@ -160,12 +190,14 @@ public final class XposedBridge {
             throw new IllegalArgumentException("Only methods and constructors can be hooked: " + member);
         }
         XposedModule module = sModule;
-        if (module == null) throw new IllegalStateException("Modern Xposed module is not attached");
+        MutableRegistration session = REGISTRATION.get();
+        if (module == null && (session == null || session.installer == null)) {
+            throw new IllegalStateException("Modern Xposed module is not attached");
+        }
         Executable executable = (Executable) member;
         executable.setAccessible(true);
 
         String executableKey = executableIdentity(executable);
-        MutableRegistration session = REGISTRATION.get();
         HookIdentity identity;
         if (session != null) {
             identity = session.nextIdentity(executableKey);
@@ -184,22 +216,38 @@ public final class XposedBridge {
             chain.getArgs().toArray(new Object[0]),
             chain::proceed
         );
+        AtomicReference<XposedInterface.Hooker> route = new AtomicReference<>();
+        XposedInterface.Hooker wrapper = routedHooker(route, hooker);
 
         try {
             XposedInterface.HookHandle oldHandle = session == null
                 ? null
                 : session.oldStableHooks.get(identity);
-            XposedInterface.HookHandle handle;
-            if (oldHandle != null) {
-                handle = oldHandle.replaceHook(hooker);
-            } else {
-                handle = module.hook(executable)
+            AtomicReference<XposedInterface.Hooker> oldRoute = session == null
+                ? null
+                : session.oldRoutes.get(identity.id);
+            HookInstaller installer = session != null && session.installer != null
+                ? session.installer
+                : (origin, id, hookerToInstall) -> module.hook(origin)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId(identity.id)
-                    .intercept(hooker);
+                    .setId(id)
+                    .intercept(hookerToInstall);
+            HookInstallResult installed = installWithFallback(
+                executable,
+                identity.id,
+                hooker,
+                wrapper,
+                route,
+                oldHandle,
+                oldRoute,
+                installer
+            );
+            CURRENT_ROUTES.put(identity.id, installed.route);
+            if (session != null) {
+                session.successful.put(identity, installed.handle);
+                if (installed.forwarded) session.forwarded.add(identity);
             }
-            if (session != null) session.successful.put(identity, handle);
-            return handle;
+            return installed.handle;
         } catch (Throwable error) {
             if (session != null) {
                 session.failures.add(new RegistrationFailure(
@@ -213,6 +261,65 @@ public final class XposedBridge {
             }
             return sneakyThrow(error);
         }
+    }
+
+    private static XposedInterface.Hooker routedHooker(
+            AtomicReference<XposedInterface.Hooker> route,
+            XposedInterface.Hooker currentGenerationHooker
+    ) {
+        return chain -> {
+            XposedInterface.Hooker active = route.get();
+            return (active == null ? currentGenerationHooker : active).intercept(chain);
+        };
+    }
+
+    private static HookInstallResult installWithFallback(
+            Executable executable,
+            String id,
+            XposedInterface.Hooker currentGenerationHooker,
+            XposedInterface.Hooker wrapper,
+            AtomicReference<XposedInterface.Hooker> currentRoute,
+            XposedInterface.HookHandle oldHandle,
+            AtomicReference<XposedInterface.Hooker> oldRoute,
+            HookInstaller installer
+    ) {
+        Throwable replaceFailure = null;
+        if (oldHandle != null) {
+            try {
+                return new HookInstallResult(
+                    oldHandle.replaceHook(wrapper),
+                    currentRoute,
+                    false
+                );
+            } catch (Throwable error) {
+                replaceFailure = error;
+            }
+        }
+
+        try {
+            XposedInterface.HookHandle handle = installer.install(executable, id, wrapper);
+            return new HookInstallResult(handle, currentRoute, false);
+        } catch (Throwable builderFailure) {
+            if (replaceFailure instanceof HookFailedError && oldRoute != null) {
+                oldRoute.set(currentGenerationHooker);
+                return new HookInstallResult(oldHandle, oldRoute, true);
+            }
+            if (replaceFailure != null && builderFailure != replaceFailure) {
+                builderFailure.addSuppressed(replaceFailure);
+            }
+            return sneakyThrow(builderFailure);
+        }
+    }
+
+    /** Clears generation-local callback references and returns neutral route slots for saved state. */
+    public static Map<String, AtomicReference<XposedInterface.Hooker>> prepareRoutesForHotReload() {
+        LinkedHashMap<String, AtomicReference<XposedInterface.Hooker>> savedRoutes =
+            new LinkedHashMap<>(CURRENT_ROUTES);
+        for (AtomicReference<XposedInterface.Hooker> route : savedRoutes.values()) {
+            route.set(null);
+        }
+        CURRENT_ROUTES.clear();
+        return savedRoutes;
     }
 
     public static List<OldHookSnapshot> snapshotOldHooks(
@@ -234,8 +341,8 @@ public final class XposedBridge {
     }
 
     /**
-     * Same-ID hooks were replaced atomically during registration. Failed replacements retain their
-     * old handle; only a complete generation removes handles that are now stale.
+     * Successful same-ID replacements and forwarded old route slots remain active. Only a complete
+     * generation removes handles that are now stale.
      */
     public static OldHookReconcileReport reconcileOldHooks(
             List<OldHookSnapshot> oldHooks,
@@ -261,6 +368,7 @@ public final class XposedBridge {
         }
 
         int atomicallyReplaced = 0;
+        int forwarded = 0;
         int legacyRemoved = 0;
         int staleRemoved = 0;
         int retainedAfterFailure = 0;
@@ -284,7 +392,11 @@ public final class XposedBridge {
             if (snapshot.id == null) continue;
             HookIdentity identity = new HookIdentity(snapshot.executable, snapshot.id);
             if (report.successful.containsKey(identity)) {
-                atomicallyReplaced++;
+                if (report.forwarded.contains(identity)) {
+                    forwarded++;
+                } else {
+                    atomicallyReplaced++;
+                }
             } else if (report.attempted.contains(identity)) {
                 retainedAfterFailure++;
             } else if (report.completed) {
@@ -296,6 +408,7 @@ public final class XposedBridge {
         }
         return new OldHookReconcileReport(
             atomicallyReplaced,
+            forwarded,
             legacyRemoved,
             staleRemoved,
             retainedAfterFailure
@@ -355,6 +468,34 @@ public final class XposedBridge {
             Proceeding proceeding
     ) throws Throwable {
         return invokeLegacyCallback(executable, callback, thisObject, args, proceeding);
+    }
+
+    static AtomicReference<XposedInterface.Hooker> currentRouteForTest(String id) {
+        return CURRENT_ROUTES.get(id);
+    }
+
+    interface HookInstaller {
+        XposedInterface.HookHandle install(
+                Executable executable,
+                String id,
+                XposedInterface.Hooker hooker
+        );
+    }
+
+    private static final class HookInstallResult {
+        final XposedInterface.HookHandle handle;
+        final AtomicReference<XposedInterface.Hooker> route;
+        final boolean forwarded;
+
+        HookInstallResult(
+                XposedInterface.HookHandle handle,
+                AtomicReference<XposedInterface.Hooker> route,
+                boolean forwarded
+        ) {
+            this.handle = handle;
+            this.route = route;
+            this.forwarded = forwarded;
+        }
     }
 
     static String executableIdentity(Executable executable) {
@@ -424,6 +565,7 @@ public final class XposedBridge {
     public static final class RegistrationReport {
         public final Set<HookIdentity> attempted;
         public final Map<HookIdentity, XposedInterface.HookHandle> successful;
+        public final Set<HookIdentity> forwarded;
         public final List<RegistrationFailure> failures;
         public final boolean completed;
         public final boolean groupsComplete;
@@ -444,8 +586,20 @@ public final class XposedBridge {
                 boolean completed,
                 boolean groupsComplete
         ) {
+            this(attempted, successful, Collections.emptySet(), failures, completed, groupsComplete);
+        }
+
+        public RegistrationReport(
+                Set<HookIdentity> attempted,
+                Map<HookIdentity, XposedInterface.HookHandle> successful,
+                Set<HookIdentity> forwarded,
+                List<RegistrationFailure> failures,
+                boolean completed,
+                boolean groupsComplete
+        ) {
             this.attempted = Collections.unmodifiableSet(new LinkedHashSet<>(attempted));
             this.successful = Collections.unmodifiableMap(new LinkedHashMap<>(successful));
+            this.forwarded = Collections.unmodifiableSet(new LinkedHashSet<>(forwarded));
             this.failures = Collections.unmodifiableList(new ArrayList<>(failures));
             this.completed = completed;
             this.groupsComplete = groupsComplete;
@@ -470,17 +624,20 @@ public final class XposedBridge {
 
     public static final class OldHookReconcileReport {
         public final int atomicallyReplaced;
+        public final int forwarded;
         public final int legacyRemoved;
         public final int staleRemoved;
         public final int retainedAfterFailure;
 
         OldHookReconcileReport(
                 int atomicallyReplaced,
+                int forwarded,
                 int legacyRemoved,
                 int staleRemoved,
                 int retainedAfterFailure
         ) {
             this.atomicallyReplaced = atomicallyReplaced;
+            this.forwarded = forwarded;
             this.legacyRemoved = legacyRemoved;
             this.staleRemoved = staleRemoved;
             this.retainedAfterFailure = retainedAfterFailure;
@@ -490,16 +647,25 @@ public final class XposedBridge {
     private static final class MutableRegistration {
         final Set<HookIdentity> attempted = new LinkedHashSet<>();
         final Map<HookIdentity, XposedInterface.HookHandle> successful = new LinkedHashMap<>();
+        final Set<HookIdentity> forwarded = new LinkedHashSet<>();
         final List<RegistrationFailure> failures = new ArrayList<>();
         final Map<String, Integer> nextSlotByExecutable = new LinkedHashMap<>();
         final Map<HookIdentity, XposedInterface.HookHandle> oldStableHooks = new LinkedHashMap<>();
+        final Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes = new LinkedHashMap<>();
+        final HookInstaller installer;
         final Set<String> startedGroups = new LinkedHashSet<>();
         final Set<String> completedGroups = new LinkedHashSet<>();
         final Set<String> incompleteGroups = new LinkedHashSet<>();
         String currentGroup;
         int optionalLookupDepth;
 
-        MutableRegistration(List<OldHookSnapshot> oldHooks) {
+        MutableRegistration(
+                List<OldHookSnapshot> oldHooks,
+                Map<String, AtomicReference<XposedInterface.Hooker>> oldRoutes,
+                HookInstaller installer
+        ) {
+            this.installer = installer;
+            if (oldRoutes != null) this.oldRoutes.putAll(oldRoutes);
             for (OldHookSnapshot snapshot : oldHooks) {
                 if (snapshot.id != null) {
                     oldStableHooks.put(

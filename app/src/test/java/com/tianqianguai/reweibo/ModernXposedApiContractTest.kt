@@ -61,7 +61,8 @@ class ModernXposedApiContractTest {
         val bridge = source(
             "app/src/main/java/com/tianqianguai/reweibo/compat/XposedBridge.java"
         )
-        assertTrue(bridge.contains("oldHandle.replaceHook(hooker)"))
+        assertTrue(bridge.contains("oldHandle.replaceHook(wrapper)"))
+        assertTrue(bridge.contains("module.hook(origin)"))
         assertTrue(bridge.contains("stableId(executable"))
         assertFalse(bridge.contains("deactivateGeneration"))
 

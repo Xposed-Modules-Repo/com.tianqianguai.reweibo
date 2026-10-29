@@ -24,6 +24,8 @@
 
 ## 功能
 
+- 持久诊断日志采用后台批量写入和分段保留；默认收集慢操作、异常与界面性能摘要，日志页可开启十分钟详细诊断。使用方法及证据边界见 [日志与性能诊断](docs/diagnostics.md)。
+
 - 提供 16 个独立功能与入口开关，并支持“一键仅去广告”：只保留启动页和信息流去广告，关闭其余模块行为与入口。功能开关在重启微博轻享版后生效；新安装及未配置的开关默认保持原有行为。
 - 可从桌面 ReWeibo 图标或微博内 ReWeibo 设置调整。关闭扩展缓存会暂时停用依赖它的预加载、断层补齐和阅读位置恢复，但不删除缓存文件或这些开关的选择；手动跳转可独立使用。完整清单见 [功能开关](docs/features.md)。
 
@@ -46,6 +48,8 @@
 
 ## Features
 
+- Persistent diagnostics use batched background writes and rotated segments. Normal recording captures slow operations, errors, and UI performance summaries; the log viewer can enable detailed recording for ten minutes. See the [diagnostics guide](docs/diagnostics.md).
+
 - Provides 16 independent feature and entry-point switches plus an “Ads only” preset that retains splash and feed ad removal while disabling other module behavior and entry points. Feature switches apply after restarting Weibo Lite; unset switches preserve existing behavior.
 - Configure features from the ReWeibo launcher icon or its in-app settings. Disabling extended caching suspends dependent preloading, gap filling, and reading-position restoration without deleting cached files or saved preferences. Manual navigation works independently. See the [feature switch guide](docs/features.md).
 
@@ -66,7 +70,18 @@
 - Refreshes or replaces expired cached timeline video URLs when possible.
 - Adds a terminal-style log view to ReWeibo settings. Log text is freely selectable, the current preview can be copied, and complete results can be filtered by start/end date-time and streamed to a TXT export without loading a large file into the UI.
 
+## 本次更新 / Current update
+
+- 微博内设置分组与卡片留白；日志导出后直接打开系统分享面板。
+- In-app settings use grouped cards and clearer spacing; log exports open the system share sheet directly.
+- 缓存按账号隔离，重启优先恢复有效原生检查点；旧缓存保留，不自动清除历史数据。
+- Caches are isolated by account, with valid native checkpoints preferred on restart; legacy caches are preserved without automatic data deletion.
+- 使用应用隐藏工具时，请让微博轻享版可见 ReWeibo，否则微博内设置可能无法同步。
+- When using an app-hiding tool, allow Weibo Lite to see ReWeibo so in-app settings can synchronize.
+
 ## 兼容性
+
+- 微博轻享版 7.0.1 / LSPosed 2.2.1（API 102）：已在 Android 17 验证冷启动跳过广告页、原生缓存恢复、设置保存及日志分享面板。
 
 - 微博轻享版 7.0.0：DEX 核对确认首页、评论和竖屏视频 UVE 广告请求经过现有 `UveAdHelper` Hook；旧 `RxApiKt` lambda 候选继续保留用于旧版兼容。此项为入口签名与调用链核对，不代表所有广告场景已完成实测。
 
@@ -80,6 +95,8 @@
 - 微博轻享版 6.9.9：V2/V3 时间线数据顺序 hook 支持 R8 `ExternalSyntheticLambda` 候选，旧版 `doLoadData` lambda 候选仍受支持。
 
 ## Compatibility
+
+- Weibo Lite 7.0.1 / LSPosed 2.2.1 (API 102): cold-start splash skipping, native cache recovery, settings saving, and the log share sheet were checked on Android 17.
 
 - Weibo Lite 7.0.0: DEX inspection confirms that home-feed, comment, and vertical-video UVE ad requests pass through the existing `UveAdHelper` hook. Legacy `RxApiKt` lambda candidates remain for older versions. This verifies entry signatures and call paths, not a full behavioral test of every ad scenario.
 

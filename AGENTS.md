@@ -18,9 +18,13 @@ Entry point: the sole Java `MainHook extends XposedModule`, dispatched from `onP
 
 APK output: `app/build/outputs/apk/release/app-release.apk`
 
+- APK 安装统一使用 shell 安装：先用 `adb push` 将安装包推送到设备 `/data/local/tmp/`，再执行 `adb shell pm install -r <设备上的 APK 路径>`；不再使用直接 `adb install` 或需要用户点击安装授权弹窗的安装流程。此规则适用于开发安装、测试部署和正式候选安装。
+- 安装前确认目标设备与安装包；仅在推送成功后执行安装，以 `pm install` 返回 `Success` 判定安装成功。保留原签名和应用数据，不通过卸载或清数据解决安装失败。
+
 Install + restart target (when an explicit device deployment is requested):
 ```bash
-adb -s 192.168.6.17:5555 install -r app/build/outputs/apk/release/app-release.apk
+adb -s 192.168.6.17:5555 push app/build/outputs/apk/release/app-release.apk /data/local/tmp/ReWeibo-install.apk
+adb -s 192.168.6.17:5555 shell pm install -r /data/local/tmp/ReWeibo-install.apk
 adb -s 192.168.6.17:5555 shell am force-stop com.weico.international
 adb -s 192.168.6.17:5555 logcat -c
 adb -s 192.168.6.17:5555 shell monkey -p com.weico.international -c android.intent.category.LAUNCHER 1
@@ -77,6 +81,7 @@ Start every new version in its own task branch/worktree. Publishing is authorize
 - GitHub Release 正文和 Telegram 发布文案均不包含 ADB 相关内容，包括 ADB 接口、命令、操作示例及其新增、改进或修复说明；相关技术记录保留在内部变更梳理或专门文档中，不纳入发布文案。
 - Telegram 发布文案中不放 Release 地址；提供项目主页 `https://github.com/Xposed-Modules-Repo/com.tianqianguai.reweibo`，并自然邀请用户点 Star 支持项目。
 - 在 Telegram 文案之外，单独提供已发布 APK 的下载地址，以及本地安装包所在文件夹的绝对路径；本地交付只给文件夹路径，不给 APK 文件链接。Release 安装包文件名必须包含版本号（例如 `ReWeibo-v1.2.2.apk`），禁止使用 `release.apk`、`app.apk` 等泛名。
+- 本地安装包文件夹路径必须单独一行以纯文本直接输出，使用原生 Windows 绝对路径格式（盘符加反斜杠）；不包装为 Markdown 链接、代码或 URI，不在盘符前添加 `/`，确保复制后可直接使用。用户说明本次无需再给路径时，不重复输出路径。
 - 提供文案不代表获准代发 Telegram 消息；发送到频道或群组仍需用户明确授权。
 
 ### Version and source interval
@@ -120,7 +125,7 @@ Start every new version in its own task branch/worktree. Publishing is authorize
 - Run one frozen-candidate gate with `./gradlew test assembleRelease` (`.\gradlew.bat test assembleRelease` on Windows). Reuse same-commit results instead of repeating the full suite.
 - Verify `output-metadata.json`, `aapt dump badging`, and `apksigner verify --print-certs`: package id, version code/name, signing certificate, and APK filename must match the intended release.
 - Verify the APK contains `META-INF/xposed/java_init.list`, `module.prop`, and `scope.list`; scope remains only `com.weico.international`, and no `io/github/libxposed/` classes are packaged.
-- If device deployment/regression was explicitly requested, install the exact frozen APK, use raw `adb shell content call` for runtime checks, confirm API 102/Hook readiness/version, and compare the installed APK SHA-256 with the candidate. Do not rebuild after device acceptance unless source or signing inputs change.
+- If device deployment/regression was explicitly requested, push the exact frozen APK to `/data/local/tmp/ReWeibo-v<version>.apk` and install it with `adb shell pm install -r` on the selected device. Use raw `adb shell content call` for runtime checks, confirm API 102/Hook readiness/version, and compare the installed APK SHA-256 with the candidate. Do not rebuild after device acceptance unless source or signing inputs change.
 
 ### GitHub and Xposed publication
 
@@ -158,9 +163,9 @@ Start every new version in its own task branch/worktree. Publishing is authorize
 
 ### API 102 hot reload
 
-- Every hook receives a deterministic executable-and-slot ID. `onHotReloaded` uses `HookHandle.replaceHook` for same-ID atomic replacement; a failed replacement retains the old handle, and a complete generation removes stale handles.
+- Every hook receives a deterministic executable-and-slot ID. `onHotReloaded` first uses `HookHandle.replaceHook`, then the same-ID builder. If both fail while an old handle is still valid, a saved route slot can forward it to the new generation; forwarded hooks are counted separately from atomic replacements. An invalid old handle or a legacy generation without a route slot cannot claim a successful fallback. A complete generation removes stale handles.
 - `HotReloadRuntime` owns main-thread callbacks and the cache executors. Reload cancels queued callbacks, stops executors, unregisters the CLI receiver, removes shortcut/progress views and listeners, and clears target-object caches.
-- Saved state is an `Object[]` containing only boot-classpath containers and target-classloader objects: Application context, current presenter, RecyclerView, owner fragment when present, Activity, and generation number.
+- Saved state is an `Object[]` containing boot-classpath containers and target-classloader objects: Application context, current presenter, RecyclerView, owner fragment when present, Activity, generation number, feature values, and a map of empty atomic route slots. Slots are cleared only after retirement preparation succeeds and are filled with new-generation callbacks after handoff; old module objects must not cross the saved-state boundary.
 - Restored state re-registers the raw ADB CLI and recreates timeline shortcuts without restarting the target process. `weico.status` reports API, framework, generation, readiness, active tasks, and observable-probe evidence.
 
 ### FloatingButton
