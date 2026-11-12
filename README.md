@@ -24,6 +24,9 @@
 
 ## 功能
 
+- 日志支持分页预览及手势异常摘要；预加载区分零游标等待与服务器结束，补齐位置恢复避让用户滚动，设置同步失败提供具体建议。
+
+
 - 持久诊断日志采用后台批量写入和分段保留；默认收集慢操作、异常与界面性能摘要，日志页可开启十分钟详细诊断。使用方法及证据边界见 [日志与性能诊断](docs/diagnostics.md)。
 
 - 提供 16 个独立功能与入口开关，并支持“一键仅去广告”：只保留启动页和信息流去广告，关闭其余模块行为与入口。功能开关在重启微博轻享版后生效；新安装及未配置的开关默认保持原有行为。
@@ -47,6 +50,9 @@
 - 在 ReWeibo 设置中提供终端样式日志页：日志文本可长按自由选择，也可复制当前预览；支持按起止日期时间筛选，并将完整筛选结果流式导出为 TXT，避免把大型日志一次性载入界面。
 
 ## Features
+
+- Logs provide paginated previews and gesture anomaly summaries. Preloading distinguishes missing cursors from server termination, gap-fill anchoring yields to user scrolling, and settings-sync failures include specific guidance.
+
 
 - Persistent diagnostics use batched background writes and rotated segments. Normal recording captures slow operations, errors, and UI performance summaries; the log viewer can enable detailed recording for ten minutes. See the [diagnostics guide](docs/diagnostics.md).
 

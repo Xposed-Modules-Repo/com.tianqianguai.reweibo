@@ -59,12 +59,12 @@ public class AuditRegressionTest {
     public Object isRefreshing() { return true; }
     public Object addData() { return null; }
 
-    @Test public void installedRefreshHookHonorsAdsOnlyAndEnabledModes() throws Throwable {
+    @Test public void installedRefreshHookLeavesNonHomeInstancesUntouched() throws Throwable {
         Method method = getClass().getMethod("isRefreshing");
         features.set(null, ModuleSettings.featureSnapshot(ModuleSettings.onlyAdsPreset()));
         assertEquals(true, HookTestDriver.invoke(method, WeiboLiteHook.pullRefreshStateHook(), true));
         features.set(null, ModuleSettings.featureSnapshot(Collections.emptyMap()));
-        assertEquals(false, HookTestDriver.invoke(method, WeiboLiteHook.pullRefreshStateHook(), true));
+        assertEquals(true, HookTestDriver.invoke(method, WeiboLiteHook.pullRefreshStateHook(), true));
     }
 
     @Test public void beforeFailureFallsBackToHostAndRestoresDiagnosticParent() throws Throwable {

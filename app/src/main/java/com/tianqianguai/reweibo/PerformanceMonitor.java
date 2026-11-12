@@ -138,12 +138,14 @@ final class PerformanceMonitor implements Application.ActivityLifecycleCallbacks
 
     private void startupEvidence() {
         try {
-            String target = application.getPackageManager().getPackageInfo(application.getPackageName(), 0).versionName;
-            String module = application.getPackageManager().getPackageInfo("com.tianqianguai.reweibo", 0).versionName;
+            String target = packageVersion(application.getPackageName());
+            String module = packageVersion("com.tianqianguai.reweibo");
             Diagnostics.event("session", "environment", "target=" + target + " module_version=" + module
                 + " sdk=" + Build.VERSION.SDK_INT + " pid=" + android.os.Process.myPid()
                 + " framework=" + com.tianqianguai.reweibo.compat.XposedBridge.frameworkName()
                 + " framework_version=" + com.tianqianguai.reweibo.compat.XposedBridge.frameworkVersion(), true);
+        } catch (Exception error) { Diagnostics.event("session", "environment_unavailable", error.getClass().getName(), true); }
+        try {
             if (Build.VERSION.SDK_INT >= 30) {
                 ActivityManager manager = (ActivityManager) application.getSystemService(Context.ACTIVITY_SERVICE);
                 List<ApplicationExitInfo> exits = manager.getHistoricalProcessExitReasons(application.getPackageName(), 0, 5);
@@ -156,6 +158,14 @@ final class PerformanceMonitor implements Application.ActivityLifecycleCallbacks
                 }
             }
         } catch (Exception error) { Diagnostics.event("session", "evidence_unavailable", error.getClass().getName(), true); }
+    }
+
+    private String packageVersion(String name) {
+        try { return application.getPackageManager().getPackageInfo(name, 0).versionName; }
+        catch (Exception error) {
+            Diagnostics.event("session", "package_unavailable", "package=" + name + " reason=" + error.getClass().getSimpleName(), true);
+            return "unavailable";
+        }
     }
 
     static void intent(Activity activity, Intent intent, String source) {
@@ -188,6 +198,7 @@ final class PerformanceMonitor implements Application.ActivityLifecycleCallbacks
         background.post(() -> { frames = slowFrames = longestFrameNs = metricsLost = 0; windowStarted = SystemClock.uptimeMillis(); });
     }
     @Override public void onActivityPaused(Activity activity) {
+        GestureDiagnostics.clear();
         if (current.get() != activity) return;
         Diagnostics.page(activity.getClass().getName(), "paused");
         foreground = false;

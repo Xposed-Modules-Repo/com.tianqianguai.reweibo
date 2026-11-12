@@ -21,6 +21,7 @@ import android.widget.Toast;
 
 import java.io.File;
 import java.util.Calendar;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Terminal-styled, selectable log viewer with bounded preview and streamed export. */
 final class LogTerminalDialog {
@@ -127,10 +128,35 @@ final class LogTerminalDialog {
             .setTitle("ReWeibo Log Terminal")
             .setView(root)
             .setNegativeButton("关闭", null)
-            .setNeutralButton("复制当前", null)
+            .setNeutralButton("复制", null)
             .setPositiveButton("导出并分享", null)
             .create();
-        final int[] loadToken = new int[] {0};
+        final AtomicInteger loadToken = new AtomicInteger();
+        final LogPreviewPages[] pages = {new LogPreviewPages("")};
+        final int[] pageIndex = {0};
+        final String[] summary = {""};
+        LinearLayout navigation = new LinearLayout(activity);
+        TextView older = terminalButton(activity, "上一页");
+        TextView newer = terminalButton(activity, "下一页");
+        TextView pageLabel = terminalText(activity, 11f, COLOR_DIM, false);
+        navigation.addView(older, weightedButtonParams(activity, false));
+        navigation.addView(pageLabel, weightedButtonParams(activity, true));
+        navigation.addView(newer, weightedButtonParams(activity, true));
+        root.addView(navigation, root.indexOfChild(outputScroll));
+        Runnable renderPage = () -> {
+            if (!isUsable(activity, dialog)) return;
+            output.setText(pages[0].page(pageIndex[0]));
+            outputScroll.scrollTo(0, 0);
+            pageLabel.setText((pageIndex[0] + 1) + " / " + pages[0].size());
+            older.setEnabled(pageIndex[0] > 0);
+            newer.setEnabled(pageIndex[0] + 1 < pages[0].size());
+            status.setText(summary[0] + " 每页最多4Ki字符；复制当前页，完整内容可导出");
+        };
+        older.setEnabled(false);
+        newer.setEnabled(false);
+        older.setOnClickListener(view -> { if (pageIndex[0] > 0) { pageIndex[0]--; renderPage.run(); } });
+        newer.setOnClickListener(view -> { if (pageIndex[0] + 1 < pages[0].size()) { pageIndex[0]++; renderPage.run(); } });
+        dialog.setOnDismissListener(ignored -> loadToken.incrementAndGet());
 
         View.OnClickListener reload = ignored -> loadPreview(
             activity,
@@ -143,7 +169,7 @@ final class LogTerminalDialog {
             status,
             output,
             outputScroll,
-            loadToken
+            loadToken, pages, pageIndex, summary, renderPage
         );
         refreshButton.setOnClickListener(reload);
         allButton.setOnClickListener(view -> {
@@ -175,20 +201,20 @@ final class LogTerminalDialog {
         dialog.setOnShowListener(ignored -> {
             styleDialog(dialog, activity);
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
-                CharSequence value = output.getText();
-                if (value == null || value.length() == 0) {
-                    Toast.makeText(activity, "当前没有可复制日志", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                ClipboardManager clipboard = (ClipboardManager) activity.getSystemService(
-                    Context.CLIPBOARD_SERVICE
-                );
-                if (clipboard == null) {
-                    Toast.makeText(activity, "剪贴板不可用", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                clipboard.setPrimaryClip(ClipData.newPlainText("ReWeibo logs", value));
-                Toast.makeText(activity, "已复制当前终端内容", Toast.LENGTH_SHORT).show();
+                AlertDialog copyDialog = new AlertDialog.Builder(activity)
+                    .setTitle("复制日志")
+                    .setItems(new String[] {"复制当前页", "复制全部预览（最多256Ki字符）"}, (choice, which) -> {
+                        String text = which == 0 ? pages[0].page(pageIndex[0]) : pages[0].all();
+                        ClipboardManager clipboard = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+                        if (clipboard == null || text.isEmpty()) {
+                            Toast.makeText(activity, "没有可复制日志或剪贴板不可用", Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                        clipboard.setPrimaryClip(ClipData.newPlainText("ReWeibo logs", text));
+                        Toast.makeText(activity, which == 0 ? "已复制当前页日志" : "已复制全部预览", Toast.LENGTH_SHORT).show();
+                    }).create();
+                copyDialog.show();
+                HotReloadRuntime.trackDialog(copyDialog);
             });
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 LogFileTools.Range range = parseRange(startInput, endInput);
@@ -245,7 +271,7 @@ final class LogTerminalDialog {
                 status,
                 output,
                 outputScroll,
-                loadToken
+                loadToken, pages, pageIndex, summary, renderPage
             );
         });
         dialog.show();
@@ -263,38 +289,37 @@ final class LogTerminalDialog {
             TextView status,
             TextView output,
             ScrollView outputScroll,
-            int[] loadToken
+            AtomicInteger loadToken, LogPreviewPages[] pages, int[] pageIndex,
+            String[] summary, Runnable renderPage
     ) {
         LogFileTools.Range range = parseRange(startInput, endInput);
         if (range == null) return;
-        int token = ++loadToken[0];
+        int token = loadToken.incrementAndGet();
         status.setText("$ reading " + range.describe());
         boolean accepted = taskRunner.execute(() -> {
+            if (token != loadToken.get()) return;
             try {
                 Diagnostics.flushOnWorker();
                 LogFileTools.Snapshot snapshot;
                 synchronized (fileLock) {
                     snapshot = LogFileTools.snapshot(logFile);
                 }
-                LogFileTools.Result loaded = LogFileTools.readPreview(
-                    snapshot,
-                    range,
-                    LogFileTools.UI_PREVIEW_MAX_CHARS
-                );
-                LogFileTools.Result result = loaded;
+                LogFileTools.Result result = LogFileTools.readPreview(
+                    snapshot, range, LogFileTools.UI_PREVIEW_MAX_CHARS);
+                if (token != loadToken.get()) return;
+                LogPreviewPages prepared = new LogPreviewPages(result.text);
                 HotReloadRuntime.post(() -> {
-                    if (token != loadToken[0] || !isUsable(activity, dialog)) return;
-                    String text = result.text.isEmpty() ? "# no log lines matched\n" : result.text;
-                    output.setText(text);
-                    status.setText(formatStatus(result));
-                    HotReloadRuntime.post(() -> {
-                        if (isUsable(activity, dialog)) {
-                            outputScroll.fullScroll(View.FOCUS_DOWN);
-                        }
-                    });
+                    if (token != loadToken.get() || !isUsable(activity, dialog)) return;
+                    pages[0] = prepared;
+                    pageIndex[0] = prepared.size() - 1;
+                    summary[0] = formatStatus(result);
+                    renderPage.run();
                 });
             } catch (Throwable error) {
-                postError(activity, dialog, status, "read failed", error);
+                HotReloadRuntime.post(() -> {
+                    if (token != loadToken.get() || !isUsable(activity, dialog)) return;
+                    status.setText("! 读取失败：" + error.getClass().getSimpleName());
+                });
             }
         });
         if (!accepted) status.setText("! hot reload is preparing; retry refresh");

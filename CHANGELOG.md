@@ -2,6 +2,30 @@
 
 # Changelog
 
+## 1.3.2
+
+### 新增与改进 / Added And Improved
+
+- 日志预览改为分页显示，保留文字选择、复制当前页、复制全部预览以及完整导出分享。
+  Log previews now use pages while retaining text selection, copying the current page or entire preview, and full export and sharing.
+- 增加首页手势异常摘要，自动记录明显滑动未传达、列表不动及疑似位置回拉的时间与相关操作，减少对用户手动记时的依赖。
+  Adds home-feed gesture summaries that automatically record the timing and context of undelivered drags, stationary lists, and possible position pullbacks, reducing the need for users to note exact times.
+- 设置同步失败显示失败项和对应处理建议，区分模块不可见、权限拒绝和其他写入错误，并明确提示尚未同步完成。
+  Settings-sync failures now show the affected setting and relevant guidance, distinguish module visibility, permission, and other write errors, and clearly indicate incomplete synchronization.
+
+### 修复 / Fixes
+
+- 修复零游标下预加载不断尝试却没有新数据的问题，区分服务器结束与游标未知，保留刷新和重新预加载获取有效游标的能力。
+  Fixes repeated preload attempts without new data when the cursor is zero, distinguishes server termination from an unknown cursor, and preserves refresh and preload restart to obtain a valid cursor.
+- 完善服务器分页结束判断，阻止旧请求结束信号和后台缓存保存覆盖新请求的游标状态。
+  Improves end-of-pagination detection and prevents stale completion signals and background cache saves from overwriting newer request cursor state.
+- 补齐位置恢复让位于用户按住、拖动和惯性滚动；禁用下拉刷新仅作用于当前首页的刷新容器。
+  Gap-fill position restoration now yields to touch, dragging, and fling gestures; pull-to-refresh blocking is limited to the current home-feed refresh container.
+- 修正视频刷新入口的 Companion 字段读取，并将失败提示绑定实际刷新请求，避免慢请求超时后没有反馈。
+  Corrects Companion-field lookup for video refresh and ties failure messages to the actual request so slow failures still provide feedback.
+- 按时间范围清缓存时同时处理宿主与模块缓存，固定账号对应的缓存键；模块版本读取失败不再阻断历史退出记录采集。
+  Time-range cache clearing now handles both host and module caches using a captured account-specific key; failure to read the module version no longer blocks historical process-exit collection.
+
 ## 1.3.1
 
 ### 新增与改进 / Added And Improved
