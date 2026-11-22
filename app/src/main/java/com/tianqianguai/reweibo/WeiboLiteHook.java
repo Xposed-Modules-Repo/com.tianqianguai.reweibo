@@ -13250,11 +13250,14 @@ public class WeiboLiteHook {
         }
     }
 
-    static Method findSplashDecisionMethod(Class<?> logoClass) throws NoSuchMethodException {
-        try {
-            Method current = logoClass.getDeclaredMethod("shouldShowSplashAd");
-            if (current.getReturnType() == boolean.class) return current;
-        } catch (NoSuchMethodException ignored) {}
+    static Method findSplashDecisionMethod(Class<?> routerClass, Class<?> logoClass) throws NoSuchMethodException {
+        for (Class<?> owner : new Class<?>[]{routerClass, logoClass}) {
+            if (owner == null) continue;
+            try {
+                Method current = owner.getDeclaredMethod("shouldShowSplashAd");
+                if (current.getReturnType() == boolean.class) return current;
+            } catch (NoSuchMethodException ignored) {}
+        }
         Method legacy = logoClass.getDeclaredMethod("doWhatNext");
         if (legacy.getReturnType() != String.class) throw new NoSuchMethodException("unsupported splash decision");
         return legacy;
@@ -13270,8 +13273,9 @@ public class WeiboLiteHook {
 
     private static void removeSplashAd(ClassLoader cl) {
         try {
+            Class<?> router = XposedHelpers.findClassIfExists("com.weico.international.activity.LaunchRouter", cl);
             Class<?> logo = Class.forName("com.weico.international.activity.LogoActivity", false, cl);
-            Method decision = findSplashDecisionMethod(logo);
+            Method decision = findSplashDecisionMethod(router, logo);
             XposedBridge.hookMethod(decision, splashDecisionHook(decision.getReturnType() == boolean.class));
         } catch (Throwable error) {
             XposedBridge.markCurrentRegistrationGroupIncomplete("splash decision hook unavailable", error);
