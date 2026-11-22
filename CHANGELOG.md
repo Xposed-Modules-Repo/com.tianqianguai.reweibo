@@ -2,6 +2,13 @@
 
 # Changelog
 
+## 1.3.3
+
+### 修复 / Fixes
+
+- 修复微博轻享版 7.0.2 冷启动时开屏广告拦截失效和模块未就绪的问题，保留旧版开屏拦截和现有功能开关。
+  Fixes splash ads appearing and the module failing to become ready on cold start in Weibo Lite 7.0.2, while retaining splash-ad removal on older versions and the existing feature switches.
+
 ## 1.3.2
 
 ### 新增与改进 / Added And Improved

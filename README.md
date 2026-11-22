@@ -87,6 +87,7 @@
 
 ## 兼容性
 
+- 微博轻享版 7.0.2 / LSPosed 2.2.1（API 102）：已在 Android 17 验证冷启动跳过开屏广告、首页刷新与分页、日期跳转及重启后恢复时间线缓存。
 - 微博轻享版 7.0.1 / LSPosed 2.2.1（API 102）：已在 Android 17 验证冷启动跳过广告页、原生缓存恢复、设置保存及日志分享面板。
 
 - 微博轻享版 7.0.0：DEX 核对确认首页、评论和竖屏视频 UVE 广告请求经过现有 `UveAdHelper` Hook；旧 `RxApiKt` lambda 候选继续保留用于旧版兼容。此项为入口签名与调用链核对，不代表所有广告场景已完成实测。
@@ -102,6 +103,7 @@
 
 ## Compatibility
 
+- Weibo Lite 7.0.2 / LSPosed 2.2.1 (API 102): cold-start splash-ad removal, home timeline refresh and pagination, date-based navigation, and cache recovery after restart were verified on Android 17.
 - Weibo Lite 7.0.1 / LSPosed 2.2.1 (API 102): cold-start splash skipping, native cache recovery, settings saving, and the log share sheet were checked on Android 17.
 
 - Weibo Lite 7.0.0: DEX inspection confirms that home-feed, comment, and vertical-video UVE ad requests pass through the existing `UveAdHelper` hook. Legacy `RxApiKt` lambda candidates remain for older versions. This verifies entry signatures and call paths, not a full behavioral test of every ad scenario.
